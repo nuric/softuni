@@ -1,0 +1,6 @@
+# Dependencies
+numpy
+ply
+# Tools
+pylint
+doit
