@@ -36,3 +36,18 @@ class TestUtils(unittest.TestCase):
   def test_tokenisation_empty(self):
     """Check the tokens of the tokenise sentence."""
     self.assertSequenceEqual(utils.tokenise(""), [])
+
+  def test_empty_word_vector(self):
+    """Check empty word vector functions."""
+    w = utils.WordVectors()
+    self.assertEqual(len(w), 0)
+    self.assertEqual(w.dim, 0)
+
+  def test_word_vector_parsing(self):
+    """Check if the word vector stream parses correctly."""
+    w = utils.WordVectors(["the 0.5 0.6 0.1", "and 0.4 0.3 0.7"])
+    self.assertEqual(len(w), 2)
+    self.assertEqual(w.dim, 3)
+    self.assertTrue((w['the'] == np.array([0.5, 0.6, 0.1])).all())
+    self.assertTrue((w['and'] == np.array([0.4, 0.3, 0.7])).all())
+    self.assertTrue((w['42'] == np.zeros(w.dim)).all())
