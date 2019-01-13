@@ -6,6 +6,7 @@ from .utils import tokenise
 
 log = logging.getLogger(__name__)
 
+
 class Sent:
   """Single Sentence composed of tokens and variables."""
   VAR_RE = r'[a-z]+:'
@@ -38,6 +39,12 @@ class Sent:
   def variables(self):
     """Return tuple of variables in order."""
     return tuple(t for t in self.tokens if isinstance(t, VarToken))
+
+  def __getitem__(self, idx):
+    return self.tokens[idx]
+
+  def __iter__(self):
+    return iter(self.tokens)
 
   def __len__(self):
     return len(self.tokens)
