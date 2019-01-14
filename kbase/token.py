@@ -15,13 +15,11 @@ class Token:
 class WordToken(Token):
   """Represents a single word token."""
   word2vec = WordVectors.from_file(os.environ['WORD2VEC']) \
-             if 'WORD2VEC' in os.environ else None
+             if 'WORD2VEC' in os.environ else WordVectors()
 
   def __init__(self, text, vector=None):
     self.text = text
-    self.vector = vector
-    if not vector and self.word2vec:
-      self.vector = self.word2vec[text]
+    self.vector = vector or self.word2vec[text]
 
   def __repr__(self):
     return '<' + self.text + '>'
