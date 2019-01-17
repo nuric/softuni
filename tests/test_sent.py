@@ -42,6 +42,14 @@ class TestSent(unittest.TestCase):
     self.assertGreater(s.unify(o), 0.1)
     self.assertEqual(str(s[-1]), "bathroom")
 
+  def test_var_clear(self):
+    """Check if unification matches correct token."""
+    s = Sent.from_text("Alice went to the Y:kitchen.")
+    o = Sent.from_text("Bob journeyed to the bathroom.")
+    self.assertGreater(s.unify(o), 0.1)
+    s.clear_variables()
+    self.assertEqual(str(s[-1]), "None")
+
   def test_double_var_unify(self):
     """Check if unification matches 2 correct tokens."""
     s = Sent.from_text("X:Alice went to the Y:kitchen.")

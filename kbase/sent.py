@@ -56,6 +56,11 @@ class Sent:
   def __str__(self):
     return ' '.join(map(str, self.tokens))
 
+  def clear_variables(self):
+    """Clear all variable bindings."""
+    for v in self.variables:
+      v.value = None
+
   def unify(self, other):
     """Bind the variables of this sent with possible matches of other."""
     if not self.variables or not other:
