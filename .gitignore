@@ -1,6 +1,7 @@
 # Custom ignores
 *.swp
 *.db
+data
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
