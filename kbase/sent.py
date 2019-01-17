@@ -2,8 +2,9 @@
 import logging
 import re
 from operator import itemgetter
+import numpy as np
 from .token import WordToken, VarToken
-from .utils import tokenise
+from .utils import tokenise, cosine_similarity
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +42,12 @@ class Sent:
     """Return tuple of variables in order."""
     return tuple(t for t in self.tokens if isinstance(t, VarToken))
 
+  @property
+  def vector(self):
+    """Return sentence vector."""
+    # bag of words calculation
+    return np.mean([t.vector for t in self.tokens], axis=0)
+
   def __getitem__(self, idx):
     return self.tokens[idx]
 
@@ -55,6 +62,12 @@ class Sent:
 
   def __str__(self):
     return ' '.join(map(str, self.tokens))
+
+  def similarity(self, other):
+    """Calculate similarity to other sentence."""
+    if not self or not other:
+      return 0.0
+    return cosine_similarity(self.vector, other.vector)
 
   def clear_variables(self):
     """Clear all variable bindings."""

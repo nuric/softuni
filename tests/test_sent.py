@@ -23,6 +23,24 @@ class TestSent(unittest.TestCase):
     self.assertEqual(len(s), 6)
     self.assertEqual(len(s.variables), 1)
 
+  def test_empty_similarity(self):
+    """Similarity is zero if sentence is empty."""
+    s = Sent.from_text("")
+    o = Sent.from_text("Alice went to the kitchen.")
+    self.assertEqual(s.similarity(o), 0.0)
+
+  def test_relative_similarity(self):
+    """Similarity is higher for closer sentences."""
+    s = Sent.from_text("Bob journeyed to the bathroom.")
+    o = Sent.from_text("Alice went to the kitchen.")
+    t = Sent.from_text("Alice picked up the ball.")
+    self.assertGreater(s.similarity(o), s.similarity(t))
+
+  def test_identitical_similarity(self):
+    """Similarity with identitical tokens."""
+    s = Sent.from_text("Bob journeyed to the Y:bathroom.")
+    self.assertGreater(s.similarity(s), 0.95)
+
   def test_novar_unification(self):
     """Check if no variable sentence fails to unify."""
     s = Sent.from_text("")
