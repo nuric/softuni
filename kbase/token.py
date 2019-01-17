@@ -17,7 +17,7 @@ class WordToken(Token):
 
   def __init__(self, text, vector=None):
     self.text = text
-    self.vector = vector or self.word2vec[text]
+    self.vector = vector or self.word2vec[text.lower().replace(' ', '_')]
 
   def __repr__(self):
     return '<' + self.text + '>'
