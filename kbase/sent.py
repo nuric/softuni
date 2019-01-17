@@ -1,6 +1,7 @@
 """Representation of a single Sentence."""
 import logging
 import re
+from operator import itemgetter
 from .token import WordToken, VarToken
 from .utils import tokenise
 
@@ -54,3 +55,16 @@ class Sent:
 
   def __str__(self):
     return ' '.join(map(str, self.tokens))
+
+  def unify(self, other):
+    """Bind the variables of this sent with possible matches of other."""
+    if not self.variables or not other:
+      return 0.0
+    # A naive semantic unification
+    sims = list()
+    for v in self.variables:
+      # find maximal match in other
+      sim, token = max([(v.similarity(t), t) for t in other], key=itemgetter(0))
+      sims.append(sim)
+      v.value = token
+    return sum(sims)/len(sims)

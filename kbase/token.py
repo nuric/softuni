@@ -1,5 +1,4 @@
 """Contains Token definition used in Sent."""
-import os
 from .utils import cosine_similarity, WordVectors
 
 
@@ -8,14 +7,13 @@ class Token:
   vector = 0.0
 
   def similarity(self, other):
-    """Calculate cosine similarity to other token."""
+    """Calculate similarity to other token."""
     return cosine_similarity(self.vector, other.vector)
 
 
 class WordToken(Token):
   """Represents a single word token."""
-  word2vec = WordVectors.from_file(os.environ['WORD2VEC']) \
-             if 'WORD2VEC' in os.environ else WordVectors()
+  word2vec = WordVectors.from_file("data/numberbatch.txt")
 
   def __init__(self, text, vector=None):
     self.text = text
