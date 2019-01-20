@@ -40,7 +40,7 @@ class Sent:
   @property
   def variables(self):
     """Return tuple of variables in order."""
-    return tuple(t for t in self.tokens if isinstance(t, VarToken))
+    return [t for t in self.tokens if isinstance(t, VarToken)]
 
   @property
   def vector(self):

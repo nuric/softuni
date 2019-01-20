@@ -43,11 +43,3 @@ class VarToken(Token):
 
   def __str__(self):
     return str(self.value)
-
-  def __eq__(self, other):
-    if isinstance(other, type(self)):
-      return self.name == other.name
-    return False
-
-  def __hash__(self):
-    return hash(self.name)
