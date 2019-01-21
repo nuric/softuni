@@ -42,8 +42,18 @@ class Sent:
   @property
   def vector(self):
     """Return sentence vector."""
-    # bag of words calculation
-    return np.mean([t.vector for t in self.tokens if t.vector is not None], axis=0)
+    # weighted bag of words calculation, variables with values take precedence
+    weights, vectors = list(), list()
+    for t in self:
+      if t.vector is None or not any(t.vector):
+        continue
+      vectors.append(t.vector)
+      # Weight towards bound variables
+      weights.append(2.1 if isinstance(t, VarToken) and t.value else 1.0)
+    # Softmax
+    weights = np.exp(weights)
+    weights /= np.sum(weights)
+    return np.average(vectors, axis=0, weights=weights)
 
   def __getitem__(self, idx):
     return self.tokens[idx]

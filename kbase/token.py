@@ -4,6 +4,7 @@ from .utils import cosine_similarity, WordVectors
 
 class Token:
   """Base class for tokens in sentences."""
+  word2vec = WordVectors.from_file("data/wordvecs.txt")
   vector = 0.0
 
   def similarity(self, other):
@@ -13,8 +14,6 @@ class Token:
 
 class WordToken(Token):
   """Represents a single word token."""
-  word2vec = WordVectors.from_file("data/numberbatch.txt")
-
   def __init__(self, text, vector=None):
     self.text = text
     self.vector = vector or self.word2vec[text.lower().replace(' ', '_')]
