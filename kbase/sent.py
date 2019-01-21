@@ -1,12 +1,9 @@
 """Representation of a single Sentence."""
-import logging
 import re
 from operator import itemgetter
 import numpy as np
 from .token import WordToken, VarToken
 from .utils import tokenise, cosine_similarity
-
-log = logging.getLogger(__name__)
 
 
 class Sent:
@@ -46,7 +43,7 @@ class Sent:
   def vector(self):
     """Return sentence vector."""
     # bag of words calculation
-    return np.mean([t.vector for t in self.tokens], axis=0)
+    return np.mean([t.vector for t in self.tokens if t.vector is not None], axis=0)
 
   def __getitem__(self, idx):
     return self.tokens[idx]

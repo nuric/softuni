@@ -53,6 +53,9 @@ class WordVectors():
   def __len__(self):
     return len(self.word2vec)
 
+  def __contains__(self, word):
+    return word in self.word2vec
+
   @classmethod
   def from_file(cls, fname):
     """Load word vectors from file."""
