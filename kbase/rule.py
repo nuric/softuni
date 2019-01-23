@@ -1,42 +1,46 @@
 """Rules in NLLOG for KnowledgeBase"""
 
 
-class Rule(object):
+class Rule:
   """Represents a single applicable rule."""
   def __init__(self, exprs=None):
     self.exprs = exprs or list()
+    self.normalise_vars(self.exprs)
 
   @property
   def head(self):
     """Return the head of the rule if any."""
-    if self.exprs:
-      return self.exprs[0]
+    return self.exprs[0] if self.exprs else None
 
   @property
   def query(self):
     """Return the query expression if any."""
-    if len(self.exprs) >= 2:
-      return self.exprs[1]
+    return self.exprs[1] if len(self.exprs) >= 2 else None
 
   @property
   def body(self):
     """Return the non-query body of the rule if any."""
     return self.exprs[2:]
 
-  @property
-  def variables(self):
-    """Recursively fetch variables inside expression."""
-    return [v for e in self.exprs for v in e.variables]
+  @staticmethod
+  def normalise_vars(exprs):
+    """Re-bind matching variable tokens of expressions."""
+    vmap = dict()
+    for e in exprs:
+      vlist, vidxs = e.variables
+      for i in vidxs:
+        vlist[i] = vmap.setdefault(vlist[i].name, vlist[i])
 
-  def unify(self, pos, expr):
-    """Unify expression at given position with expr."""
-    sim = self.exprs[pos].unify(expr)
-    # Update variables
-    for v in self.exprs[pos].variables:
-      for vv in self.variables:
-        if v.name == vv.name:
-          vv.value = v.value
-    return sim
+  def apply(self, expr, pos):
+    """Apply rule at given position to return new rule."""
+    # Create re-usable expressions to bind variables etc
+    cexprs = [e.copy() for e in self.exprs]
+    self.normalise_vars(cexprs)
+    # Unify both ways
+    uni_sim = cexprs[pos].unify(expr)
+    uni_sim *= expr.unify(cexprs[pos])
+    # Substitute VarTokens after unification
+    return uni_sim, Rule(cexprs)
 
   def __len__(self):
     return len(self.exprs)
