@@ -1,7 +1,7 @@
 """KnowledgeBase of rules for NLLog"""
 import logging
-import numpy as np
 from operator import itemgetter
+import numpy as np
 from sklearn.cluster import DBSCAN
 
 log = logging.getLogger(__name__)
@@ -21,7 +21,7 @@ class KnowledgeBase:
 
   def match(self, expr, pos=0):
     """Try to find a close matching rule with expr position pos."""
-    sri= []
+    sri = []
     # Check across all the rules in the knowledge base
     for i, rule in enumerate(self.rules):
       if (pos >= len(rule) or not rule.exprs[pos] or
@@ -29,6 +29,8 @@ class KnowledgeBase:
         continue
       s = expr.match(rule.exprs[pos])
       sri.append((rule, s, i))
+    if not sri:
+      return list() # We have no matches
     # Cluster based on similarity
     sims = np.array([r[1] for r in sri]).reshape(-1, 1)
     labels = self.CLUSTER.fit_predict(sims)
@@ -37,7 +39,7 @@ class KnowledgeBase:
       clusters.setdefault(l, list()).append(tup)
     # Find most similar cluster
     label, _ = max([(l, max(map(itemgetter(1), c))) for l, c in clusters.items()],
-                     key=itemgetter(1))
+                   key=itemgetter(1))
     matches = clusters[label]
     # Sort rules by position
     matches.sort(key=itemgetter(2))
