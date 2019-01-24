@@ -8,6 +8,9 @@ from .utils import tokenise, cosine_similarity
 
 log = logging.getLogger(__name__)
 
+with open("kbase/stopwords.txt") as f:
+  STOPWORDS = [l.strip() for l in f]
+
 
 class Sent:
   """Single Sentence composed of tokens and variables."""
