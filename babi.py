@@ -1,9 +1,11 @@
 """bAbI run of NLLog"""
 import argparse
 import logging
+import string
 from kbase.expr import ExprSent
 from kbase.rule import Rule
 from kbase.knowledgebase import KnowledgeBase
+from kbase.utils import tokenise
 
 
 # Arguments
@@ -36,17 +38,35 @@ with open(ARGS.task) as f:
       # Just a statement
       stories[-1].append(sl)
     prev_id = sid
-    if len(stories) > 2:
-      break
+print("TOTAL:", len(stories), "stories")
 print("SAMPLE:", stories[0])
 
-p1 = ExprSent("X:Bob went to the Y:hallway.")
-q0 = ExprSent("Where is X:Bob?")
-a0 = ExprSent("Y:hallway")
-r = Rule([a0, q0, p1])
+def one_shot(query, answer, sups, story):
+  """Create a one shot rule."""
+  q, a, sups = tokenise(query), tokenise(answer), [tokenise(story[i]) for i in sups]
+  vnames = list(string.ascii_lowercase)
+  vmap = dict()
+  # Convert common tokens into variables
+  sents = [a, q]+sups
+  for i, sent in enumerate(sents):
+    rtokens = [t for s in sents[i+1:] for t in s]
+    for token in sent:
+      if token in rtokens:
+        vmap.setdefault(token, vnames.pop())
+  # Construct rule
+  sents = [' '.join([vmap[t]+':'+t if t in vmap else t for t in s])
+           for s in sents]
+  return Rule([ExprSent(s) for s in sents])
+
+# --------------------
+# p1 = ExprSent("X:Bob went to the Y:hallway.")
+# q0 = ExprSent("Where is X:Bob?")
+# a0 = ExprSent("Y:hallway")
+# r = Rule([a0, q0, p1])
+learned_rules = list()
 
 for story in stories:
-  kb = KnowledgeBase([r])
+  kb = KnowledgeBase(learned_rules.copy())
   for line in story:
     # Check statement or question
     if isinstance(line, str):
@@ -55,17 +75,30 @@ for story in stories:
       continue
     # We have a question
     q, a, sups = line
-    confidence, rules = next(kb.prove([ExprSent(q)], 1))
-    prediction = str(rules[0].head)
+    # Obtain prediction
+    confidence, prediction = 0.0, None
+    try:
+      confidence, rules = next(kb.prove([ExprSent(q)], 1))
+      prediction = str(rules[0].head)
+    except StopIteration as e:
+      print(e) # No more solutions
+    # Check and learn
     if prediction != a:
       # We got a wrong answer
-      print("-----")
+      print("----KNOWLEDGEBASE----")
       print(kb)
       print("-----")
-      print(rules)
-      print("-----")
-      print("ANSWER:", rules[0].head, confidence)
+      print("QUERY:", q)
+      print("ANSWER:", prediction, confidence)
       print("EXPECTED:", a, sups)
       print("-----")
-      exit()
-print("--ALL PASS--")
+      # Attempt to one-shot learn
+      rule = one_shot(q, a, sups, story)
+      print("NEWRULE:", rule)
+      learned_rules.append(rule)
+      kb.rules.append(rule)
+print("--ALLPASS--")
+print("-----------")
+print("--LEARNED--")
+for r in learned_rules:
+  print(r)
