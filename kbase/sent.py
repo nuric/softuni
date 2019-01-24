@@ -49,22 +49,6 @@ class Sent:
     """Return re-usable sentence object."""
     return Sent([t.copy() for t in self.tokens])
 
-  @property
-  def vector(self):
-    """Return sentence vector."""
-    # weighted bag of words calculation, variables with values take precedence
-    weights, vectors = list(), list()
-    for t in self:
-      if t.vector is None or not any(t.vector):
-        continue
-      vectors.append(t.vector)
-      # Weight towards bound variables
-      weights.append(4.0 if isinstance(t, VarToken) and t.value else 1.0)
-    # Softmax
-    weights = np.exp(weights)
-    weights /= np.sum(weights)
-    return np.average(vectors, axis=0, weights=weights)
-
   def __getitem__(self, idx):
     return self.tokens[idx]
 
@@ -84,10 +68,25 @@ class Sent:
     return token in self.tokens
 
   def similarity(self, other):
-    """Calculate similarity to other sentence."""
+    """Calculate similarity to other sentence, not symmetric."""
     if not self or not other:
       return 0.0
-    return cosine_similarity(self.vector, other.vector)
+    weights, sims = list(), list()
+    for t in self:
+      if (t.vector is None or not any(t.vector) or # omit no vector or zero vectors
+          str(t) in STOPWORDS or # omit stopwords
+          (isinstance(t, VarToken) and not t.value)): # omit variables with no values
+        continue
+      # Find maximal match
+      sims.append(max([t.similarity(o) for o in other]))
+      # Weight towards bound variables
+      weights.append(4.0 if isinstance(t, VarToken) and t.value else 1.0)
+    # Softmax
+    weights = np.exp(weights)
+    weights /= np.sum(weights)
+    final_sim = np.average(sims, axis=0, weights=weights)
+    log.debug("SIM: %s -- %s -- %f", repr(self), repr(other), final_sim)
+    return final_sim
 
   def clear_variables(self):
     """Clear all variable bindings."""

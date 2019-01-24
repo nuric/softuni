@@ -48,7 +48,8 @@ class WordVectors():
     self.dim = len(next(iter(self.word2vec.values()))) if self.word2vec else 0
 
   def __getitem__(self, word):
-    return self.word2vec.get(word, np.zeros(self.dim))
+    # return self.word2vec.get(word, np.zeros(self.dim))
+    return self.word2vec[word]
 
   def __len__(self):
     return len(self.word2vec)

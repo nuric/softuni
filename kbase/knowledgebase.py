@@ -32,6 +32,7 @@ class KnowledgeBase:
     if not sri:
       return list() # We have no matches
     # Cluster based on similarity
+    log.debug("MATCHES: %s -- %s", repr(expr), sri)
     sims = np.array([r[1] for r in sri]).reshape(-1, 1)
     labels = self.CLUSTER.fit_predict(sims)
     clusters = dict()
