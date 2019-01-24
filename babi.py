@@ -3,6 +3,7 @@ import argparse
 import logging
 import string
 from kbase.expr import ExprSent
+from kbase.sent import STOPWORDS
 from kbase.rule import Rule
 from kbase.knowledgebase import KnowledgeBase
 from kbase.utils import tokenise
@@ -51,6 +52,8 @@ def one_shot(query, answer, sups, story):
   for i, sent in enumerate(sents):
     rtokens = [t for s in sents[i+1:] for t in s]
     for token in sent:
+      if token in STOPWORDS:
+        continue
       if token in rtokens:
         vmap.setdefault(token, vnames.pop())
   # Construct rule
