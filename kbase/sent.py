@@ -56,7 +56,7 @@ class Sent:
         continue
       vectors.append(t.vector)
       # Weight towards bound variables
-      weights.append(2.1 if isinstance(t, VarToken) and t.value else 1.0)
+      weights.append(4.0 if isinstance(t, VarToken) and t.value else 1.0)
     # Softmax
     weights = np.exp(weights)
     weights /= np.sum(weights)
@@ -106,8 +106,8 @@ class Sent:
       simtokens = sorted([(vl[i].similarity(t), t) for t in other], key=itemgetter(0), reverse=True)
       for sim, token in simtokens:
         # Ensure it is not a token we contain and that is already bound to a variable
-        if token in self or \
-           any([vl[j].similarity(token) > 0.95 for j in vidxs if vl[j].value]):
+        if (token in self or
+            any([vl[j].similarity(token) > 0.95 for j in vidxs if vl[j].value])):
           continue # find another token
         sims.append(sim)
         log.debug("BIND: %s << %s, %f", repr(vl[i]), repr(token), sim)

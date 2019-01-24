@@ -54,10 +54,18 @@ for story in stories:
       kb.add_rule(Rule([ExprSent(line)]))
       continue
     # We have a question
-    q, a, _ = line
-    for confidence, rules in kb.prove([ExprSent(q)], 1):
-      print(confidence, rules)
-      print("ANSWER:", rules[0].head)
-      break
-    break
-  break
+    q, a, sups = line
+    confidence, rules = next(kb.prove([ExprSent(q)], 1))
+    prediction = str(rules[0].head)
+    if prediction != a:
+      # We got a wrong answer
+      print("-----")
+      print(kb)
+      print("-----")
+      print(rules)
+      print("-----")
+      print("ANSWER:", rules[0].head, confidence)
+      print("EXPECTED:", a, sups)
+      print("-----")
+      exit()
+print("--ALL PASS--")

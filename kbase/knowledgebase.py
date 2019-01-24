@@ -1,6 +1,8 @@
 """KnowledgeBase of rules for NLLog"""
 import logging
+import numpy as np
 from operator import itemgetter
+from sklearn.cluster import DBSCAN
 
 log = logging.getLogger(__name__)
 
@@ -8,6 +10,7 @@ log = logging.getLogger(__name__)
 class KnowledgeBase:
   """Represents a collection of Rules."""
   MAX_DEPTH = 7
+  CLUSTER = DBSCAN(eps=0.05, min_samples=1)
 
   def __init__(self, rules=None):
     self.rules = rules or list()
@@ -18,15 +21,27 @@ class KnowledgeBase:
 
   def match(self, expr, pos=0):
     """Try to find a close matching rule with expr position pos."""
-    sr = []
+    sri= []
     # Check across all the rules in the knowledge base
-    for rule in self.rules:
-      if pos >= len(rule) or not rule.exprs[pos]:
+    for i, rule in enumerate(self.rules):
+      if (pos >= len(rule) or not rule.exprs[pos] or
+          (pos == 0 and rule.query)):
         continue
       s = expr.match(rule.exprs[pos])
-      sr.append((s, rule))
-    sr.sort(key=itemgetter(0), reverse=True) # most similar is first
-    return sr
+      sri.append((rule, s, i))
+    # Cluster based on similarity
+    sims = np.array([r[1] for r in sri]).reshape(-1, 1)
+    labels = self.CLUSTER.fit_predict(sims)
+    clusters = dict()
+    for tup, l in zip(sri, labels):
+      clusters.setdefault(l, list()).append(tup)
+    # Find most similar cluster
+    label, _ = max([(l, max(map(itemgetter(1), c))) for l, c in clusters.items()],
+                     key=itemgetter(1))
+    matches = clusters[label]
+    # Sort rules by position
+    matches.sort(key=itemgetter(2))
+    return matches
 
   def prove(self, exprs, pos=0, depth=0):
     """Prove given expression on the knowledge base."""
@@ -44,7 +59,7 @@ class KnowledgeBase:
     # Save state for backtracking
     state = exprs[0].save_state()
     # Find matching rules
-    for sim, rule in self.match(exprs[0], pos=pos):
+    for rule, sim, _ in self.match(exprs[0], pos=pos):
       # Load state
       exprs[0].load_state(state)
       log.debug("PMATCH: %f -- %s -- %s ", sim, repr(exprs[0]), repr(rule))
@@ -56,3 +71,9 @@ class KnowledgeBase:
       for child_conf, child_rules in self.prove(goal_rule.body + exprs[1:], depth=depth+1):
         yield confidence*child_conf, (goal_rule,)+child_rules
     # We exhausted all options
+
+  def __repr__(self):
+    return '\n'.join(map(repr, self.rules))
+
+  def __str__(self):
+    return '\n'.join(map(str, self.rules))
