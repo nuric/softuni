@@ -4,6 +4,7 @@ import logging
 import numpy as np
 import chainer as C
 import chainer.links as L
+import chainer.functions as F
 
 
 # Arguments
@@ -81,6 +82,21 @@ print(enc_stories[0])
 
 # ---------------------------
 
+# Utility functions for neural networks
+def sequence_embed(seqs):
+  """Embed sequences of integer ids to word vectors."""
+  x_len = [len(x) for x in seqs]
+  x_section = np.cumsum(x_len[:-1])
+  ex = F.embed_id(F.concat(seqs, axis=0), wordvecs)
+  exs = F.split_axis(ex, x_section, 0)
+  return exs
+
+def bow_encode(exs):
+  """Given sentences compute is bag-of-words representation."""
+  return [F.sum(e, axis=0) for e in exs]
+
+# ---------------------------
+
 # Rule generating network
 class RuleGen(C.Chain):
   """Takes an example story-> context, query, answer
@@ -92,6 +108,18 @@ class RuleGen(C.Chain):
 
   def forward(self, story):
     """Given a story generate a probabilistic learnable rule."""
+    # Encode sequences
+    embedded_ctx = sequence_embed(story['context']) # [(s1len, 300), (s2len, 300), ...]
+    enc_ctx = bow_encode(embedded_ctx) # [(300,), (300,), ...]
+    enc_ctx = F.concat([F.expand_dims(e, 0) for e in enc_ctx], axis=0) # (clen, 300)
+    embedded_q = sequence_embed([story['query']])[0] # (qlen, 300)
+    enc_query = bow_encode([embedded_q])[0] # (300,)
+    print(enc_query)
+    # import pdb; pdb.set_trace()
+    # Need:
+    # - whether a fact is in the body or not, negated or not, multi-label -> (clen, 2)
+    # - whether each word in story is a variable, multi-class
+    #   -> {'answer':(alen, 6), 'query':(qlen, 6), ...}
     print("RULEGEN:", self.links(), story)
     return "new rule"
 rulegen = RuleGen()
@@ -99,9 +127,9 @@ rulegen = RuleGen()
 # ---------------------------
 
 # Stories to generate rules from
-repo = [stories[0]]
+repo = [enc_stories[0]]
 # Train loop
-for dstory in stories[1:]:
+for dstory in enc_stories[1:]:
   # Get rules based on seen stories
   rules = [rulegen(s) for s in repo]
   print("RULES:", rules)
