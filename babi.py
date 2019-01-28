@@ -93,13 +93,15 @@ for story in stories:
       print("-----")
       print("QUERY:", q)
       print("ANSWER:", prediction, confidence)
-      print("EXPECTED:", a, sups)
+      print("EXPECTED:", a, [story[i] for i in sups])
       print("-----")
       # Attempt to one-shot learn
       rule = one_shot(q, a, sups, story)
       print("NEWRULE:", rule)
       learned_rules.append(rule)
       kb.rules.append(rule)
+      # if len(learned_rules) > 1:
+        # exit()
 print("--ALLPASS--")
 print("-----------")
 print("--LEARNED--")
