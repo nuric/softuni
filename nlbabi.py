@@ -54,7 +54,7 @@ with open(ARGS.vocab) as f:
     word, *vec = l.split(' ')
     wordvecs.append(np.array([float(n) for n in vec]))
     word2idx[word] = i
-wordvecs = np.array(wordvecs)
+wordvecs = np.array(wordvecs, dtype=np.float32)
 print("VOCAB:", wordvecs.shape)
 
 # ---------------------------
@@ -104,7 +104,7 @@ class RuleGen(C.Chain):
   def __init__(self):
     super().__init__()
     with self.init_scope():
-      self.linear1 = L.Linear(2, 3)
+      self.bodylinear = L.Linear(900, 2)
 
   def forward(self, story):
     """Given a story generate a probabilistic learnable rule."""
@@ -114,12 +114,16 @@ class RuleGen(C.Chain):
     enc_ctx = F.concat([F.expand_dims(e, 0) for e in enc_ctx], axis=0) # (clen, 300)
     embedded_q = sequence_embed([story['query']])[0] # (qlen, 300)
     enc_query = bow_encode([embedded_q])[0] # (300,)
-    print(enc_query)
-    # import pdb; pdb.set_trace()
-    # Need:
-    # - whether a fact is in the body or not, negated or not, multi-label -> (clen, 2)
-    # - whether each word in story is a variable, multi-class
-    #   -> {'answer':(alen, 6), 'query':(qlen, 6), ...}
+    embedded_as = sequence_embed([story['answers']])[0] # (alen, 300)
+    enc_answer = bow_encode([embedded_as])[0] # (300,)
+    # Whether a fact is in the body or not, negated or not, multi-label -> (clen, 2)
+    r_answer = F.repeat(F.expand_dims(enc_answer, 0), len(story['context']), axis=0) # (clen, 300)
+    r_query = F.repeat(F.expand_dims(enc_query, 0), len(story['context']), axis=0) # (clen, 300)
+    r_ctx = F.concat([r_answer, r_query, enc_ctx], axis=1) # (clen, 300*3)
+    ctxinbody = self.bodylinear(r_ctx)
+    ctxinbody = F.sigmoid(ctxinbody)
+    import pdb; pdb.set_trace()
+    # Whether each word in story is a variable, binary class -> {wordid:sigmoid}
     print("RULEGEN:", self.links(), story)
     return "new rule"
 rulegen = RuleGen()
