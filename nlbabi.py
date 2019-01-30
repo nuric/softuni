@@ -105,6 +105,8 @@ class RuleGen(C.Chain):
     super().__init__()
     with self.init_scope():
       self.bodylinear = L.Linear(900, 2)
+      self.convolve_words = L.Convolution1D(300, 16, 3, pad=1)
+      self.isvariable_linear = L.Linear(17, 1)
 
   def forward(self, story):
     """Given a story generate a probabilistic learnable rule."""
@@ -116,16 +118,41 @@ class RuleGen(C.Chain):
     enc_query = bow_encode([embedded_q])[0] # (300,)
     embedded_as = sequence_embed([story['answers']])[0] # (alen, 300)
     enc_answer = bow_encode([embedded_as])[0] # (300,)
+    # ---------------------------
     # Whether a fact is in the body or not, negated or not, multi-label -> (clen, 2)
     r_answer = F.repeat(F.expand_dims(enc_answer, 0), len(story['context']), axis=0) # (clen, 300)
     r_query = F.repeat(F.expand_dims(enc_query, 0), len(story['context']), axis=0) # (clen, 300)
     r_ctx = F.concat([r_answer, r_query, enc_ctx], axis=1) # (clen, 300*3)
     ctxinbody = self.bodylinear(r_ctx)
     ctxinbody = F.sigmoid(ctxinbody)
-    import pdb; pdb.set_trace()
+    # ---------------------------
     # Whether each word in story is a variable, binary class -> {wordid:sigmoid}
-    print("RULEGEN:", self.links(), story)
-    return "new rule"
+    words = np.concatenate([story['query']]+story['context']) # (qlen+s1len+s2len+...,)
+    unique_idxs, inverse_idxs, unique_counts = np.unique(words, return_inverse=True,
+                                                         return_counts=True)
+    # unique_idxs[inverse_idxs] == words
+    # len(inverse_idxs) == len(words)
+    # len(unique_counts) == len(unique_idxs)
+    # Compute contextuals by convolving each sentence
+    cwords = [F.squeeze(self.convolve_words(F.expand_dims(s.T, 0)), 0).T
+              for s in (embedded_q,)+embedded_ctx] # [(qlen,16), (s1len,16), (s2len,16), ...]
+    allwords = F.concat(cwords, axis=0) # (qlen+s1len+s2len+..., 16)
+    assert len(allwords) == len(inverse_idxs), "Convolved features do not match story len."
+    # Add whether they appear more than once
+    appeartwice = (unique_counts[inverse_idxs] > 1) # (qlen+s1len+s2len+...,)
+    appeartwice = appeartwice.astype(np.float32).reshape(-1, 1) # (qlen+s1len+s2len+..., 1)
+    allwords = F.concat([allwords, appeartwice], axis=1) # (qlen+s1len+s2len+..., 17)
+    wordvars = self.isvariable_linear(allwords) # (qlen+s1len+s2len+..., 1)
+    wordvars = F.squeeze(wordvars, 1) # (qlen+s1len+s2len+...,)
+    wordvars = F.sigmoid(wordvars) # (qlen+s1len+s2len+...,)
+    # Merge word variable predictions
+    iswordvar = {idx:1.0 for idx in unique_idxs}
+    for idx in inverse_idxs:
+      iswordvar[unique_idxs[idx]] *= wordvars[idx]
+    # ---------------------------
+    # Tells whether a context is in the body, negated or not
+    # and whether a word is a variable or not
+    return ctxinbody, iswordvar
 rulegen = RuleGen()
 
 # ---------------------------
