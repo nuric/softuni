@@ -152,8 +152,105 @@ class RuleGen(C.Chain):
     # ---------------------------
     # Tells whether a context is in the body, negated or not
     # and whether a word is a variable or not
-    return ctxinbody, iswordvar
+    return {'story': story, 'bodymap': ctxinbody, 'vmap': iswordvar}
 rulegen = RuleGen()
+
+# ---------------------------
+
+# Unification network
+class Unify(C.Chain):
+  """Semantic unification on two sentences with variables."""
+  def __init__(self):
+    super().__init__()
+    with self.init_scope():
+      self.linear = L.Linear(300, 2)
+      self.convolve_words = L.Convolution1D(300, 16, 3, pad=1)
+      self.match_rnn = L.NStepGRU(1, 16, 16, 0.1)
+      self.match_linear = L.Linear(16, 1)
+
+  def forward(self, toprove, candidates):
+    """Given two sentences compute variable matches and score."""
+    # toprove.shape = (plen, 300), candidates = [(s1len, 300), (s2len, 300), ...]
+    # ---------------------------
+    # Calculate a match for every word in s1 to every word in s2
+    # Compute contextual representations
+    cwords = [F.squeeze(self.convolve_words(F.expand_dims(s.T, 0)), 0).T
+              for s in (toprove,)+candidates] # [(plen,16), (s1len,16), (s2len,16]
+    # Compute similarity between every candidate
+    ctp, *ccandids = cwords # (plen,16), [(s1len,16), (s2len,16), ...]
+    sims = [F.softmax(ctp @ c.T, axis=1) for c in ccandids] # [(plen,s1len), (plen,s2len), ...]
+    # ---------------------------
+    # Calculate score for candidate matches
+    # Compute bag of words
+    pbow, *cbows = [F.expand_dims(F.sum(s, axis=0), 0) for s in cwords] # [(1,16), (1,16)]
+    pbow = F.expand_dims(pbow, 0) # (1,1,16) (layers, batchsize, 16)
+    cbows = F.concat(cbows, axis=0) # (len(candidates), 16)
+    _, scores = self.match_rnn(pbow, [cbows]) # _, [(len(candidates), 16)]
+    scores = self.match_linear(scores[0]) # (len(candidates), 1)
+    scores = F.softmax(F.squeeze(scores, 1), 0) # (len(candidates),)
+    # ---------------------------
+    # Calculate attended unififed word representations for toprove
+    uwords = F.concat([F.expand_dims(s @ c, 0) for s, c in zip(sims, candidates)], 0) # (len(candidates), plen, 300)
+    # Weighted sum using scores
+    final_words = F.einsum("i,ijk->jk", scores, uwords) # (plen, 300)
+    final_score = F.max(scores) # ()
+    return final_score, final_words
+
+# ---------------------------
+
+# Inference network
+class Infer(C.Chain):
+  """Takes a story, a set of rules and predicts answers."""
+  def __init__(self):
+    super().__init__()
+    with self.init_scope():
+      self.unify = Unify()
+
+  def forward(self, story, rules):
+    """Given story and rules predict answers."""
+    # Encode story
+    embedded_ctx = sequence_embed(story['context']) # [(s1len, 300), (s2len, 300), ...]
+    enc_ctx = bow_encode(embedded_ctx) # [(300,), (300,), ...]
+    enc_ctx = F.concat([F.expand_dims(e, 0) for e in enc_ctx], axis=0) # (clen, 300)
+    embedded_q = sequence_embed([story['query']])[0] # (qlen, 300)
+    enc_query = bow_encode([embedded_q])[0] # (300,)
+    # ---------------------------
+    # Iterative theorem proving
+    # Initialise variable states
+    varstates = [{vidx:self.xp.zeros(300, dtype=np.float32) for vidx in r['vmap'].keys()}
+                for r in rules]
+    # Compute iterative updates on variables
+    for i, r in enumerate(rules):
+      # Encode rule
+      enc_q = sequence_embed([r['story']['query']])[0] # (qlen, 300)
+      enc_body = sequence_embed(r['story']['context']) # [(s1len, 300), ...]
+      # ---------------------------
+      # Setup variable grounding based on variable state
+      vs = varstates[i]
+      # Iterative proof
+      for _ in range(1):
+        # Gather variable values
+        vvalues = [F.concat([F.expand_dims(vs[widx], 0) for widx in widxs], axis=0)
+                   for widxs in [r['story']['query']]+r['story']['context']]
+                  # [(qlen, 300), (s1len, 300), ...]
+        # Merge ground with variable values
+        grounds = (enc_q,)+enc_body # [(qlen, 300), (s1len, 300), ...]
+        vgates = [F.expand_dims(F.concat([F.expand_dims(r['vmap'][widx], 0) for widx in widxs], axis=0), 1)
+                  for widxs in [r['story']['query']]+r['story']['context']]
+                  # [(qlen, 1), (s1len, 1), ...]
+        qtoprove, *bodytoprove = [vg*vv+(1-vg)*gr for vg, vv, gr in zip(vgates, vvalues, grounds)]
+        # ---------------------------
+        # Unify query
+        _, qsims = self.unify(qtoprove, (embedded_q,))
+        # Unify body conditions
+        for btoprove in bodytoprove:
+          score, unified = self.unify(btoprove, embedded_ctx)
+          import ipdb; ipdb.set_trace()
+          print("HERE")
+    # Unify rule queries with story query
+    unified_q = [self.unify(r['story']['query'], story['query']) for r in rules]
+    return "infer"
+infer = Infer()
 
 # ---------------------------
 
@@ -163,5 +260,6 @@ repo = [enc_stories[0]]
 for dstory in enc_stories[1:]:
   # Get rules based on seen stories
   rules = [rulegen(s) for s in repo]
+  answer = infer(dstory, rules)
   print("RULES:", rules)
   break
