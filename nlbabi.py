@@ -123,8 +123,8 @@ class RuleGen(C.Chain):
     r_answer = F.repeat(F.expand_dims(enc_answer, 0), len(story['context']), axis=0) # (clen, 300)
     r_query = F.repeat(F.expand_dims(enc_query, 0), len(story['context']), axis=0) # (clen, 300)
     r_ctx = F.concat([r_answer, r_query, enc_ctx], axis=1) # (clen, 300*3)
-    ctxinbody = self.bodylinear(r_ctx)
-    ctxinbody = F.sigmoid(ctxinbody)
+    ctxinbody = self.bodylinear(r_ctx) # (clen, 2)
+    ctxinbody = F.sigmoid(ctxinbody) # (clen, 2)
     # ---------------------------
     # Whether each word in story is a variable, binary class -> {wordid:sigmoid}
     words = np.concatenate([story['query']]+story['context']) # (qlen+s1len+s2len+...,)
@@ -185,15 +185,16 @@ class Unify(C.Chain):
     pbow, *cbows = [F.expand_dims(F.sum(s, axis=0), 0) for s in cwords] # [(1,16), (1,16)]
     pbow = F.expand_dims(pbow, 0) # (1,1,16) (layers, batchsize, 16)
     cbows = F.concat(cbows, axis=0) # (len(candidates), 16)
-    _, scores = self.match_rnn(pbow, [cbows]) # _, [(len(candidates), 16)]
-    scores = self.match_linear(scores[0]) # (len(candidates), 1)
-    scores = F.softmax(F.squeeze(scores, 1), 0) # (len(candidates),)
+    _, raw_scores = self.match_rnn(pbow, [cbows]) # _, [(len(candidates), 16)]
+    raw_scores = self.match_linear(raw_scores[0]) # (len(candidates), 1)
+    raw_scores = F.squeeze(raw_scores, 1) # (len(candidates),)
     # ---------------------------
     # Calculate attended unififed word representations for toprove
     uwords = F.concat([F.expand_dims(s @ c, 0) for s, c in zip(sims, candidates)], 0) # (len(candidates), plen, 300)
     # Weighted sum using scores
-    final_words = F.einsum("i,ijk->jk", scores, uwords) # (plen, 300)
-    final_score = F.max(scores) # ()
+    weights = F.softmax(raw_scores, 0) # (len(candidates),)
+    final_words = F.einsum("i,ijk->jk", weights, uwords) # (plen, 300)
+    final_score = F.max(raw_scores) # ()
     return final_score, final_words
 
 # ---------------------------
@@ -211,7 +212,7 @@ class Infer(C.Chain):
     # Encode story
     embedded_ctx = sequence_embed(story['context']) # [(s1len, 300), (s2len, 300), ...]
     enc_ctx = bow_encode(embedded_ctx) # [(300,), (300,), ...]
-    enc_ctx = F.concat([F.expand_dims(e, 0) for e in enc_ctx], axis=0) # (clen, 300)
+    enc_ctx = F.vstack(enc_ctx) # (clen, 300)
     embedded_q = sequence_embed([story['query']])[0] # (qlen, 300)
     enc_query = bow_encode([embedded_q])[0] # (300,)
     # ---------------------------
@@ -220,35 +221,59 @@ class Infer(C.Chain):
     varstates = [{vidx:self.xp.zeros(300, dtype=np.float32) for vidx in r['vmap'].keys()}
                 for r in rules]
     # Compute iterative updates on variables
-    for i, r in enumerate(rules):
+    rscores = list() # final rule scores
+    for ridx, r in enumerate(rules):
       # Encode rule
       enc_q = sequence_embed([r['story']['query']])[0] # (qlen, 300)
       enc_body = sequence_embed(r['story']['context']) # [(s1len, 300), ...]
       # ---------------------------
       # Setup variable grounding based on variable state
-      vs = varstates[i]
+      vs = varstates[ridx]
       # Iterative proof
       for _ in range(1):
+        rwords = [r['story']['query']]+r['story']['context'] # [(qlen,), (s1len,), ...]
         # Gather variable values
-        vvalues = [F.concat([F.expand_dims(vs[widx], 0) for widx in widxs], axis=0)
-                   for widxs in [r['story']['query']]+r['story']['context']]
+        vvalues = [F.vstack([vs[widx] for widx in widxs]) for widxs in rwords]
                   # [(qlen, 300), (s1len, 300), ...]
         # Merge ground with variable values
         grounds = (enc_q,)+enc_body # [(qlen, 300), (s1len, 300), ...]
-        vgates = [F.expand_dims(F.concat([F.expand_dims(r['vmap'][widx], 0) for widx in widxs], axis=0), 1)
-                  for widxs in [r['story']['query']]+r['story']['context']]
+        vgates = [F.expand_dims(F.hstack([r['vmap'][widx] for widx in widxs]), 1)
+                  for widxs in rwords]
                   # [(qlen, 1), (s1len, 1), ...]
         qtoprove, *bodytoprove = [vg*vv+(1-vg)*gr for vg, vv, gr in zip(vgates, vvalues, grounds)]
         # ---------------------------
+        # Unifications give new variable values and a score for match
         # Unify query
-        _, qsims = self.unify(qtoprove, (embedded_q,))
+        qscore, qunified = self.unify(qtoprove, (embedded_q,)) # (), (qlen, 300)
+        scores, unifications = [qscore], [qunified]
         # Unify body conditions
         for btoprove in bodytoprove:
-          score, unified = self.unify(btoprove, embedded_ctx)
-          import ipdb; ipdb.set_trace()
-          print("HERE")
-    # Unify rule queries with story query
-    unified_q = [self.unify(r['story']['query'], story['query']) for r in rules]
+          score, unified = self.unify(btoprove, embedded_ctx) # (), (snlen, 300)
+          scores.append(score)
+          unifications.append(unified)
+        # ---------------------------
+        # Update variables after unification
+        words = np.concatenate(rwords) # (qlen+s1len+s2len+...,)
+        unique_idxs, unique_counts = np.unique(words, return_counts=True)
+        weights = [F.repeat(scores[i], len(seq)) for i, seq in enumerate(rwords)] # [(qlen,), (s1len,), ...]
+        weights = F.sigmoid(F.hstack(weights)) # (qlen+s1len+s2len+...,)
+        unifications = F.concat(unifications, 0) # (qlen+s1len+s2len+..., 300)
+        # Weighted sum based on sigmoid score
+        normalisations = {widx:0.0 for widx in unique_idxs}
+        for pidx, widx in enumerate(words):
+          normalisations[widx] += weights[pidx]
+        for pidx, widx in enumerate(words):
+          varstates[ridx][widx] += (unifications[pidx] / normalisations[widx])
+      # ---------------------------
+      # End iterations with final score for each premise
+      prem_scores = F.sigmoid(F.hstack(scores)) # (1 + len(body),)
+    # ---------------------------
+    # Compute overall score for rule
+    # r['bodymap'].shape == (len(body), 2) => inbody, isnegated
+    qscore, bscores = prem_scores[0], prem_scores[1:]
+    import ipdb; ipdb.set_trace()
+    print("HERE")
+    # ---------------------------
     return "infer"
 infer = Infer()
 
