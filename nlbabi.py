@@ -168,19 +168,22 @@ class Unify(C.Chain):
       self.match_rnn = L.NStepGRU(1, 16, 16, 0.1)
       self.match_linear = L.Linear(16, 1)
 
-  def forward(self, toprove, candidates):
+  def forward(self, toprove, candidates, embedded_candidates):
     """Given two sentences compute variable matches and score."""
-    # toprove.shape = (plen, 300), candidates = [(s1len, 300), (s2len, 300), ...]
+    # toprove.shape = (plen, 300)
+    # candidates = [(s1len,), (s2len,), ...]
+    # embedded_candidates = [(s1len, 300), (s2len, 300), ...]
+    assert len(candidates) == len(embedded_candidates), "Candidate lengths differ."
     # ---------------------------
     # Calculate a match for every word in s1 to every word in s2
     # Compute contextual representations
     cwords = [F.squeeze(self.convolve_words(F.expand_dims(s.T, 0)), 0).T
-              for s in (toprove,)+candidates] # [(plen,16), (s1len,16), (s2len,16]
+              for s in (toprove,)+embedded_candidates] # [(plen,16), (s1len,16), (s2len,16]
     # Compute similarity between every candidate
     ctp, *ccandids = cwords # (plen,16), [(s1len,16), (s2len,16), ...]
     sims = [F.softmax(ctp @ c.T, axis=1) for c in ccandids] # [(plen,s1len), (plen,s2len), ...]
     # ---------------------------
-    # Calculate score for candidate matches
+    # Calculate score for each candidate
     # Compute bag of words
     pbow, *cbows = [F.expand_dims(F.sum(s, axis=0), 0) for s in cwords] # [(1,16), (1,16)]
     pbow = F.expand_dims(pbow, 0) # (1,1,16) (layers, batchsize, 16)
@@ -189,13 +192,17 @@ class Unify(C.Chain):
     raw_scores = self.match_linear(raw_scores[0]) # (len(candidates), 1)
     raw_scores = F.squeeze(raw_scores, 1) # (len(candidates),)
     # ---------------------------
-    # Calculate attended unififed word representations for toprove
-    uwords = F.concat([F.expand_dims(s @ c, 0) for s, c in zip(sims, candidates)], 0) # (len(candidates), plen, 300)
+    # Calculate attended unified word representations for toprove
+    eye = self.xp.eye(len(word2idx))
+    unifications = [simvals @ eye[candidxs]
+                    for simvals, candidxs in zip(sims, candidates)]
+                   # len(candidates) [(plen, len(word2idx)), ...]
+    unifications = F.stack(unifications, axis=0) # (len(candidates), plen, len(word2idx)
     # Weighted sum using scores
     weights = F.softmax(raw_scores, 0) # (len(candidates),)
-    final_words = F.einsum("i,ijk->jk", weights, uwords) # (plen, 300)
+    final_uni = F.einsum("i,ijk->jk", weights, unifications) # (plen, len(word2idx))
     final_score = F.max(raw_scores) # ()
-    return final_score, final_words
+    return final_score, final_uni
 
 # ---------------------------
 
@@ -218,8 +225,8 @@ class Infer(C.Chain):
     # ---------------------------
     # Iterative theorem proving
     # Initialise variable states
-    varstates = [{vidx:self.xp.zeros(300, dtype=np.float32) for vidx in r['vmap'].keys()}
-                for r in rules]
+    varstates = [{vidx:self.xp.zeros(len(word2idx), dtype=np.float32) for vidx in r['vmap'].keys()}
+                 for r in rules]
     # Compute iterative updates on variables
     rscores = list() # final rule scores
     for ridx, r in enumerate(rules):
@@ -233,28 +240,29 @@ class Infer(C.Chain):
       for _ in range(1):
         rwords = [r['story']['query']]+r['story']['context'] # [(qlen,), (s1len,), ...]
         # Gather variable values
-        vvalues = [F.vstack([vs[widx] for widx in widxs]) for widxs in rwords]
+        vvalues = [F.vstack([vs[widx] @ wordvecs for widx in widxs]) for widxs in rwords]
                   # [(qlen, 300), (s1len, 300), ...]
         # Merge ground with variable values
         grounds = (enc_q,)+enc_body # [(qlen, 300), (s1len, 300), ...]
         vgates = [F.expand_dims(F.hstack([r['vmap'][widx] for widx in widxs]), 1)
-                  for widxs in rwords]
-                  # [(qlen, 1), (s1len, 1), ...]
+                  for widxs in rwords] # [(qlen, 1), (s1len, 1), ...]
         qtoprove, *bodytoprove = [vg*vv+(1-vg)*gr for vg, vv, gr in zip(vgates, vvalues, grounds)]
         # ---------------------------
         # Unifications give new variable values and a score for match
         # Unify query
-        qscore, qunified = self.unify(qtoprove, (embedded_q,)) # (), (qlen, 300)
+        qscore, qunified = self.unify(qtoprove, [story['query']], (embedded_q,)) # (), (qlen, len(word2idx))
         scores, unifications = [qscore], [qunified]
         # Unify body conditions
         for btoprove in bodytoprove:
-          score, unified = self.unify(btoprove, embedded_ctx) # (), (snlen, 300)
+          score, unified = self.unify(btoprove, story['context'], embedded_ctx) # (), (snlen, len(word2idx))
           scores.append(score)
           unifications.append(unified)
         # ---------------------------
         # Update variables after unification
         words = np.concatenate(rwords) # (qlen+s1len+s2len+...,)
         unique_idxs, unique_counts = np.unique(words, return_counts=True)
+        import ipdb; ipdb.set_trace()
+        print("HERE")
         weights = [F.repeat(scores[i], len(seq)) for i, seq in enumerate(rwords)] # [(qlen,), (s1len,), ...]
         weights = F.sigmoid(F.hstack(weights)) # (qlen+s1len+s2len+...,)
         unifications = F.concat(unifications, 0) # (qlen+s1len+s2len+..., 300)
