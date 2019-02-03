@@ -49,11 +49,13 @@ print("SAMPLE:", stories[0])
 # Load word vectors
 wordvecs = list()
 word2idx = dict()
+idx2word = dict()
 with open(ARGS.vocab) as f:
   for i, l in enumerate(f):
     word, *vec = l.split(' ')
     wordvecs.append(np.array([float(n) for n in vec]))
     word2idx[word] = i
+    idx2word[i] = word
 wordvecs = np.array(wordvecs, dtype=np.float32)
 print("VOCAB:", wordvecs.shape)
 
@@ -153,7 +155,6 @@ class RuleGen(C.Chain):
     # Tells whether a context is in the body, negated or not
     # and whether a word is a variable or not
     return {'story': story, 'bodymap': ctxinbody, 'vmap': iswordvar}
-rulegen = RuleGen()
 
 # ---------------------------
 
@@ -212,9 +213,10 @@ class Infer(C.Chain):
   def __init__(self):
     super().__init__()
     with self.init_scope():
+      self.rulegen = RuleGen()
       self.unify = Unify()
 
-  def forward(self, story, rules):
+  def forward(self, story, rule_stories):
     """Given story and rules predict answers."""
     # Encode story
     embedded_ctx = sequence_embed(story['context']) # [(s1len, 300), (s2len, 300), ...]
@@ -224,6 +226,7 @@ class Infer(C.Chain):
     enc_query = bow_encode([embedded_q])[0] # (300,)
     # ---------------------------
     # Iterative theorem proving
+    rules = [self.rulegen(s) for s in rule_stories]
     # Initialise variable states
     varstates = [{vidx:self.xp.zeros(len(word2idx), dtype=np.float32) for vidx in r['vmap'].keys()}
                  for r in rules]
@@ -291,9 +294,18 @@ class Infer(C.Chain):
     # ---------------------------
     # Weighted sum using rule scores to produce final result
     # *** Just single rule case for now***
-    import ipdb; ipdb.set_trace()
-    print("HERE")
-    return "infer"
+    # Read head of rule with variable mapping
+    r, vs = rules[0], varstates[0]
+    # Get ground value
+    eye = self.xp.eye(len(word2idx)) # (len(word2idx), len(word2idx))
+    asground = eye[r['story']['answers']] # (len(answers), len(word2idx))
+    # Get variable values
+    asvar = F.vstack([vs[widx] for widx in r['story']['answers']]) # (len(answers), len(word2idx))
+    # Compute final value using variable gating values
+    asvgates = F.hstack([r['vmap'][widx] for widx in r['story']['answers']]) # (len(answers),)
+    asvgates = F.expand_dims(asvgates, 1) # (len(answers), 1)
+    prediction = asvar*asvgates + (1-asvgates)*asground # (len(answers), len(word2idx))
+    return prediction, rscores[0]
 infer = Infer()
 
 # ---------------------------
@@ -303,7 +315,9 @@ repo = [enc_stories[0]]
 # Train loop
 for dstory in enc_stories[1:]:
   # Get rules based on seen stories
-  rules = [rulegen(s) for s in repo]
-  answer = infer(dstory, rules)
-  print("RULES:", rules)
+  print("RULES:", repo)
+  answer, confidence = infer(dstory, repo)
+  print("ANSWER:", answer)
+  print("CONFIDENCE:", confidence)
+  print("WORD:", idx2word[np.argmax(answer.array, axis=-1)[0]])
   break
