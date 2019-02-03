@@ -260,28 +260,39 @@ class Infer(C.Chain):
         # ---------------------------
         # Update variables after unification
         words = np.concatenate(rwords) # (qlen+s1len+s2len+...,)
-        unique_idxs, unique_counts = np.unique(words, return_counts=True)
-        import ipdb; ipdb.set_trace()
-        print("HERE")
+        unique_idxs = np.unique(words)
         weights = [F.repeat(scores[i], len(seq)) for i, seq in enumerate(rwords)] # [(qlen,), (s1len,), ...]
         weights = F.sigmoid(F.hstack(weights)) # (qlen+s1len+s2len+...,)
-        unifications = F.concat(unifications, 0) # (qlen+s1len+s2len+..., 300)
+        unifications = F.concat(unifications, 0) # (qlen+s1len+s2len+..., len(word2idx))
         # Weighted sum based on sigmoid score
         normalisations = {widx:0.0 for widx in unique_idxs}
         for pidx, widx in enumerate(words):
           normalisations[widx] += weights[pidx]
+        # Reset variable states
+        for widx in unique_idxs:
+          vs[widx] = self.xp.zeros(len(word2idx), dtype=np.float32)
+        # Update new variable states
         for pidx, widx in enumerate(words):
-          varstates[ridx][widx] += (unifications[pidx] / normalisations[widx])
+          vs[widx] += (weights[pidx] * unifications[pidx] / normalisations[widx])
       # ---------------------------
-      # End iterations with final score for each premise
+      # Compute overall score for rule
+      # r['bodymap'].shape == (len(body), 2) => inbody, isnegated
       prem_scores = F.sigmoid(F.hstack(scores)) # (1 + len(body),)
+      qscore, bscores = prem_scores[0], prem_scores[1:] # (), (len(body),)
+      # Computed negated scores: n(1-b) + (1-n)b
+      isneg = r['bodymap'][:,1] # (len(body),)
+      nbscores = isneg*(1-bscores) + (1-isneg)*bscores # (len(body),)
+      # Compute final scores for body premises: in*nb+(1-in)*1
+      inbody = r['bodymap'][:,0] # (len(body),)
+      fbscores = inbody*nbscores+(1-inbody) # (len(body),)
+      # Final score for rule following AND semantics
+      rscore = qscore * F.cumprod(fbscores)[-1] # ()
+      rscores.append(rscore)
     # ---------------------------
-    # Compute overall score for rule
-    # r['bodymap'].shape == (len(body), 2) => inbody, isnegated
-    qscore, bscores = prem_scores[0], prem_scores[1:]
+    # Weighted sum using rule scores to produce final result
+    # *** Just single rule case for now***
     import ipdb; ipdb.set_trace()
     print("HERE")
-    # ---------------------------
     return "infer"
 infer = Infer()
 
