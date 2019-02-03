@@ -1,6 +1,7 @@
 """bAbI run on neurolog."""
 import argparse
 import logging
+import time
 import numpy as np
 import chainer as C
 import chainer.links as L
@@ -182,7 +183,7 @@ class Unify(C.Chain):
               for s in (toprove,)+embedded_candidates] # [(plen,16), (s1len,16), (s2len,16]
     # Compute similarity between every candidate
     ctp, *ccandids = cwords # (plen,16), [(s1len,16), (s2len,16), ...]
-    sims = [F.softmax(ctp @ c.T, axis=1) for c in ccandids] # [(plen,s1len), (plen,s2len), ...]
+    raw_sims = [ctp @ c.T for c in ccandids] # [(plen,s1len), (plen,s2len), ...]
     # ---------------------------
     # Calculate score for each candidate
     # Compute bag of words
@@ -196,7 +197,7 @@ class Unify(C.Chain):
     # Calculate attended unified word representations for toprove
     eye = self.xp.eye(len(word2idx))
     unifications = [simvals @ eye[candidxs]
-                    for simvals, candidxs in zip(sims, candidates)]
+                    for simvals, candidxs in zip(raw_sims, candidates)]
                    # len(candidates) [(plen, len(word2idx)), ...]
     unifications = F.stack(unifications, axis=0) # (len(candidates), plen, len(word2idx)
     # Weighted sum using scores
@@ -306,18 +307,49 @@ class Infer(C.Chain):
     asvgates = F.expand_dims(asvgates, 1) # (len(answers), 1)
     prediction = asvar*asvgates + (1-asvgates)*asground # (len(answers), len(word2idx))
     return prediction, rscores[0]
-infer = Infer()
 
 # ---------------------------
 
+# Setup model
+model = Infer()
+optimiser = C.optimizers.Adam().setup(model)
+
 # Stories to generate rules from
-repo = [enc_stories[0]]
-# Train loop
-for dstory in enc_stories[1:]:
-  # Get rules based on seen stories
-  print("RULES:", repo)
-  answer, confidence = infer(dstory, repo)
-  print("ANSWER:", answer)
-  print("CONFIDENCE:", confidence)
-  print("WORD:", idx2word[np.argmax(answer.array, axis=-1)[0]])
-  break
+rule_repo = [enc_stories[0]]
+training = enc_stories[:9]
+
+for sidx, curr_story in enumerate(enc_stories[9:]):
+  answer, confidence = model(curr_story, rule_repo)
+  # answer.shape == (len(answers), len(word2idx))
+  # Check if correct answer
+  prediction = np.argmax(F.softmax(answer).array, axis=-1)[0]
+  if prediction == curr_story['answers'][0]:
+    continue
+  print("# ---------------------------")
+  print(stories[sidx+1])
+  print("WRONG:", idx2word[prediction], idx2word[curr_story['answers'][0]])
+  # Add to training set
+  training.append(curr_story)
+  print("TRAINING SIZE:", len(training))
+  print("# ---------------------------")
+  # ---------------------------
+  try:
+    # and retrain network
+    for epoch in range(100):
+      stime = time.time()
+      model.cleargrads()
+      outs = [model(ts, rule_repo)[0] for ts in training] # [(1, len(word2idx), ...]
+      preds = F.vstack(outs) # (len(training), len(word2idx))
+      targets = np.array([ts['answers'][0] for ts in training]) # (len(training),)
+      loss = F.softmax_cross_entropy(preds, targets)
+      if loss.array < 0.01:
+        break
+      loss.backward()
+      optimiser.update()
+      etime = time.time()
+      print(f"Epoch: {epoch} Loss: {str(loss.array)} Time: {round(etime-stime,3)}")
+  except KeyboardInterrupt:
+    import ipdb; ipdb.set_trace()
+
+print("\nTraining complete:")
+print("RULES:", rule_repo)
