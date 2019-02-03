@@ -8,6 +8,9 @@ import chainer.links as L
 import chainer.functions as F
 
 
+# Disable scientific printing
+np.set_printoptions(suppress=True)
+
 # Arguments
 parser = argparse.ArgumentParser(description="Run NeuroLog on bAbI tasks.")
 parser.add_argument("task", help="File that contains task.")
@@ -36,8 +39,10 @@ with open(ARGS.task) as f:
     # Check for question or not
     if '\t' in sl:
       q, a, _ = sl.split('\t')
-      stories.append({'context': context.copy(),
-                      'query': q, 'answers': a.split(',')})
+      cctx = context.copy()
+      cctx.reverse()
+      stories.append({'context': cctx, 'query': q,
+                      'answers': a.split(',')})
     else:
       # Just a statement
       context.append(sl)
@@ -48,15 +53,14 @@ print("SAMPLE:", stories[0])
 # ---------------------------
 
 # Load word vectors
-wordvecs = list()
-word2idx = dict()
-idx2word = dict()
+wordvecs = [np.zeros(300, dtype=np.float32)]
+word2idx = {'unk':0}
+idx2word = {0:'unk'}
 with open(ARGS.vocab) as f:
   for i, l in enumerate(f):
     word, *vec = l.split(' ')
-    wordvecs.append(np.array([float(n) for n in vec]))
-    word2idx[word] = i
-    idx2word[i] = word
+    wordvecs.append(np.array([float(n) for n in vec], dtype=np.float32))
+    word2idx[word], idx2word[i+1] = i+1, word
 wordvecs = np.array(wordvecs, dtype=np.float32)
 print("VOCAB:", wordvecs.shape)
 
@@ -244,7 +248,7 @@ class Infer(C.Chain):
       for _ in range(1):
         rwords = [r['story']['query']]+r['story']['context'] # [(qlen,), (s1len,), ...]
         # Gather variable values
-        vvalues = [F.vstack([vs[widx] @ wordvecs for widx in widxs]) for widxs in rwords]
+        vvalues = [F.vstack([F.softmax(vs[widx], 0) @ wordvecs for widx in widxs]) for widxs in rwords]
                   # [(qlen, 300), (s1len, 300), ...]
         # Merge ground with variable values
         grounds = (enc_q,)+enc_body # [(qlen, 300), (s1len, 300), ...]
@@ -296,7 +300,7 @@ class Infer(C.Chain):
     # Weighted sum using rule scores to produce final result
     # *** Just single rule case for now***
     # Read head of rule with variable mapping
-    r, vs = rules[0], varstates[0]
+    r, rscore, vs = rules[0], rscores[0], varstates[0]
     # Get ground value
     eye = self.xp.eye(len(word2idx)) # (len(word2idx), len(word2idx))
     asground = eye[r['story']['answers']] # (len(answers), len(word2idx))
@@ -306,7 +310,11 @@ class Infer(C.Chain):
     asvgates = F.hstack([r['vmap'][widx] for widx in r['story']['answers']]) # (len(answers),)
     asvgates = F.expand_dims(asvgates, 1) # (len(answers), 1)
     prediction = asvar*asvgates + (1-asvgates)*asground # (len(answers), len(word2idx))
-    return prediction, rscores[0]
+    # Compute final final value using rule score
+    noans = self.xp.zeros(prediction.shape) # (len(answers), len(word2idx))
+    noans[0,0] = 10.0 # high unnormalised score for unknown word
+    answer = rscore*prediction + (1-rscore)*noans # (len(answers), len(word2idx))
+    return answer, rscore
 
 # ---------------------------
 
@@ -316,9 +324,17 @@ optimiser = C.optimizers.Adam().setup(model)
 
 # Stories to generate rules from
 rule_repo = [enc_stories[0]]
-training = enc_stories[:9]
+answers = set()
+training = list()
+init_tsize = 4
+for es in enc_stories[1:]:
+  if es['answers'][0] not in answers:
+    training.append(es)
+    answers.add(es['answers'][0])
+  if len(training) == init_tsize:
+    break
 
-for sidx, curr_story in enumerate(enc_stories[9:]):
+for sidx, curr_story in enumerate(enc_stories[init_tsize:]):
   answer, confidence = model(curr_story, rule_repo)
   # answer.shape == (len(answers), len(word2idx))
   # Check if correct answer
@@ -326,7 +342,7 @@ for sidx, curr_story in enumerate(enc_stories[9:]):
   if prediction == curr_story['answers'][0]:
     continue
   print("# ---------------------------")
-  print(stories[sidx+1])
+  print(stories[sidx+init_tsize])
   print("WRONG:", idx2word[prediction], idx2word[curr_story['answers'][0]])
   # Add to training set
   training.append(curr_story)
@@ -335,7 +351,7 @@ for sidx, curr_story in enumerate(enc_stories[9:]):
   # ---------------------------
   try:
     # and retrain network
-    for epoch in range(100):
+    for epoch in range(1000):
       stime = time.time()
       model.cleargrads()
       outs = [model(ts, rule_repo)[0] for ts in training] # [(1, len(word2idx), ...]
