@@ -9,7 +9,7 @@ import chainer.functions as F
 
 
 # Disable scientific printing
-np.set_printoptions(suppress=True)
+np.set_printoptions(suppress=True, precision=3)
 
 # Arguments
 parser = argparse.ArgumentParser(description="Run NeuroLog on bAbI tasks.")
@@ -144,7 +144,7 @@ class RuleGen(C.Chain):
     cwords = [F.squeeze(self.convolve_words(F.expand_dims(s.T, 0)), 0).T
               for s in (embedded_q,)+embedded_ctx] # [(qlen,16), (s1len,16), (s2len,16), ...]
     allwords = F.concat(cwords, axis=0) # (qlen+s1len+s2len+..., 16)
-    assert len(allwords) == len(inverse_idxs), "Convolved features do not match story len."
+    assert len(allwords) == len(words), "Convolved features do not match story len."
     # Add whether they appear more than once
     appeartwice = (unique_counts[inverse_idxs] > 1) # (qlen+s1len+s2len+...,)
     appeartwice = appeartwice.astype(np.float32).reshape(-1, 1) # (qlen+s1len+s2len+..., 1)
@@ -154,8 +154,8 @@ class RuleGen(C.Chain):
     wordvars = F.sigmoid(wordvars) # (qlen+s1len+s2len+...,)
     # Merge word variable predictions
     iswordvar = {idx:1.0 for idx in unique_idxs}
-    for idx in inverse_idxs:
-      iswordvar[unique_idxs[idx]] *= wordvars[idx]
+    for pidx, widx in enumerate(words):
+      iswordvar[widx] *= wordvars[pidx]
     # ---------------------------
     # Tells whether a context is in the body, negated or not
     # and whether a word is a variable or not
