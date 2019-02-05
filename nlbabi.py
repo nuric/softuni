@@ -188,10 +188,11 @@ class Unify(C.Chain):
     # Compute similarity between every candidate
     ctp, *ccandids = cwords # (plen,16), [(s1len,16), (s2len,16), ...]
     raw_sims = [ctp @ c.T for c in ccandids] # [(plen,s1len), (plen,s2len), ...]
+    # raw_sims = [toprove @ c.T for c in embedded_candidates] # [(plen,s1len), (plen,s2len), ...]
     # ---------------------------
     # Calculate score for each candidate
     # Compute bag of words
-    pbow, *cbows = [F.expand_dims(F.sum(s, axis=0), 0) for s in cwords] # [(1,16), (1,16)]
+    pbow, *cbows = [F.sum(s, axis=0, keepdims=True) for s in cwords] # [(1,16), (1,16)]
     pbow = F.expand_dims(pbow, 0) # (1,1,16) (layers, batchsize, 16)
     cbows = F.concat(cbows, axis=0) # (len(candidates), 16)
     _, raw_scores = self.match_rnn(pbow, [cbows]) # _, [(len(candidates), 16)]
@@ -237,22 +238,22 @@ class Infer(C.Chain):
                  for r in rules]
     # Compute iterative updates on variables
     rscores = list() # final rule scores
-    for ridx, r in enumerate(rules):
+    for ridx, rule in enumerate(rules):
       # Encode rule
-      enc_q = sequence_embed([r['story']['query']])[0] # (qlen, 300)
-      enc_body = sequence_embed(r['story']['context']) # [(s1len, 300), ...]
+      enc_q = sequence_embed([rule['story']['query']])[0] # (qlen, 300)
+      enc_body = sequence_embed(rule['story']['context']) # [(s1len, 300), ...]
       # ---------------------------
       # Setup variable grounding based on variable state
       vs = varstates[ridx]
       # Iterative proof
       for _ in range(1):
-        rwords = [r['story']['query']]+r['story']['context'] # [(qlen,), (s1len,), ...]
+        rwords = [rule['story']['query']]+rule['story']['context'] # [(qlen,), (s1len,), ...]
         # Gather variable values
         vvalues = [F.vstack([F.softmax(vs[widx], 0) @ wordvecs for widx in widxs]) for widxs in rwords]
                   # [(qlen, 300), (s1len, 300), ...]
         # Merge ground with variable values
         grounds = (enc_q,)+enc_body # [(qlen, 300), (s1len, 300), ...]
-        vgates = [F.expand_dims(F.hstack([r['vmap'][widx] for widx in widxs]), 1)
+        vgates = [F.expand_dims(F.hstack([rule['vmap'][widx] for widx in widxs]), 1)
                   for widxs in rwords] # [(qlen, 1), (s1len, 1), ...]
         qtoprove, *bodytoprove = [vg*vv+(1-vg)*gr for vg, vv, gr in zip(vgates, vvalues, grounds)]
         # ---------------------------
@@ -284,14 +285,14 @@ class Infer(C.Chain):
           vs[widx] += (weights[pidx] * unifications[pidx] / normalisations[widx])
       # ---------------------------
       # Compute overall score for rule
-      # r['bodymap'].shape == (len(body), 2) => inbody, isnegated
+      # rule['bodymap'].shape == (len(body), 2) => inbody, isnegated
       prem_scores = F.sigmoid(F.hstack(scores)) # (1 + len(body),)
       qscore, bscores = prem_scores[0], prem_scores[1:] # (), (len(body),)
       # Computed negated scores: n(1-b) + (1-n)b
-      isneg = r['bodymap'][:,1] # (len(body),)
+      isneg = rule['bodymap'][:,1] # (len(body),)
       nbscores = isneg*(1-bscores) + (1-isneg)*bscores # (len(body),)
       # Compute final scores for body premises: in*nb+(1-in)*1
-      inbody = r['bodymap'][:,0] # (len(body),)
+      inbody = rule['bodymap'][:,0] # (len(body),)
       fbscores = inbody*nbscores+(1-inbody) # (len(body),)
       # Final score for rule following AND semantics
       rscore = qscore * F.cumprod(fbscores)[-1] # ()
@@ -300,14 +301,14 @@ class Infer(C.Chain):
     # Weighted sum using rule scores to produce final result
     # *** Just single rule case for now***
     # Read head of rule with variable mapping
-    r, rscore, vs = rules[0], rscores[0], varstates[0]
+    rule, rscore, vs = rules[0], rscores[0], varstates[0]
     # Get ground value
     eye = self.xp.eye(len(word2idx)) # (len(word2idx), len(word2idx))
-    asground = eye[r['story']['answers']] # (len(answers), len(word2idx))
+    asground = eye[rule['story']['answers']] # (len(answers), len(word2idx))
     # Get variable values
-    asvar = F.vstack([vs[widx] for widx in r['story']['answers']]) # (len(answers), len(word2idx))
+    asvar = F.vstack([vs[widx] for widx in rule['story']['answers']]) # (len(answers), len(word2idx))
     # Compute final value using variable gating values
-    asvgates = F.hstack([r['vmap'][widx] for widx in r['story']['answers']]) # (len(answers),)
+    asvgates = F.hstack([rule['vmap'][widx] for widx in rule['story']['answers']]) # (len(answers),)
     asvgates = F.expand_dims(asvgates, 1) # (len(answers), 1)
     prediction = asvar*asvgates + (1-asvgates)*asground # (len(answers), len(word2idx))
     # Compute final final value using rule score
