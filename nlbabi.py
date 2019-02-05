@@ -232,21 +232,23 @@ class Infer(C.Chain):
     enc_query = bow_encode([embedded_q])[0] # (300,)
     # ---------------------------
     # Iterative theorem proving
-    rules = [self.rulegen(s) for s in rule_stories]
-    # Initialise variable states
-    varstates = [{vidx:self.xp.zeros(len(word2idx), dtype=np.float32) for vidx in r['vmap'].keys()}
-                 for r in rules]
+    rules = list()
+    unk = self.xp.zeros(len(word2idx), dtype=self.xp.float32) # Unknown word
+    unk[0] = 10.0 # High unnormalised score
+    for rs in rule_stories:
+      r = self.rulegen(rs) # Differentiable rule generated from story
+      vs = {vidx:unk for vidx in r['vmap'].keys()} # Init unknown for every variable
+      rules.append((r, vs))
     # Compute iterative updates on variables
     rscores = list() # final rule scores
-    for ridx, rule in enumerate(rules):
+    for rule, vs in rules:
       # Encode rule
       enc_q = sequence_embed([rule['story']['query']])[0] # (qlen, 300)
       enc_body = sequence_embed(rule['story']['context']) # [(s1len, 300), ...]
       # ---------------------------
-      # Setup variable grounding based on variable state
-      vs = varstates[ridx]
-      # Iterative proof
+      # Iterative proving
       for _ in range(1):
+        # Setup variable grounding based on variable state
         rwords = [rule['story']['query']]+rule['story']['context'] # [(qlen,), (s1len,), ...]
         # Gather variable values
         vvalues = [F.vstack([F.softmax(vs[widx], 0) @ wordvecs for widx in widxs]) for widxs in rwords]
