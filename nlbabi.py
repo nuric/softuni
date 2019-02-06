@@ -221,7 +221,7 @@ class Infer(C.Chain):
     with self.init_scope():
       self.rulegen = RuleGen()
       self.unify = Unify()
-      self.unkbias = C.Parameter(10.0, shape=(1,), name="unkbias")
+      self.unkbias = C.Parameter(1.0, shape=(1,), name="unkbias")
 
   def forward(self, story, rule_stories):
     """Given story and rules predict answers."""
@@ -302,19 +302,25 @@ class Infer(C.Chain):
     # Weighted sum using rule scores to produce final result
     # *** Just single rule case for now***
     # Read head of rule with variable mapping
-    rule, rscore, vs = rules[0], rscores[0], varstates[0]
+    rscore = rscores[0]
+    rule, vs = rules[0]
     # Get ground value
     eye = self.xp.eye(len(word2idx)) # (len(word2idx), len(word2idx))
     asground = eye[rule['story']['answers']] # (len(answers), len(word2idx))
     # Get variable values
     asvar = F.vstack([vs[widx] for widx in rule['story']['answers']]) # (len(answers), len(word2idx))
+    # Get maximum appearance of variable
+    varinbody = [[widx in seq for seq in rule['story']['context']] for widx in rule['story']['answers']]
+    varinbody = np.array(varinbody) # (len(answers), len(body))
+    inbody = rule['bodymap'][:,0] # (len(body),)
+    maxinbody = F.hstack([F.max(inbody[vb]) for vb in varinbody]) # (len(answers),)
     # Compute final value using variable gating values
     asvgates = F.hstack([rule['vmap'][widx] for widx in rule['story']['answers']]) # (len(answers),)
+    asvgates *= maxinbody # (len(answers),)
     asvgates = F.expand_dims(asvgates, 1) # (len(answers), 1)
-    prediction = asvar*asvgates + (1-asvgates)*asground # (len(answers), len(word2idx))
+    prediction = asvgates*asvar + (1-asvgates)*asground # (len(answers), len(word2idx))
     # Compute final final value using rule score
-    noans = self.xp.zeros(prediction.shape) # (len(answers), len(word2idx))
-    noans[0,0] = 10.0 # high unnormalised score for unknown word
+    noans = F.tile(unk, (len(rule['story']['answers']), 1)) # (len(answers), len(word2idx))
     answer = rscore*prediction + (1-rscore)*noans # (len(answers), len(word2idx))
     return answer, rscore
 
