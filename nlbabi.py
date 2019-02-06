@@ -221,6 +221,7 @@ class Infer(C.Chain):
     with self.init_scope():
       self.rulegen = RuleGen()
       self.unify = Unify()
+      self.unkbias = C.Parameter(10.0, shape=(1,), name="unkbias")
 
   def forward(self, story, rule_stories):
     """Given story and rules predict answers."""
@@ -233,8 +234,7 @@ class Infer(C.Chain):
     # ---------------------------
     # Iterative theorem proving
     rules = list()
-    unk = self.xp.zeros(len(word2idx), dtype=self.xp.float32) # Unknown word
-    unk[0] = 10.0 # High unnormalised score
+    unk = F.pad(self.unkbias, (0, len(word2idx)-1), 'constant', constant_values=0.0)
     for rs in rule_stories:
       r = self.rulegen(rs) # Differentiable rule generated from story
       vs = {vidx:unk for vidx in r['vmap'].keys()} # Init unknown for every variable
@@ -271,17 +271,16 @@ class Infer(C.Chain):
         # ---------------------------
         # Update variables after unification
         words = np.concatenate(rwords) # (qlen+s1len+s2len+...,)
-        unique_idxs = np.unique(words)
         weights = [F.repeat(scores[i], len(seq)) for i, seq in enumerate(rwords)] # [(qlen,), (s1len,), ...]
         weights = F.sigmoid(F.hstack(weights)) # (qlen+s1len+s2len+...,)
         unifications = F.concat(unifications, 0) # (qlen+s1len+s2len+..., len(word2idx))
         # Weighted sum based on sigmoid score
-        normalisations = {widx:0.0 for widx in unique_idxs}
+        normalisations = {widx:0.0 for widx in vs.keys()}
         for pidx, widx in enumerate(words):
           normalisations[widx] += weights[pidx]
         # Reset variable states
-        for widx in unique_idxs:
-          vs[widx] = self.xp.zeros(len(word2idx), dtype=np.float32)
+        for widx in vs.keys():
+          vs[widx] = unk
         # Update new variable states
         for pidx, widx in enumerate(words):
           vs[widx] += (weights[pidx] * unifications[pidx] / normalisations[widx])
