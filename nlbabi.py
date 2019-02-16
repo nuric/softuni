@@ -179,8 +179,8 @@ class Unify(C.Chain):
     super().__init__()
     with self.init_scope():
       self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
-      self.match_rnn = L.NStepGRU(1, EMBED, EMBED, 0.1)
-      self.match_linear = L.Linear(EMBED, 1)
+      self.match_linear = L.Linear(EMBED, EMBED)
+      self.temporal_enc = C.Parameter(C.initializers.Normal(1.0), (20, EMBED), name="tempenc")
 
   def forward(self, toprove, candidates, embedded_candidates):
     """Given two sentences compute variable matches and score."""
@@ -196,15 +196,14 @@ class Unify(C.Chain):
     # Compute similarity between every candidate
     ctp, *ccandids = cwords # (plen,16), [(s1len,16), (s2len,16), ...]
     raw_sims = [ctp @ c.T for c in ccandids] # [(plen,s1len), (plen,s2len), ...]
-    # raw_sims = [toprove @ c.T for c in embedded_candidates] # [(plen,s1len), (plen,s2len), ...]
     # ---------------------------
     # Calculate score for each candidate
     # Compute bag of words
-    pbow, *cbows = [F.sum(s, axis=0, keepdims=True) for s in cwords] # [(1,16), (1,16)]
-    pbow = F.expand_dims(pbow, 0) # (1,1,16) (layers, batchsize, 16)
-    cbows = F.concat(cbows, axis=0) # (len(candidates), 16)
-    _, raw_scores = self.match_rnn(pbow, [cbows]) # _, [(len(candidates), 16)]
-    raw_scores = self.match_linear(raw_scores[0]) # (len(candidates), 1)
+    pbow, *cbows = [F.sum(s, axis=0) for s in cwords] # (16,) [(16,), ...]
+    pbow = self.match_linear(F.expand_dims(pbow, 0)) # (1, 16)
+    cbows = F.vstack(cbows) # (len(candidates), 16)
+    cbows += self.temporal_enc[:cbows.shape[0],:] # (len(candidates), 16)
+    raw_scores = cbows @ pbow.T # (len(candidates), 1)
     raw_scores = F.squeeze(raw_scores, 1) # (len(candidates),)
     # ---------------------------
     # Calculate attended unified word representations for toprove
@@ -236,10 +235,7 @@ class Infer(C.Chain):
     """Given story and rules predict answers."""
     # Encode story
     embedded_ctx = sequence_embed(story['context'], self.embed) # [(s1len, E), (s2len, E), ...]
-    enc_ctx = pos_encode(embedded_ctx) # [(E,), (E,), ...]
-    enc_ctx = F.vstack(enc_ctx) # (clen, E)
     embedded_q = sequence_embed([story['query']], self.embed)[0] # (qlen, E)
-    enc_query = pos_encode([embedded_q])[0] # (E,)
     # ---------------------------
     # Iterative theorem proving
     rules = list()
