@@ -109,18 +109,18 @@ class RuleGen(C.Chain):
   def forward(self, story, embedded_story):
     """Given a story generate a probabilistic learnable rule."""
     # Encode sequences
-    embedded_ctx = embedded_story['context'] # [(s1len, 300), (s2len, 300), ...]
-    enc_ctx = bow_encode(embedded_ctx) # [(300,), (300,), ...]
-    enc_ctx = F.concat([F.expand_dims(e, 0) for e in enc_ctx], axis=0) # (clen, 300)
-    embedded_q = embedded_story['query'] # (qlen, 300)
-    enc_query = bow_encode([embedded_q])[0] # (300,)
-    embedded_as = embedded_story['answers'] # (alen, 300)
-    enc_answer = bow_encode([embedded_as])[0] # (300,)
+    embedded_ctx = embedded_story['context'] # [(s1len, E), (s2len, E), ...]
+    enc_ctx = bow_encode(embedded_ctx) # [(E,), (E,), ...]
+    enc_ctx = F.concat([F.expand_dims(e, 0) for e in enc_ctx], axis=0) # (clen, E)
+    embedded_q = embedded_story['query'] # (qlen, E)
+    enc_query = bow_encode([embedded_q])[0] # (E,)
+    embedded_as = embedded_story['answers'] # (alen, E)
+    enc_answer = bow_encode([embedded_as])[0] # (E,)
     # ---------------------------
     # Whether a fact is in the body or not, negated or not, multi-label -> (clen, 2)
-    r_answer = F.repeat(F.expand_dims(enc_answer, 0), len(story['context']), axis=0) # (clen, 300)
-    r_query = F.repeat(F.expand_dims(enc_query, 0), len(story['context']), axis=0) # (clen, 300)
-    r_ctx = F.concat([r_answer, r_query, enc_ctx], axis=1) # (clen, 300*3)
+    r_answer = F.repeat(F.expand_dims(enc_answer, 0), len(story['context']), axis=0) # (clen, E)
+    r_query = F.repeat(F.expand_dims(enc_query, 0), len(story['context']), axis=0) # (clen, E)
+    r_ctx = F.concat([r_answer, r_query, enc_ctx], axis=1) # (clen, E*3)
     ctxinbody = self.bodylinear(r_ctx) # (clen, 2)
     ctxinbody = F.sigmoid(ctxinbody) # (clen, 2)
     # ---------------------------
@@ -167,9 +167,9 @@ class Unify(C.Chain):
 
   def forward(self, toprove, candidates, embedded_candidates):
     """Given two sentences compute variable matches and score."""
-    # toprove.shape = (plen, 300)
+    # toprove.shape = (plen, E)
     # candidates = [(s1len,), (s2len,), ...]
-    # embedded_candidates = [(s1len, 300), (s2len, 300), ...]
+    # embedded_candidates = [(s1len, E), (s2len, E), ...]
     assert len(candidates) == len(embedded_candidates), "Candidate lengths differ."
     # ---------------------------
     # Calculate a match for every word in s1 to every word in s2
@@ -218,11 +218,11 @@ class Infer(C.Chain):
   def forward(self, story, rule_stories):
     """Given story and rules predict answers."""
     # Encode story
-    embedded_ctx = sequence_embed(story['context'], self.embed) # [(s1len, 300), (s2len, 300), ...]
-    enc_ctx = bow_encode(embedded_ctx) # [(300,), (300,), ...]
-    enc_ctx = F.vstack(enc_ctx) # (clen, 300)
-    embedded_q = sequence_embed([story['query']], self.embed)[0] # (qlen, 300)
-    enc_query = bow_encode([embedded_q])[0] # (300,)
+    embedded_ctx = sequence_embed(story['context'], self.embed) # [(s1len, E), (s2len, E), ...]
+    enc_ctx = bow_encode(embedded_ctx) # [(E,), (E,), ...]
+    enc_ctx = F.vstack(enc_ctx) # (clen, E)
+    embedded_q = sequence_embed([story['query']], self.embed)[0] # (qlen, E)
+    enc_query = bow_encode([embedded_q])[0] # (E,)
     # ---------------------------
     # Iterative theorem proving
     rules = list()
@@ -242,7 +242,7 @@ class Infer(C.Chain):
     rscores = list() # final rule scores
     for rule, vs, enc_rule in rules:
       # Encode rule
-      enc_q, enc_body = enc_rule['query'], enc_rule['context'] # (qlen, 300), [(s1len, 300), ...]
+      enc_q, enc_body = enc_rule['query'], enc_rule['context'] # (qlen, E), [(s1len, E), ...]
       # ---------------------------
       # Iterative proving
       for _ in range(1):
@@ -250,9 +250,9 @@ class Infer(C.Chain):
         rwords = [rule['story']['query']]+rule['story']['context'] # [(qlen,), (s1len,), ...]
         # Gather variable values
         vvalues = [F.vstack([F.softmax(vs[widx], 0) @ self.embed.W for widx in widxs]) for widxs in rwords]
-                  # [(qlen, 300), (s1len, 300), ...]
+                  # [(qlen, E), (s1len, E), ...]
         # Merge ground with variable values
-        grounds = (enc_q,)+enc_body # [(qlen, 300), (s1len, 300), ...]
+        grounds = (enc_q,)+enc_body # [(qlen, E), (s1len, E), ...]
         vgates = [F.expand_dims(F.hstack([rule['vmap'][widx] for widx in widxs]), 1)
                   for widxs in rwords] # [(qlen, 1), (s1len, 1), ...]
         qtoprove, *bodytoprove = [vg*vv+(1-vg)*gr for vg, vv, gr in zip(vgates, vvalues, grounds)]
