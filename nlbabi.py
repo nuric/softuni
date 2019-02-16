@@ -14,7 +14,6 @@ np.set_printoptions(suppress=True, precision=3)
 # Arguments
 parser = argparse.ArgumentParser(description="Run NeuroLog on bAbI tasks.")
 parser.add_argument("task", help="File that contains task.")
-parser.add_argument("vocab", help="File contains word vectors.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
 ARGS = parser.parse_args()
 
@@ -52,20 +51,6 @@ print("SAMPLE:", stories[0])
 
 # ---------------------------
 
-# Load word vectors
-wordvecs = [np.zeros(300, dtype=np.float32)]
-word2idx = {'unk':0}
-idx2word = {0:'unk'}
-with open(ARGS.vocab) as f:
-  for i, l in enumerate(f):
-    word, *vec = l.split(' ')
-    wordvecs.append(np.array([float(n) for n in vec], dtype=np.float32))
-    word2idx[word], idx2word[i+1] = i+1, word
-wordvecs = np.array(wordvecs, dtype=np.float32)
-print("VOCAB:", wordvecs.shape)
-
-# ---------------------------
-
 # Tokenisation of sentences
 def tokenise(text, filters='!"#$%&()*+,-./;<=>?@[\\]^_`{|}~\t\n', split=' '):
   """Lower case naive space based tokeniser."""
@@ -76,25 +61,31 @@ def tokenise(text, filters='!"#$%&()*+,-./;<=>?@[\\]^_`{|}~\t\n', split=' '):
   seq = text.split(split)
   return [i for i in seq if i]
 
+# Word indices
+word2idx = {'unk':0}
+
 # Encode stories
 def encode_story(story):
   """Convert given story into word vector indices."""
   es = dict()
-  es['context'] = [np.array([word2idx[w] for w in tokenise(s)]) for s in story['context']]
-  es['query'] = np.array([word2idx[w] for w in tokenise(story['query'])])
-  es['answers'] = np.array([word2idx[w] for w in story['answers']])
+  es['context'] = [np.array([word2idx.setdefault(w, len(word2idx)) for w in tokenise(s)]) for s in story['context']]
+  es['query'] = np.array([word2idx.setdefault(w, len(word2idx)) for w in tokenise(story['query'])])
+  es['answers'] = np.array([word2idx.setdefault(w, len(word2idx)) for w in story['answers']])
   return es
-enc_stories = C.datasets.TransformDataset(stories, encode_story)
+enc_stories = list(map(encode_story, stories))
 print(enc_stories[0])
+
+idx2word = {v:k for k, v in word2idx.items()}
+print("VOCAB:", len(word2idx))
 
 # ---------------------------
 
 # Utility functions for neural networks
-def sequence_embed(seqs):
+def sequence_embed(seqs, embed):
   """Embed sequences of integer ids to word vectors."""
   x_len = [len(x) for x in seqs]
   x_section = np.cumsum(x_len[:-1])
-  ex = F.embed_id(F.concat(seqs, axis=0), wordvecs)
+  ex = embed(F.concat(seqs, axis=0))
   exs = F.split_axis(ex, x_section, 0)
   return exs
 
@@ -111,19 +102,19 @@ class RuleGen(C.Chain):
   def __init__(self):
     super().__init__()
     with self.init_scope():
-      self.bodylinear = L.Linear(900, 2)
-      self.convolve_words = L.Convolution1D(300, 16, 3, pad=1)
+      self.bodylinear = L.Linear(16*3, 2)
+      self.convolve_words = L.Convolution1D(16, 16, 3, pad=1)
       self.isvariable_linear = L.Linear(18, 1)
 
-  def forward(self, story):
+  def forward(self, story, embedded_story):
     """Given a story generate a probabilistic learnable rule."""
     # Encode sequences
-    embedded_ctx = sequence_embed(story['context']) # [(s1len, 300), (s2len, 300), ...]
+    embedded_ctx = embedded_story['context'] # [(s1len, 300), (s2len, 300), ...]
     enc_ctx = bow_encode(embedded_ctx) # [(300,), (300,), ...]
     enc_ctx = F.concat([F.expand_dims(e, 0) for e in enc_ctx], axis=0) # (clen, 300)
-    embedded_q = sequence_embed([story['query']])[0] # (qlen, 300)
+    embedded_q = embedded_story['query'] # (qlen, 300)
     enc_query = bow_encode([embedded_q])[0] # (300,)
-    embedded_as = sequence_embed([story['answers']])[0] # (alen, 300)
+    embedded_as = embedded_story['answers'] # (alen, 300)
     enc_answer = bow_encode([embedded_as])[0] # (300,)
     # ---------------------------
     # Whether a fact is in the body or not, negated or not, multi-label -> (clen, 2)
@@ -170,7 +161,7 @@ class Unify(C.Chain):
   def __init__(self):
     super().__init__()
     with self.init_scope():
-      self.convolve_words = L.Convolution1D(300, 16, 3, pad=1)
+      self.convolve_words = L.Convolution1D(16, 16, 3, pad=1)
       self.match_rnn = L.NStepGRU(1, 16, 16, 0.1)
       self.match_linear = L.Linear(16, 1)
 
@@ -219,39 +210,46 @@ class Infer(C.Chain):
   def __init__(self):
     super().__init__()
     with self.init_scope():
+      self.embed = C.links.EmbedID(len(word2idx), 16)
       self.rulegen = RuleGen()
       self.unify = Unify()
-      self.unkbias = C.Parameter(1.0, shape=(1,), name="unkbias")
+      self.unkbias = C.Parameter(4.0, shape=(1,), name="unkbias")
 
   def forward(self, story, rule_stories):
     """Given story and rules predict answers."""
     # Encode story
-    embedded_ctx = sequence_embed(story['context']) # [(s1len, 300), (s2len, 300), ...]
+    embedded_ctx = sequence_embed(story['context'], self.embed) # [(s1len, 300), (s2len, 300), ...]
     enc_ctx = bow_encode(embedded_ctx) # [(300,), (300,), ...]
     enc_ctx = F.vstack(enc_ctx) # (clen, 300)
-    embedded_q = sequence_embed([story['query']])[0] # (qlen, 300)
+    embedded_q = sequence_embed([story['query']], self.embed)[0] # (qlen, 300)
     enc_query = bow_encode([embedded_q])[0] # (300,)
     # ---------------------------
     # Iterative theorem proving
     rules = list()
     unk = F.pad(self.unkbias, (0, len(word2idx)-1), 'constant', constant_values=0.0)
     for rs in rule_stories:
-      r = self.rulegen(rs) # Differentiable rule generated from story
-      vs = {vidx:unk for vidx in r['vmap'].keys()} # Init unknown for every variable
-      rules.append((r, vs))
+      # Encode rule story
+      enc_rule = {'answers': sequence_embed([rs['answers']], self.embed)[0],
+                  'query': sequence_embed([rs['query']], self.embed)[0],
+                  'context': sequence_embed(rs['context'], self.embed)}
+      r = self.rulegen(rs, enc_rule) # Differentiable rule generated from story
+      # r = {'story': rs, 'bodymap': np.array([[0.0,0.0], [1.0,0.0]], dtype=np.float32),
+           # 'vmap': {3: np.array(0.0, dtype=np.float32), 4: np.array(0.0, dtype=np.float32), 5: np.array(1.0, dtype=np.float32), 6: np.array(0.0, dtype=np.float32), 7: np.array(0.0, dtype=np.float32), 8: np.array(1.0, dtype=np.float32), 9: np.array(0.0, dtype=np.float32), 10: np.array(0.0, dtype=np.float32), 11: np.array(0.0, dtype=np.float32), 12: np.array(0.0, dtype=np.float32)}}
+      vs = {vidx: F.pad(self.unkbias, (vidx, len(word2idx)-1-vidx), 'constant', constant_values=0.0)
+            for vidx in r['vmap'].keys()} # Init unknown for every variable
+      rules.append((r, vs, enc_rule))
     # Compute iterative updates on variables
     rscores = list() # final rule scores
-    for rule, vs in rules:
+    for rule, vs, enc_rule in rules:
       # Encode rule
-      enc_q = sequence_embed([rule['story']['query']])[0] # (qlen, 300)
-      enc_body = sequence_embed(rule['story']['context']) # [(s1len, 300), ...]
+      enc_q, enc_body = enc_rule['query'], enc_rule['context'] # (qlen, 300), [(s1len, 300), ...]
       # ---------------------------
       # Iterative proving
       for _ in range(1):
         # Setup variable grounding based on variable state
         rwords = [rule['story']['query']]+rule['story']['context'] # [(qlen,), (s1len,), ...]
         # Gather variable values
-        vvalues = [F.vstack([F.softmax(vs[widx], 0) @ wordvecs for widx in widxs]) for widxs in rwords]
+        vvalues = [F.vstack([F.softmax(vs[widx], 0) @ self.embed.W for widx in widxs]) for widxs in rwords]
                   # [(qlen, 300), (s1len, 300), ...]
         # Merge ground with variable values
         grounds = (enc_q,)+enc_body # [(qlen, 300), (s1len, 300), ...]
@@ -303,7 +301,7 @@ class Infer(C.Chain):
     # *** Just single rule case for now***
     # Read head of rule with variable mapping
     rscore = rscores[0]
-    rule, vs = rules[0]
+    rule, vs, _ = rules[0]
     # Get ground value
     eye = self.xp.eye(len(word2idx)) # (len(word2idx), len(word2idx))
     asground = eye[rule['story']['answers']] * self.unkbias # (len(answers), len(word2idx))
