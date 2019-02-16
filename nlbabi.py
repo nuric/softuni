@@ -21,6 +21,8 @@ ARGS = parser.parse_args()
 if ARGS.debug:
   logging.basicConfig(level=logging.DEBUG)
 
+EMBED = 16
+
 # ---------------------------
 
 # Load in task
@@ -91,7 +93,22 @@ def sequence_embed(seqs, embed):
 
 def bow_encode(exs):
   """Given sentences compute is bag-of-words representation."""
+  # [(s1len, E), (s2len, E), ...]
   return [F.sum(e, axis=0) for e in exs]
+
+# pe = np.zeros((20, EMBED), dtype=np.float32) # (20, E) 20 is max length
+# for pos in range(pe.shape[0]):
+  # for i in range(0, pe.shape[1], 2):
+    # pe[pos, i] = np.sin(pos / (10000 ** ((2*i)/EMBED)))
+    # pe[pos, i+1] = np.cos(pos / (10000 ** ((2*(i+1))/EMBED)))
+
+def pos_encode(exs):
+  """Given sentences compute positional encoding."""
+  # [(s1len, E), (s2len, E), ...]
+  def get_weights(slen):
+    return np.fromfunction(lambda j, k: 1 - (j + 1) / slen - (k + 1) / EMBED * (1 - 2 * (j + 1) / slen),
+                           (slen, EMBED), dtype=np.float32)
+  return [F.sum(e * get_weights(e.shape[0]), axis=0) for e in exs]
 
 # ---------------------------
 
@@ -102,20 +119,20 @@ class RuleGen(C.Chain):
   def __init__(self):
     super().__init__()
     with self.init_scope():
-      self.bodylinear = L.Linear(16*3, 2)
-      self.convolve_words = L.Convolution1D(16, 16, 3, pad=1)
-      self.isvariable_linear = L.Linear(18, 1)
+      self.bodylinear = L.Linear(EMBED*3, 2)
+      self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
+      self.isvariable_linear = L.Linear(EMBED+2, 1)
 
   def forward(self, story, embedded_story):
     """Given a story generate a probabilistic learnable rule."""
     # Encode sequences
     embedded_ctx = embedded_story['context'] # [(s1len, E), (s2len, E), ...]
-    enc_ctx = bow_encode(embedded_ctx) # [(E,), (E,), ...]
+    enc_ctx = pos_encode(embedded_ctx) # [(E,), (E,), ...]
     enc_ctx = F.concat([F.expand_dims(e, 0) for e in enc_ctx], axis=0) # (clen, E)
     embedded_q = embedded_story['query'] # (qlen, E)
-    enc_query = bow_encode([embedded_q])[0] # (E,)
+    enc_query = pos_encode([embedded_q])[0] # (E,)
     embedded_as = embedded_story['answers'] # (alen, E)
-    enc_answer = bow_encode([embedded_as])[0] # (E,)
+    enc_answer = pos_encode([embedded_as])[0] # (E,)
     # ---------------------------
     # Whether a fact is in the body or not, negated or not, multi-label -> (clen, 2)
     r_answer = F.repeat(F.expand_dims(enc_answer, 0), len(story['context']), axis=0) # (clen, E)
@@ -161,9 +178,9 @@ class Unify(C.Chain):
   def __init__(self):
     super().__init__()
     with self.init_scope():
-      self.convolve_words = L.Convolution1D(16, 16, 3, pad=1)
-      self.match_rnn = L.NStepGRU(1, 16, 16, 0.1)
-      self.match_linear = L.Linear(16, 1)
+      self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
+      self.match_rnn = L.NStepGRU(1, EMBED, EMBED, 0.1)
+      self.match_linear = L.Linear(EMBED, 1)
 
   def forward(self, toprove, candidates, embedded_candidates):
     """Given two sentences compute variable matches and score."""
@@ -210,7 +227,7 @@ class Infer(C.Chain):
   def __init__(self):
     super().__init__()
     with self.init_scope():
-      self.embed = C.links.EmbedID(len(word2idx), 16)
+      self.embed = C.links.EmbedID(len(word2idx), EMBED)
       self.rulegen = RuleGen()
       self.unify = Unify()
       self.unkbias = C.Parameter(4.0, shape=(1,), name="unkbias")
@@ -219,10 +236,10 @@ class Infer(C.Chain):
     """Given story and rules predict answers."""
     # Encode story
     embedded_ctx = sequence_embed(story['context'], self.embed) # [(s1len, E), (s2len, E), ...]
-    enc_ctx = bow_encode(embedded_ctx) # [(E,), (E,), ...]
+    enc_ctx = pos_encode(embedded_ctx) # [(E,), (E,), ...]
     enc_ctx = F.vstack(enc_ctx) # (clen, E)
     embedded_q = sequence_embed([story['query']], self.embed)[0] # (qlen, E)
-    enc_query = bow_encode([embedded_q])[0] # (E,)
+    enc_query = pos_encode([embedded_q])[0] # (E,)
     # ---------------------------
     # Iterative theorem proving
     rules = list()
@@ -292,7 +309,7 @@ class Infer(C.Chain):
       nbscores = isneg*(1-bscores) + (1-isneg)*bscores # (len(body),)
       # Compute final scores for body premises: in*nb+(1-in)*1
       inbody = rule['bodymap'][:,0] # (len(body),)
-      fbscores = inbody*nbscores # (len(body),)
+      fbscores = inbody*nbscores+(1-inbody) # (len(body),)
       # Final score for rule following AND semantics
       rscore = qscore * F.cumprod(fbscores)[-1] # ()
       rscores.append(rscore)
