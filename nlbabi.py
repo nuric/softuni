@@ -113,7 +113,7 @@ class RuleGen(C.Chain):
     with self.init_scope():
       self.bodylinear = L.Linear(900, 2)
       self.convolve_words = L.Convolution1D(300, 16, 3, pad=1)
-      self.isvariable_linear = L.Linear(17, 1)
+      self.isvariable_linear = L.Linear(18, 1)
 
   def forward(self, story):
     """Given a story generate a probabilistic learnable rule."""
@@ -148,7 +148,8 @@ class RuleGen(C.Chain):
     # Add whether they appear more than once
     appeartwice = (unique_counts[inverse_idxs] > 1) # (qlen+s1len+s2len+...,)
     appeartwice = appeartwice.astype(np.float32).reshape(-1, 1) # (qlen+s1len+s2len+..., 1)
-    allwords = F.concat([allwords, appeartwice], axis=1) # (qlen+s1len+s2len+..., 17)
+    appearanswer = np.array([w in story['answers'] for w in words], dtype=np.float32).reshape(-1, 1) # (qlen+s1len+s2len+..., 1)
+    allwords = F.concat([allwords, appeartwice, appearanswer], axis=1) # (qlen+s1len+s2len+..., 18)
     wordvars = self.isvariable_linear(allwords) # (qlen+s1len+s2len+..., 1)
     wordvars = F.squeeze(wordvars, 1) # (qlen+s1len+s2len+...,)
     wordvars = F.sigmoid(wordvars) # (qlen+s1len+s2len+...,)
@@ -169,7 +170,6 @@ class Unify(C.Chain):
   def __init__(self):
     super().__init__()
     with self.init_scope():
-      self.linear = L.Linear(300, 2)
       self.convolve_words = L.Convolution1D(300, 16, 3, pad=1)
       self.match_rnn = L.NStepGRU(1, 16, 16, 0.1)
       self.match_linear = L.Linear(16, 1)
@@ -272,7 +272,7 @@ class Infer(C.Chain):
         # Update variables after unification
         words = np.concatenate(rwords) # (qlen+s1len+s2len+...,)
         weights = [F.repeat(scores[i], len(seq)) for i, seq in enumerate(rwords)] # [(qlen,), (s1len,), ...]
-        weights = F.sigmoid(F.hstack(weights)) # (qlen+s1len+s2len+...,)
+        weights = F.hstack(weights) # (qlen+s1len+s2len+...,)
         unifications = F.concat(unifications, 0) # (qlen+s1len+s2len+..., len(word2idx))
         # Weighted sum based on sigmoid score
         normalisations = {widx:0.0 for widx in vs.keys()}
@@ -280,7 +280,7 @@ class Infer(C.Chain):
           normalisations[widx] += weights[pidx]
         # Reset variable states
         for widx in vs.keys():
-          vs[widx] = unk
+          vs[widx] = self.xp.zeros(len(word2idx)) # (len(word2idx),)
         # Update new variable states
         for pidx, widx in enumerate(words):
           vs[widx] += (weights[pidx] * unifications[pidx] / normalisations[widx])
@@ -294,7 +294,7 @@ class Infer(C.Chain):
       nbscores = isneg*(1-bscores) + (1-isneg)*bscores # (len(body),)
       # Compute final scores for body premises: in*nb+(1-in)*1
       inbody = rule['bodymap'][:,0] # (len(body),)
-      fbscores = inbody*nbscores+(1-inbody) # (len(body),)
+      fbscores = inbody*nbscores # (len(body),)
       # Final score for rule following AND semantics
       rscore = qscore * F.cumprod(fbscores)[-1] # ()
       rscores.append(rscore)
@@ -306,7 +306,7 @@ class Infer(C.Chain):
     rule, vs = rules[0]
     # Get ground value
     eye = self.xp.eye(len(word2idx)) # (len(word2idx), len(word2idx))
-    asground = eye[rule['story']['answers']] # (len(answers), len(word2idx))
+    asground = eye[rule['story']['answers']] * self.unkbias # (len(answers), len(word2idx))
     # Get variable values
     asvar = F.vstack([vs[widx] for widx in rule['story']['answers']]) # (len(answers), len(word2idx))
     # Get maximum appearance of variable
