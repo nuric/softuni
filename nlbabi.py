@@ -258,16 +258,15 @@ class Infer(C.Chain):
       enc_q, enc_body = enc_rule['query'], enc_rule['context'] # (qlen, E), [(s1len, E), ...]
       # ---------------------------
       # Iterative proving
-      for _ in range(1):
-        # Setup variable grounding based on variable state
-        rwords = [rule['story']['query']]+rule['story']['context'] # [(qlen,), (s1len,), ...]
+      rwords = [rule['story']['query']]+rule['story']['context'] # [(qlen,), (s1len,), ...]
+      grounds = (enc_q,)+enc_body # [(qlen, E), (s1len, E), ...]
+      vgates = [F.expand_dims(F.hstack([rule['vmap'][widx] for widx in widxs]), 1)
+                for widxs in rwords] # [(qlen, 1), (s1len, 1), ...]
+      for _ in range(2):
         # Gather variable values
         vvalues = [F.vstack([F.softmax(vs[widx], 0) @ self.embed.W for widx in widxs]) for widxs in rwords]
                   # [(qlen, E), (s1len, E), ...]
         # Merge ground with variable values
-        grounds = (enc_q,)+enc_body # [(qlen, E), (s1len, E), ...]
-        vgates = [F.expand_dims(F.hstack([rule['vmap'][widx] for widx in widxs]), 1)
-                  for widxs in rwords] # [(qlen, 1), (s1len, 1), ...]
         qtoprove, *bodytoprove = [vg*vv+(1-vg)*gr for vg, vv, gr in zip(vgates, vvalues, grounds)]
         # ---------------------------
         # Unifications give new variable values and a score for match
@@ -285,7 +284,7 @@ class Infer(C.Chain):
         weights = [F.repeat(scores[i], len(seq)) for i, seq in enumerate(rwords)] # [(qlen,), (s1len,), ...]
         weights = F.hstack(weights) # (qlen+s1len+s2len+...,)
         unifications = F.concat(unifications, 0) # (qlen+s1len+s2len+..., len(word2idx))
-        # Weighted sum based on sigmoid score
+        # Weighted sum based on score
         normalisations = {widx:0.0 for widx in vs.keys()}
         for pidx, widx in enumerate(words):
           normalisations[widx] += weights[pidx]
