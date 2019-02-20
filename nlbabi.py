@@ -239,7 +239,7 @@ class Infer(C.Chain):
       self.unify = Unify()
       self.unkbias = C.Parameter(4.0, shape=(1,), name="unkbias")
 
-  def forward(self, story, rule_stories):
+  def infer(self, story, rule_stories):
     """Given story and rules predict answers."""
     # Encode story
     embedded_ctx = sequence_embed(story['context'], self.embed) # [(s1len, E), (s2len, E), ...]
@@ -253,9 +253,9 @@ class Infer(C.Chain):
       enc_rule = {'answers': sequence_embed([rs['answers']], self.embed)[0],
                   'query': sequence_embed([rs['query']], self.embed)[0],
                   'context': sequence_embed(rs['context'], self.embed)}
-      r = self.rulegen(rs, enc_rule) # Differentiable rule generated from story
-      # r = {'story': rs, 'bodymap': np.array([[0.0,0.0], [1.0,0.0]], dtype=np.float32),
-           # 'vmap': {3: np.array(0.0, dtype=np.float32), 4: np.array(0.0, dtype=np.float32), 5: np.array(1.0, dtype=np.float32), 6: np.array(0.0, dtype=np.float32), 7: np.array(0.0, dtype=np.float32), 8: np.array(1.0, dtype=np.float32), 9: np.array(0.0, dtype=np.float32), 10: np.array(0.0, dtype=np.float32), 11: np.array(0.0, dtype=np.float32), 12: np.array(0.0, dtype=np.float32)}}
+      # r = self.rulegen(rs, enc_rule) # Differentiable rule generated from story
+      r = {'story': rs, 'bodymap': np.array([[0.0,0.0], [1.0,0.0]], dtype=np.float32),
+           'vmap': {1: np.array(0.0, dtype=np.float32), 2: np.array(0.0, dtype=np.float32), 3: np.array(0.0, dtype=np.float32), 4: np.array(0.0, dtype=np.float32), 5: np.array(0.0, dtype=np.float32), 6: np.array(1.0, dtype=np.float32), 7: np.array(0.0, dtype=np.float32), 8: np.array(1.0, dtype=np.float32), 9: np.array(0.0, dtype=np.float32), 10: np.array(0.0, dtype=np.float32)}}
       vs = {vidx: F.pad(self.unkbias, (vidx, len(word2idx)-1-vidx), 'constant', constant_values=0.0)
             for vidx in r['vmap'].keys()} # Init unknown for every variable
       rules.append((r, vs, enc_rule))
@@ -302,7 +302,7 @@ class Infer(C.Chain):
         weights = F.hstack(weights) # (qlen+s1len+s2len+...,)
         unifications = F.concat(unifications, 0) # (qlen+s1len+s2len+..., len(word2idx))
         # Weighted sum based on score
-        normalisations = {widx:1.0 for widx in vs.keys()}
+        normalisations = {widx:0.1 for widx in vs.keys()}
         for pidx, widx in enumerate(words):
           normalisations[widx] += weights[pidx]
         # Reset variable states
@@ -349,58 +349,50 @@ class Infer(C.Chain):
     # Compute final final value using rule score
     noans = F.tile(unk, (len(rule['story']['answers']), 1)) # (len(answers), len(word2idx))
     answer = rscore*prediction + (1-rscore)*noans # (len(answers), len(word2idx))
-    return answer, rscore
+    return answer #, rscore
+
+  def forward(self, stories):
+    """Compute the forward inference pass for given stories."""
+    preds = [self.infer(s, rule_repo)[0] for s in stories] # [(len(word2idx),), ...]
+    return F.vstack(preds) # (len(stories), len(word2idx))
+
+# ---------------------------
+
+# Stories to generate rules from
+rule_repo = [enc_stories[0]]
+answers = set()
+# training = list()
+# init_tsize = 9
+# for es in enc_stories[1:]:
+  # if es['answers'][0] not in answers:
+    # training.append(es)
+    # answers.add(es['answers'][0])
+  # if len(training) == init_tsize:
+    # break
 
 # ---------------------------
 
 # Setup model
 model = Infer()
-optimiser = C.optimizers.Adam().setup(model)
+cmodel = L.Classifier(model, lossfun=F.softmax_cross_entropy, accfun=F.accuracy)
 
-# Stories to generate rules from
-rule_repo = [enc_stories[0]]
-answers = set()
-training = list()
-init_tsize = 4
-for es in enc_stories[1:]:
-  if es['answers'][0] not in answers:
-    training.append(es)
-    answers.add(es['answers'][0])
-  if len(training) == init_tsize:
-    break
+optimiser = C.optimizers.Adam().setup(cmodel)
+# optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.01))
 
-for sidx, curr_story in enumerate(enc_stories[init_tsize:]):
-  answer, confidence = model(curr_story, rule_repo)
-  # answer.shape == (len(answers), len(word2idx))
-  # Check if correct answer
-  prediction = np.argmax(F.softmax(answer).array, axis=-1)[0]
-  if prediction == curr_story['answers'][0]:
-    continue
-  print("# ---------------------------")
-  print(stories[sidx+init_tsize])
-  print("WRONG:", idx2word[prediction], idx2word[curr_story['answers'][0]])
-  # Add to training set
-  training.append(curr_story)
-  print("TRAINING SIZE:", len(training))
-  print("# ---------------------------")
-  # ---------------------------
-  try:
-    # and retrain network
-    for epoch in range(1000):
-      stime = time.time()
-      model.cleargrads()
-      outs = [model(ts, rule_repo)[0] for ts in training] # [(1, len(word2idx), ...]
-      preds = F.vstack(outs) # (len(training), len(word2idx))
-      targets = np.array([ts['answers'][0] for ts in training]) # (len(training),)
-      loss = F.softmax_cross_entropy(preds, targets)
-      if loss.array < 0.01:
-        break
-      loss.backward()
-      optimiser.update()
-      etime = time.time()
-      print(f"Epoch: {epoch} Loss: {str(loss.array)} Time: {round(etime-stime,3)}")
-  except KeyboardInterrupt:
-    import ipdb; ipdb.set_trace()
+train_iter = C.iterators.SerialIterator(enc_stories, 32)
+def converter(stories, _):
+  """Coverts given batch to expected format for Classifier."""
+  return stories, np.array([s['answers'][0] for s in stories])
+updater = C.training.StandardUpdater(train_iter, optimiser, converter=converter, device=-1)
+trainer = C.training.Trainer(updater, (50, 'epoch'))
+trainer.extend(C.training.extensions.LogReport(trigger=(1,'iteration')))
+trainer.extend(C.training.extensions.FailOnNonNumber())
+trainer.extend(C.training.extensions.PrintReport(['epoch', 'iteration', 'elapsed_time', 'main/loss', 'main/accuracy']))
+# trainer.extend(C.training.extensions.ProgressBar(update_interval=10))
 
-print("\nTraining complete:")
-print("RULES:", rule_repo)
+try:
+  trainer.run()
+except KeyboardInterrupt:
+  pass
+import ipdb; ipdb.set_trace()
+answer, confidence = model.infer(enc_stories[1], rule_repo)
