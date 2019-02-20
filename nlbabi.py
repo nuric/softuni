@@ -179,7 +179,8 @@ class Unify(C.Chain):
     super().__init__()
     with self.init_scope():
       self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
-      self.match_linear = L.Linear(EMBED, EMBED)
+      self.match_linear = L.Linear(3*EMBED, EMBED)
+      self.match_score = L.Linear(EMBED, 1)
       self.temporal_enc = C.Parameter(C.initializers.Normal(1.0), (20, EMBED), name="tempenc")
 
   def forward(self, toprove, candidates, embedded_candidates):
@@ -199,11 +200,17 @@ class Unify(C.Chain):
     # ---------------------------
     # Calculate score for each candidate
     # Compute bag of words
-    pbow, *cbows = [F.sum(s, axis=0) for s in cwords] # (16,) [(16,), ...]
-    pbow = self.match_linear(F.expand_dims(pbow, 0)) # (1, 16)
-    cbows = F.vstack(cbows) # (len(candidates), 16)
-    cbows += self.temporal_enc[:cbows.shape[0],:] # (len(candidates), 16)
-    raw_scores = cbows @ pbow.T # (len(candidates), 1)
+    pbow, *cbows = [F.sum(s, axis=0) for s in cwords] # (E,) [(E,), ...]
+    # pbow = pos_encode([toprove])[0] # (E,)
+    # cbows = pos_encode(embedded_candidates) # [(E,), (E,)]
+    pbow = F.repeat(F.expand_dims(pbow, 0), len(candidates), axis=0) # (len(candidates), E)
+    cbows = F.vstack(cbows) # (len(candidates), E)
+    cbows += self.temporal_enc[:cbows.shape[0],:] # (len(candidates), E)
+    # raw_scores = cbows @ pbow.T # (len(candidates), 1)
+    pcbows = F.concat([pbow, cbows, pbow*cbows]) # (len(candidates), 3*E)
+    raw_scores = self.match_linear(pcbows) # (len(candidates, E)
+    raw_scores = F.tanh(raw_scores) # (len(candidates), E)
+    raw_scores = self.match_score(raw_scores) # (len(candidates, 1)
     raw_scores = F.squeeze(raw_scores, 1) # (len(candidates),)
     # ---------------------------
     # Calculate attended unified word representations for toprove
@@ -227,7 +234,8 @@ class Infer(C.Chain):
     super().__init__()
     with self.init_scope():
       self.embed = C.links.EmbedID(len(word2idx), EMBED)
-      self.rulegen = RuleGen()
+      # self.rulegen = RuleGen()
+      self.var_linear = C.links.Linear(EMBED, EMBED)
       self.unify = Unify()
       self.unkbias = C.Parameter(4.0, shape=(1,), name="unkbias")
 
@@ -251,27 +259,34 @@ class Infer(C.Chain):
       vs = {vidx: F.pad(self.unkbias, (vidx, len(word2idx)-1-vidx), 'constant', constant_values=0.0)
             for vidx in r['vmap'].keys()} # Init unknown for every variable
       rules.append((r, vs, enc_rule))
+    # ---------------------------
     # Compute iterative updates on variables
     rscores = list() # final rule scores
     for rule, vs, enc_rule in rules:
-      # Encode rule
-      enc_q, enc_body = enc_rule['query'], enc_rule['context'] # (qlen, E), [(s1len, E), ...]
-      # ---------------------------
       # Iterative proving
       rwords = [rule['story']['query']]+rule['story']['context'] # [(qlen,), (s1len,), ...]
-      grounds = (enc_q,)+enc_body # [(qlen, E), (s1len, E), ...]
+      grounds = (enc_rule['query'],)+enc_rule['context'] # [(qlen, E), (s1len, E), ...]
       vgates = [F.expand_dims(F.hstack([rule['vmap'][widx] for widx in widxs]), 1)
                 for widxs in rwords] # [(qlen, 1), (s1len, 1), ...]
-      for _ in range(2):
-        # Gather variable values
-        vvalues = [F.vstack([F.softmax(vs[widx], 0) @ self.embed.W for widx in widxs]) for widxs in rwords]
-                  # [(qlen, E), (s1len, E), ...]
+      for _ in range(1):
+        # ---------------------------
+        # Unify query first assuming given query is ground
+        qvvalues = F.vstack([F.softmax(vs[widx], 0) @ self.embed.W for widx in rwords[0]]) # (qlen, E)
+        qvvalues = self.var_linear(qvvalues) # (qlen, E)
+        qtoprove = vgates[0]*qvvalues + (1-vgates[0])*grounds[0] # (qlen, E)
+        qscore, qunified = self.unify(qtoprove, [story['query']], (embedded_q,)) # (), (qlen, len(word2idx))
+        # Update variable states with new unifications
+        for pidx, widx in enumerate(rwords[0]):
+          vs[widx] = qunified[pidx]
+        # ---------------------------
+        # Regather all variable values
+        vvalues = [F.vstack([F.softmax(vs[widx], 0) @ self.embed.W for widx in widxs]) for widxs in rwords[1:]]
+                  # [(s1len, E), ...]
+        vvalues = [self.var_linear(vv) for vv in vvalues] # [(s1len, E), ...]
         # Merge ground with variable values
-        qtoprove, *bodytoprove = [vg*vv+(1-vg)*gr for vg, vv, gr in zip(vgates, vvalues, grounds)]
+        bodytoprove = [vg*vv+(1-vg)*gr for vg, vv, gr in zip(vgates[1:], vvalues, grounds[1:])]
         # ---------------------------
         # Unifications give new variable values and a score for match
-        # Unify query
-        qscore, qunified = self.unify(qtoprove, [story['query']], (embedded_q,)) # (), (qlen, len(word2idx))
         scores, unifications = [qscore], [qunified]
         # Unify body conditions
         for btoprove in bodytoprove:
@@ -281,11 +296,13 @@ class Infer(C.Chain):
         # ---------------------------
         # Update variables after unification
         words = np.concatenate(rwords) # (qlen+s1len+s2len+...,)
-        weights = [F.repeat(scores[i], len(seq)) for i, seq in enumerate(rwords)] # [(qlen,), (s1len,), ...]
+        weights = [F.repeat(scores[0], len(rwords[0]))] # [(qlen,)
+        inbody = rule['bodymap'][:,0] # (len(body),)
+        weights.extend([F.repeat(scores[i]*inbody[i], len(seq)) for i, seq in enumerate(rwords[1:])]) # [(qlen,), (s1len,), ...]
         weights = F.hstack(weights) # (qlen+s1len+s2len+...,)
         unifications = F.concat(unifications, 0) # (qlen+s1len+s2len+..., len(word2idx))
         # Weighted sum based on score
-        normalisations = {widx:0.0 for widx in vs.keys()}
+        normalisations = {widx:1.0 for widx in vs.keys()}
         for pidx, widx in enumerate(words):
           normalisations[widx] += weights[pidx]
         # Reset variable states
