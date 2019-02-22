@@ -6,6 +6,9 @@ import numpy as np
 import chainer as C
 import chainer.links as L
 import chainer.functions as F
+import chainer.training as T
+import matplotlib
+matplotlib.use('pdf')
 
 
 # Disable scientific printing
@@ -13,7 +16,8 @@ np.set_printoptions(suppress=True, precision=3)
 
 # Arguments
 parser = argparse.ArgumentParser(description="Run NeuroLog on bAbI tasks.")
-parser.add_argument("task", help="File that contains task.")
+parser.add_argument("task", help="File that contains task train.")
+parser.add_argument("validation", help="File that contains task validation.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
 ARGS = parser.parse_args()
 
@@ -25,30 +29,35 @@ EMBED = 16
 
 # ---------------------------
 
-# Load in task
-stories = []
-with open(ARGS.task) as f:
-  prev_id = 1
-  context = list()
-  for line in f:
-    line = line.strip()
-    sid, sl = line.split(' ', 1)
-    # Is this a new story?
-    sid = int(sid)-1
-    if sid < prev_id:
-      context = list()
-    # Check for question or not
-    if '\t' in sl:
-      q, a, _ = sl.split('\t')
-      cctx = context.copy()
-      cctx.reverse()
-      stories.append({'context': cctx, 'query': q,
-                      'answers': a.split(',')})
-    else:
-      # Just a statement
-      context.append(sl)
-    prev_id = sid
-print("TOTAL:", len(stories), "stories")
+def load_task(fname):
+  """Load task stories from given file name."""
+  ss = []
+  with open(fname) as f:
+    prev_id = 1
+    context = list()
+    for line in f:
+      line = line.strip()
+      sid, sl = line.split(' ', 1)
+      # Is this a new story?
+      sid = int(sid)-1
+      if sid < prev_id:
+        context = list()
+      # Check for question or not
+      if '\t' in sl:
+        q, a, _ = sl.split('\t')
+        cctx = context.copy()
+        cctx.reverse()
+        ss.append({'context': cctx, 'query': q,
+                        'answers': a.split(',')})
+      else:
+        # Just a statement
+        context.append(sl)
+      prev_id = sid
+  return ss
+stories = load_task(ARGS.task)
+val_stories = load_task(ARGS.validation)
+print("TRAIN:", len(stories), "stories")
+print("VAL:", len(val_stories), "stories")
 print("SAMPLE:", stories[0])
 
 # ---------------------------
@@ -75,10 +84,11 @@ def encode_story(story):
   es['answers'] = np.array([word2idx.setdefault(w, len(word2idx)) for w in story['answers']])
   return es
 enc_stories = list(map(encode_story, stories))
-print(enc_stories[0])
-
+print("TRAIN VOCAB:", len(word2idx))
+val_enc_stories = list(map(encode_story, val_stories))
+print("VAL VOCAB:", len(word2idx))
+print("ENC SAMPLE:", enc_stories[0])
 idx2word = {v:k for k, v in word2idx.items()}
-print("VOCAB:", len(word2idx))
 
 # ---------------------------
 
@@ -233,9 +243,9 @@ class Infer(C.Chain):
   def __init__(self):
     super().__init__()
     with self.init_scope():
-      self.embed = C.links.EmbedID(len(word2idx), EMBED)
+      self.embed = L.EmbedID(len(word2idx), EMBED)
       # self.rulegen = RuleGen()
-      self.var_linear = C.links.Linear(EMBED, EMBED)
+      self.var_linear = L.Linear(EMBED, EMBED)
       self.unify = Unify()
       self.unkbias = C.Parameter(4.0, shape=(1,), name="unkbias")
 
@@ -383,12 +393,19 @@ train_iter = C.iterators.SerialIterator(enc_stories, 32)
 def converter(stories, _):
   """Coverts given batch to expected format for Classifier."""
   return stories, np.array([s['answers'][0] for s in stories])
-updater = C.training.StandardUpdater(train_iter, optimiser, converter=converter, device=-1)
-trainer = C.training.Trainer(updater, (50, 'epoch'))
-trainer.extend(C.training.extensions.LogReport(trigger=(1,'iteration')))
-trainer.extend(C.training.extensions.FailOnNonNumber())
-trainer.extend(C.training.extensions.PrintReport(['epoch', 'iteration', 'elapsed_time', 'main/loss', 'main/accuracy']))
-# trainer.extend(C.training.extensions.ProgressBar(update_interval=10))
+updater = T.StandardUpdater(train_iter, optimiser, converter=converter, device=-1)
+trainer = T.Trainer(updater, (50, 'epoch'))
+
+# Trainer extensions
+val_iter = C.iterators.SerialIterator(val_enc_stories, 32, repeat=False, shuffle=False)
+trainer.extend(T.extensions.Evaluator(val_iter, cmodel, converter=converter, device=-1))
+# trainer.extend(T.extensions.snapshot(), trigger=T.triggers.MinValueTrigger('validation/main/loss'))
+trainer.extend(T.extensions.LogReport(trigger=(1,'iteration')))
+trainer.extend(T.extensions.FailOnNonNumber())
+trainer.extend(T.extensions.PrintReport(['epoch', 'iteration', 'main/loss', 'validation/main/loss', 'main/accuracy', 'validation/main/accuracy', 'elapsed_time']))
+# trainer.extend(T.extensions.ProgressBar(update_interval=10))
+trainer.extend(T.extensions.PlotReport(['main/loss', 'validation/main/loss'], 'iteration', marker=None, file_name='loss.pdf'))
+trainer.extend(T.extensions.PlotReport(['main/accuracy', 'validation/main/accuracy'],'iteration', marker=None, file_name='accuracy.pdf'))
 
 try:
   trainer.run()
