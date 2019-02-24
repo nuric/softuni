@@ -194,8 +194,8 @@ class Unify(C.Chain):
     super().__init__()
     with self.init_scope():
       self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
-      self.match_linear = L.Linear(3*EMBED, EMBED)
-      self.match_score = L.Linear(EMBED, 1)
+      self.match_linear = L.Linear(6*EMBED, 3*EMBED)
+      self.match_score = L.Linear(3*EMBED, 1)
       self.temporal_enc = C.Parameter(C.initializers.Normal(1.0), (20, EMBED), name="tempenc")
 
   def forward(self, toprove, candidates, embedded_candidates):
@@ -220,9 +220,8 @@ class Unify(C.Chain):
     # cbows = pos_encode(embedded_candidates) # [(E,), (E,)]
     pbow = F.repeat(F.expand_dims(pbow, 0), len(candidates), axis=0) # (len(candidates), E)
     cbows = F.vstack(cbows) # (len(candidates), E)
-    cbows += self.temporal_enc[:cbows.shape[0],:] # (len(candidates), E)
-    # raw_scores = cbows @ pbow.T # (len(candidates), 1)
-    pcbows = F.concat([pbow, cbows, pbow*cbows]) # (len(candidates), 3*E)
+    tbows = self.temporal_enc[:cbows.shape[0], :] # (len(candidates), E)
+    pcbows = F.concat([pbow, cbows, pbow*cbows, tbows, tbows+cbows, tbows*cbows]) # (len(candidates), 6*E)
     raw_scores = self.match_linear(pcbows) # (len(candidates, E)
     raw_scores = F.tanh(raw_scores) # (len(candidates), E)
     raw_scores = self.match_score(raw_scores) # (len(candidates, 1)
