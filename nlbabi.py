@@ -1,6 +1,8 @@
 """bAbI run on neurolog."""
 import argparse
 import logging
+import os
+import signal
 import time
 import numpy as np
 import chainer as C
@@ -18,15 +20,18 @@ np.set_printoptions(suppress=True, precision=3)
 parser = argparse.ArgumentParser(description="Run NeuroLog on bAbI tasks.")
 parser.add_argument("task", help="File that contains task train.")
 parser.add_argument("validation", help="File that contains task validation.")
+parser.add_argument("--name", default="nlbabi", help="Name prefix for saving files etc.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
 ARGS = parser.parse_args()
 
 # Debug
 if ARGS.debug:
   logging.basicConfig(level=logging.DEBUG)
+  C.set_debug(True)
 
 EMBED = 16
 MAX_HIST = 25
+ITERATIONS = 3
 
 # ---------------------------
 
@@ -267,21 +272,26 @@ class Infer(C.Chain):
       self.var_linear = L.Linear(EMBED, EMBED)
       self.unify = Unify()
       self.unkbias = C.Parameter(4.0, shape=(1,), name="unkbias")
+      self.weye = self.xp.eye(len(word2idx), dtype=self.xp.float32) * self.unkbias# (V, V)
 
-  def forward(self, stories):
-    """Compute the forward inference pass for given stories."""
-    # ---------------------------
-    # Prepare rules from rule stories
+  def gen_rules(self):
+    """Apply rule generator on the rule repository with fresh state."""
     rules = list()
-    vs_init = self.xp.eye(len(word2idx), dtype=self.xp.float32) * self.unkbias # (V, V)
     for rs in self.rule_stories:
       # Encode rule story
       enc_rule = story_embed(rs, self.embed)
       r = self.rulegen(rs, enc_rule) # Differentiable rule generated from story
       # r = {'story': rs, 'bodymap': np.array([[0.0,0.0], [1.0,0.0]], dtype=np.float32),
            # 'vmap': np.array([0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0], dtype=np.float32)}
-      vs = F.tile(vs_init, (len(stories), 1, 1)) # (B, V, V)
+      vs = F.tile(self.weye, (len(stories), 1, 1)) # (B, V, V)
       rules.append([r, vs, enc_rule])
+    return rules
+
+  def forward(self, stories):
+    """Compute the forward inference pass for given stories."""
+    # ---------------------------
+    # Prepare rules from rule stories
+    rules = self.gen_rules() # [[rule_story, vstate, enc_rule], ...]
     # ---------------------------
     # Embed stories
     embedded_stories = [story_embed(s, self.embed) for s in stories] # (B, [{'answers': (alen, E), 'query': (qlen, E), 'context': [(s1len, E), ...]}, ...])
@@ -298,7 +308,7 @@ class Infer(C.Chain):
       concat_rwords = np.concatenate(rwords) # (qlen+s1len+s2len+...,)
       grounds = F.concat((enc_rule['query'],)+enc_rule['context'], 0) # (qlen+s1len+s2len+..., E)
       vgates = F.expand_dims(rule['vmap'][concat_rwords], 1) # (qlen+s1len+s2len+..., 1)
-      for _ in range(1):
+      for _ in range(ITERATIONS):
         # ---------------------------
         # Unify query first assuming given query is ground
         qvvalues = F.softmax(vs[:, rwords[0]], -1) # (B, qlen, V)
@@ -352,7 +362,8 @@ class Infer(C.Chain):
         unifications *= weights[..., None] # (B, qlen+s1len+s2len+..., V)
         unifications = F.scatter_add(self.xp.zeros((len(stories), len(word2idx), len(word2idx)), dtype=self.xp.float32),
                                      (batch_range, concat_rwords), unifications) # (B, V, V)
-        comprule[1] = unifications / normalisations[..., None]
+        vs = unifications / normalisations[..., None]
+        comprule[1] = vs
       # ---------------------------
       # Compute overall score for rule
       # rule['bodymap'].shape == (len(body), 2) => inbody, isnegated
@@ -375,8 +386,7 @@ class Infer(C.Chain):
       # Read head of rule with variable mapping
       aswords = rule['story']['answers'] # (len(answers),)
       # Get ground value
-      eye = self.xp.eye(len(word2idx)) # (V, V)
-      asground = eye[aswords] * self.unkbias # (len(answers), V)
+      asground = self.weye[aswords] # (len(answers), V)
       # Get variable values
       asvar = vs[:, aswords] # (B, len(answers), V)
       # Get maximum appearance of variable
@@ -390,7 +400,7 @@ class Infer(C.Chain):
       asvgates *= maxinbody # (len(answers),)
       prediction = asvgates[:,None]*asvar + (1-asvgates[:,None])*asground # (B, len(answers), V)
       # Compute final final value using rule score
-      noans = F.tile(vs_init[0], (len(stories), len(aswords), 1)) # (B, len(answers), V)
+      noans = F.tile(self.weye[0], (len(stories), len(aswords), 1)) # (B, len(answers), V)
       answers = rscore[:, None, None]*prediction + (1-rscore[:, None, None])*noans # (B, len(answers), V)
       # Shorcut for single rule cases
       if len(rules) == 1:
@@ -427,8 +437,9 @@ print("RULE REPO:", rule_repo)
 # Setup model
 model = Infer(rule_repo)
 cmodel = L.Classifier(model, lossfun=F.softmax_cross_entropy, accfun=F.accuracy)
-answers = model([enc_stories[1], enc_stories[20]])
-print("INIT ANSWERS:", answers)
+if ARGS.debug:
+  answers = model([enc_stories[1], enc_stories[20]])
+  print("INIT ANSWERS:", answers)
 
 optimiser = C.optimizers.Adam().setup(cmodel)
 optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
@@ -438,23 +449,47 @@ def converter(stories, _):
   """Coverts given batch to expected format for Classifier."""
   return stories, np.array([s['answers'][0] for s in stories])
 updater = T.StandardUpdater(train_iter, optimiser, converter=converter, device=-1)
-trainer = T.Trainer(updater, (50, 'epoch'))
+trainer = T.Trainer(updater, T.triggers.EarlyStoppingTrigger())
 
 # Trainer extensions
 val_iter = C.iterators.SerialIterator(val_enc_stories, 32, repeat=False, shuffle=False)
 trainer.extend(T.extensions.Evaluator(val_iter, cmodel, converter=converter, device=-1))
-# trainer.extend(T.extensions.snapshot(), trigger=T.triggers.MinValueTrigger('validation/main/loss'))
-trainer.extend(T.extensions.LogReport(trigger=(1,'iteration')))
+# trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_best.npz'), trigger=T.triggers.MinValueTrigger('validation/main/loss'))
+trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_latest.npz'), trigger=(1, 'epoch'))
+trainer.extend(T.extensions.LogReport(log_name=ARGS.name+'_log.json'))
 trainer.extend(T.extensions.FailOnNonNumber())
-trainer.extend(T.extensions.PrintReport(['epoch', 'iteration', 'main/loss', 'validation/main/loss', 'main/accuracy', 'validation/main/accuracy', 'elapsed_time']))
+trainer.extend(T.extensions.PrintReport(['epoch', 'main/loss', 'validation/main/loss', 'main/accuracy', 'validation/main/accuracy', 'elapsed_time']))
 # trainer.extend(T.extensions.ProgressBar(update_interval=10))
-trainer.extend(T.extensions.PlotReport(['main/loss', 'validation/main/loss'], 'iteration', marker=None, file_name='loss.pdf'))
-trainer.extend(T.extensions.PlotReport(['main/accuracy', 'validation/main/accuracy'],'iteration', marker=None, file_name='accuracy.pdf'))
+# trainer.extend(T.extensions.PlotReport(['main/loss', 'validation/main/loss'], 'iteration', marker=None, file_name=ARGS.name+'_loss.pdf'))
+# trainer.extend(T.extensions.PlotReport(['main/accuracy', 'validation/main/accuracy'],'iteration', marker=None, file_name=ARGS.name+'_acc.pdf'))
 
+# Setup training pausing
+trainer_statef = trainer.out + '/' + ARGS.name + '_latest.npz'
+def interrupt(signum, frame):
+  """Save and interrupt training."""
+  C.serializers.save_npz(trainer_statef, trainer)
+  print("Getting interrupted, saved trainer file:", trainer_statef)
+  raise KeyboardInterrupt
+signal.signal(signal.SIGTERM, interrupt)
+
+# Check previously saved trainer
+if os.path.isfile(trainer_statef):
+  C.serializers.load_npz(trainer_statef, trainer)
+  print("Loaded trainer state from:", trainer_statef)
+
+# Hit the train button
 try:
   trainer.run()
 except KeyboardInterrupt:
   pass
-import ipdb; ipdb.set_trace()
-answers = model([enc_stories[1], enc_stories[20]])
-print("FINAL ANSWERS:", answers)
+
+# Print final rules
+for r, _, _  in model.gen_rules():
+  print("RSTORY:", decode_story(r['story']))
+  print(r['bodymap'])
+  print(r['vmap'])
+# Extra inspection if we are debugging
+if ARGS.debug:
+  import ipdb; ipdb.set_trace()
+  answers = model([enc_stories[1], enc_stories[20]])
+  print("FINAL ANSWERS:", answers)
