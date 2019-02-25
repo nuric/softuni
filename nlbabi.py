@@ -26,6 +26,7 @@ if ARGS.debug:
   logging.basicConfig(level=logging.DEBUG)
 
 EMBED = 16
+MAX_HIST = 25
 
 # ---------------------------
 
@@ -47,7 +48,7 @@ def load_task(fname):
         q, a, _ = sl.split('\t')
         cctx = context.copy()
         cctx.reverse()
-        ss.append({'context': cctx, 'query': q,
+        ss.append({'context': cctx[:MAX_HIST], 'query': q,
                         'answers': a.split(',')})
       else:
         # Just a statement
@@ -201,7 +202,7 @@ class Unify(C.Chain):
       self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
       self.match_linear = L.Linear(6*EMBED, 3*EMBED)
       self.match_score = L.Linear(3*EMBED, 1)
-      self.temporal_enc = C.Parameter(C.initializers.Normal(1.0), (20, EMBED), name="tempenc")
+      self.temporal_enc = C.Parameter(C.initializers.Normal(1.0), (MAX_HIST, EMBED), name="tempenc")
 
   def forward(self, toprove, candidates, embedded_candidates):
     """Given two sentences compute variable matches and score."""
