@@ -134,27 +134,31 @@ class RuleGen(C.Chain):
   def __init__(self):
     super().__init__()
     with self.init_scope():
-      self.bodylinear = L.Linear(EMBED*3, 2)
+      self.body_linear = L.Linear(5*EMBED, 2*EMBED)
+      self.body_score = L.Linear(2*EMBED, 2)
       self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
-      self.isvariable_linear = L.Linear(EMBED+2, 1)
+      self.isvariable_linear = L.Linear(EMBED+2, EMBED)
+      self.isvariable_score = L.Linear(EMBED, 1)
 
   def forward(self, story, embedded_story):
     """Given a story generate a probabilistic learnable rule."""
     # Encode sequences
     embedded_ctx = embedded_story['context'] # [(s1len, E), (s2len, E), ...]
     enc_ctx = pos_encode(embedded_ctx) # [(E,), (E,), ...]
-    enc_ctx = F.concat([F.expand_dims(e, 0) for e in enc_ctx], axis=0) # (clen, E)
+    enc_ctx = F.vstack(enc_ctx) # (clen, E)
     embedded_q = embedded_story['query'] # (qlen, E)
     enc_query = pos_encode([embedded_q])[0] # (E,)
     embedded_as = embedded_story['answers'] # (alen, E)
     enc_answer = pos_encode([embedded_as])[0] # (E,)
     # ---------------------------
     # Whether a fact is in the body or not, negated or not, multi-label -> (clen, 2)
-    r_answer = F.repeat(F.expand_dims(enc_answer, 0), len(story['context']), axis=0) # (clen, E)
-    r_query = F.repeat(F.expand_dims(enc_query, 0), len(story['context']), axis=0) # (clen, E)
-    r_ctx = F.concat([r_answer, r_query, enc_ctx], axis=1) # (clen, E*3)
-    ctxinbody = self.bodylinear(r_ctx) # (clen, 2)
-    ctxinbody = F.sigmoid(ctxinbody) # (clen, 2)
+    r_answer = F.tile(enc_answer, (len(story['context']), 1)) # (clen, E)
+    r_query = F.tile(enc_query, (len(story['context']), 1)) # (clen, E)
+    r_ctx = F.concat([r_answer, r_query, enc_ctx, r_answer*enc_ctx, r_query*enc_ctx], axis=1) # (clen, 5*E)
+    inbody = self.body_linear(r_ctx) # (clen, 2*E)
+    inbody = F.tanh(inbody) # (clen, 2*E)
+    inbody = self.body_score(inbody) # (clen, 2)
+    inbody = F.sigmoid(inbody) # (clen, 2)
     # ---------------------------
     # Whether each word in story is a variable, binary class -> {wordid:sigmoid}
     words = np.concatenate([story['query']]+story['context']) # (qlen+s1len+s2len+...,)
@@ -166,24 +170,25 @@ class RuleGen(C.Chain):
     # Compute contextuals by convolving each sentence
     cwords = [F.squeeze(self.convolve_words(F.expand_dims(s.T, 0)), 0).T
               for s in (embedded_q,)+embedded_ctx] # [(qlen,16), (s1len,16), (s2len,16), ...]
-    allwords = F.concat(cwords, axis=0) # (qlen+s1len+s2len+..., 16)
-    assert len(allwords) == len(words), "Convolved features do not match story len."
+    allwords = F.concat(cwords, 0) # (qlen+s1len+s2len+..., 16)
     # Add whether they appear more than once
     appeartwice = (unique_counts[inverse_idxs] > 1) # (qlen+s1len+s2len+...,)
     appeartwice = appeartwice.astype(np.float32).reshape(-1, 1) # (qlen+s1len+s2len+..., 1)
     appearanswer = np.array([w in story['answers'] for w in words], dtype=np.float32).reshape(-1, 1) # (qlen+s1len+s2len+..., 1)
     allwords = F.concat([allwords, appeartwice, appearanswer], axis=1) # (qlen+s1len+s2len+..., 18)
-    wordvars = self.isvariable_linear(allwords) # (qlen+s1len+s2len+..., 1)
+    wordvars = self.isvariable_linear(allwords) # (qlen+s1len+s2len+..., E)
+    wordvars = F.tanh(wordvars) # (qlen+s1len+s2len+..., E)
+    wordvars = self.isvariable_score(wordvars) # (qlen+s1len+s2len+..., 1)
     wordvars = F.squeeze(wordvars, 1) # (qlen+s1len+s2len+...,)
-    wordvars = F.sigmoid(wordvars) # (qlen+s1len+s2len+...,)
     # Merge word variable predictions
-    iswordvar = {idx:1.0 for idx in unique_idxs}
-    for pidx, widx in enumerate(words):
-      iswordvar[widx] *= wordvars[pidx]
+    iswordvar = F.scatter_add(self.xp.zeros(len(word2idx), dtype=self.xp.float32), words, wordvars) # (len(word2idx),)
+    iswordvar = F.sigmoid(iswordvar) # (len(word2idx),)
+    mask = np.isin(np.arange(len(word2idx)), words).astype(np.float32) # (len(word2idx),)
+    iswordvar *= mask # (len(word2idx),)
     # ---------------------------
     # Tells whether a context is in the body, negated or not
     # and whether a word is a variable or not
-    return {'story': story, 'bodymap': ctxinbody, 'vmap': iswordvar}
+    return {'story': story, 'bodymap': inbody, 'vmap': iswordvar}
 
 # ---------------------------
 
@@ -249,7 +254,7 @@ class Infer(C.Chain):
     self.rule_stories = rule_stories
     with self.init_scope():
       self.embed = L.EmbedID(len(word2idx), EMBED)
-      # self.rulegen = RuleGen()
+      self.rulegen = RuleGen()
       self.var_linear = L.Linear(EMBED, EMBED)
       self.unify = Unify()
       self.unkbias = C.Parameter(4.0, shape=(1,), name="unkbias")
@@ -263,9 +268,9 @@ class Infer(C.Chain):
     for rs in self.rule_stories:
       # Encode rule story
       enc_rule = story_embed(rs, self.embed)
-      # r = self.rulegen(rs, enc_rule) # Differentiable rule generated from story
-      r = {'story': rs, 'bodymap': np.array([[0.0,0.0], [1.0,0.0]], dtype=np.float32),
-           'vmap': np.array([0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0], dtype=np.float32)}
+      r = self.rulegen(rs, enc_rule) # Differentiable rule generated from story
+      # r = {'story': rs, 'bodymap': np.array([[0.0,0.0], [1.0,0.0]], dtype=np.float32),
+           # 'vmap': np.array([0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0], dtype=np.float32)}
       vs = F.tile(vs_init, (len(stories), 1, 1)) # (B, len(word2idx), len(word2idx))
       rules.append([r, vs, enc_rule])
     # ---------------------------
@@ -400,6 +405,8 @@ answers = set()
 # Setup model
 model = Infer(rule_repo)
 cmodel = L.Classifier(model, lossfun=F.softmax_cross_entropy, accfun=F.accuracy)
+answers = model([enc_stories[1], enc_stories[20]])
+print("INIT ANSWERS:", answers)
 
 optimiser = C.optimizers.Adam().setup(cmodel)
 optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
@@ -427,4 +434,5 @@ try:
 except KeyboardInterrupt:
   pass
 import ipdb; ipdb.set_trace()
-answer = model([enc_stories[1], enc_stories[20]])
+answers = model([enc_stories[1], enc_stories[20]])
+print("FINAL ANSWERS:", answers)
