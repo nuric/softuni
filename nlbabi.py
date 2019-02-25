@@ -80,9 +80,9 @@ word2idx = {'unk':0}
 def encode_story(story):
   """Convert given story into word vector indices."""
   es = dict()
-  es['context'] = [np.array([word2idx.setdefault(w, len(word2idx)) for w in tokenise(s)]) for s in story['context']]
-  es['query'] = np.array([word2idx.setdefault(w, len(word2idx)) for w in tokenise(story['query'])])
-  es['answers'] = np.array([word2idx.setdefault(w, len(word2idx)) for w in story['answers']])
+  es['context'] = [np.array([word2idx.setdefault(w, len(word2idx)) for w in tokenise(s)], dtype=np.int32) for s in story['context']]
+  es['query'] = np.array([word2idx.setdefault(w, len(word2idx)) for w in tokenise(story['query'])], dtype=np.int32)
+  es['answers'] = np.array([word2idx.setdefault(w, len(word2idx)) for w in story['answers']], dtype=np.int32)
   return es
 enc_stories = list(map(encode_story, stories))
 print("TRAIN VOCAB:", len(word2idx))
@@ -90,6 +90,14 @@ val_enc_stories = list(map(encode_story, val_stories))
 print("VAL VOCAB:", len(word2idx))
 print("ENC SAMPLE:", enc_stories[0])
 idx2word = {v:k for k, v in word2idx.items()}
+
+def decode_story(story):
+  """Decode a given story back into words."""
+  ds = dict()
+  ds['context'] = [[idx2word[widx] for widx in c] for c in story['context']]
+  ds['query'] = [idx2word[widx] for widx in story['query']]
+  ds['answers'] = [idx2word[widx] for widx in story['answers']]
+  return ds
 
 # ---------------------------
 
@@ -361,45 +369,58 @@ class Infer(C.Chain):
       rscores.append(rscore)
     # ---------------------------
     # Weighted sum using rule scores to produce final result
-    # *** Just single rule case for now***
-    # Read head of rule with variable mapping
-    rscore = rscores[0]
-    rule, vs, _ = rules[0]
-    aswords = rule['story']['answers'] # (len(answers,)
-    # Get ground value
-    eye = self.xp.eye(len(word2idx)) # (V, V)
-    asground = eye[aswords] * self.unkbias # (len(answers), V)
-    # Get variable values
-    asvar = vs[:, aswords] # (B, len(answers), V)
-    # Get maximum appearance of variable
-    varinbody = [[widx in seq for seq in rule['story']['context']] for widx in aswords]
-    varinbody = np.array(varinbody) # (len(answers), len(body))
-    inbody = rule['bodymap'][:,0] # (len(body),)
-    maxinbody = varinbody * inbody # (len(answers), len(body))
-    maxinbody = F.max(maxinbody, -1) # (len(answers),)
-    # Compute final value using variable gating values
-    asvgates = rule['vmap'][aswords] # (len(answers),)
-    asvgates *= maxinbody # (len(answers),)
-    prediction = asvgates[:,None]*asvar + (1-asvgates[:,None])*asground # (B, len(answers), V)
-    # Compute final final value using rule score
-    noans = F.tile(vs_init[0], (len(stories), len(aswords), 1)) # (B, len(answers), V)
-    answers = rscore[:, None, None]*prediction + (1-rscore[:, None, None])*noans # (B, len(answers), V)
-    # Assume single word answer for now
-    return answers[:, 0, :]
+    allanswers = list()
+    max_alen = max([len(r[0]['story']['answers']) for r in rules])
+    for rscore, (rule, vs, _) in zip(rscores, rules):
+      # Read head of rule with variable mapping
+      aswords = rule['story']['answers'] # (len(answers),)
+      # Get ground value
+      eye = self.xp.eye(len(word2idx)) # (V, V)
+      asground = eye[aswords] * self.unkbias # (len(answers), V)
+      # Get variable values
+      asvar = vs[:, aswords] # (B, len(answers), V)
+      # Get maximum appearance of variable
+      varinbody = [[widx in seq for seq in rule['story']['context']] for widx in aswords]
+      varinbody = np.array(varinbody) # (len(answers), len(body))
+      inbody = rule['bodymap'][:,0] # (len(body),)
+      maxinbody = varinbody * inbody # (len(answers), len(body))
+      maxinbody = F.max(maxinbody, -1) # (len(answers),)
+      # Compute final value using variable gating values
+      asvgates = rule['vmap'][aswords] # (len(answers),)
+      asvgates *= maxinbody # (len(answers),)
+      prediction = asvgates[:,None]*asvar + (1-asvgates[:,None])*asground # (B, len(answers), V)
+      # Compute final final value using rule score
+      noans = F.tile(vs_init[0], (len(stories), len(aswords), 1)) # (B, len(answers), V)
+      answers = rscore[:, None, None]*prediction + (1-rscore[:, None, None])*noans # (B, len(answers), V)
+      # Shorcut for single rule cases
+      if len(rules) == 1:
+        return answers[:, 0, :]
+      if len(aswords) != max_alen:
+        # Pad answers to match shapes
+        answers = F.pad(answers, (0, (0, max_alen-len(aswords)), 0), mode='constant', constant_values=0.0)
+        import ipdb; ipdb.set_trace()
+      allanswers.append(answers) # (B, max_alen, V)
+    # Aggregate answers based on rule scores
+    rscores = F.vstack(rscores) # (R, B)
+    rscores = F.softmax(rscores, 0) # (R, B)
+    allanswers = F.stack(allanswers, 0) # (R, B, max_alen, V)
+    final_answers = F.einsum("ij,ijkl->jkl", rscores, allanswers) # (B, max_alen, V)
+    # **Assume one answer for now**
+    return final_answers[:, 0, :]
 
 # ---------------------------
 
 # Stories to generate rules from
-rule_repo = [enc_stories[0]]
 answers = set()
-# training = list()
-# init_tsize = 9
-# for es in enc_stories[1:]:
-  # if es['answers'][0] not in answers:
-    # training.append(es)
-    # answers.add(es['answers'][0])
-  # if len(training) == init_tsize:
-    # break
+rule_repo = list()
+rule_repo_size = 1
+for es in enc_stories:
+  if es['answers'][0] not in answers:
+    rule_repo.append(es)
+    answers.add(es['answers'][0])
+  if len(rule_repo) == rule_repo_size:
+    break
+print("RULE REPO:", rule_repo)
 
 # ---------------------------
 
