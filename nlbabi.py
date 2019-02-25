@@ -181,10 +181,10 @@ class RuleGen(C.Chain):
     wordvars = self.isvariable_score(wordvars) # (qlen+s1len+s2len+..., 1)
     wordvars = F.squeeze(wordvars, 1) # (qlen+s1len+s2len+...,)
     # Merge word variable predictions
-    iswordvar = F.scatter_add(self.xp.zeros(len(word2idx), dtype=self.xp.float32), words, wordvars) # (len(word2idx),)
-    iswordvar = F.sigmoid(iswordvar) # (len(word2idx),)
-    mask = np.isin(np.arange(len(word2idx)), words).astype(np.float32) # (len(word2idx),)
-    iswordvar *= mask # (len(word2idx),)
+    iswordvar = F.scatter_add(self.xp.zeros(len(word2idx), dtype=self.xp.float32), words, wordvars) # (V,)
+    iswordvar = F.sigmoid(iswordvar) # (V,)
+    mask = np.isin(np.arange(len(word2idx)), words).astype(np.float32) # (V,)
+    iswordvar *= mask # (V,)
     # ---------------------------
     # Tells whether a context is in the body, negated or not
     # and whether a word is a variable or not
@@ -236,11 +236,11 @@ class Unify(C.Chain):
     eye = self.xp.eye(len(word2idx))
     unifications = [simvals @ eye[candidxs]
                     for simvals, candidxs in zip(raw_sims, candidates)]
-                   # len(candidates) [(plen, len(word2idx)), ...]
-    unifications = F.stack(unifications, axis=0) # (len(candidates), plen, len(word2idx)
+                   # len(candidates) [(plen, V), ...]
+    unifications = F.stack(unifications, axis=0) # (len(candidates), plen, V)
     # Weighted sum using scores
     weights = F.softmax(raw_scores, 0) # (len(candidates),)
-    final_uni = F.einsum("i,ijk->jk", weights, unifications) # (plen, len(word2idx))
+    final_uni = F.einsum("i,ijk->jk", weights, unifications) # (plen, V)
     final_score = F.max(raw_scores) # ()
     return final_score, final_uni
 
@@ -264,14 +264,14 @@ class Infer(C.Chain):
     # ---------------------------
     # Prepare rules from rule stories
     rules = list()
-    vs_init = self.xp.eye(len(word2idx), dtype=self.xp.float32) * self.unkbias # (len(word2idx), len(word2idx))
+    vs_init = self.xp.eye(len(word2idx), dtype=self.xp.float32) * self.unkbias # (V, V)
     for rs in self.rule_stories:
       # Encode rule story
       enc_rule = story_embed(rs, self.embed)
       r = self.rulegen(rs, enc_rule) # Differentiable rule generated from story
       # r = {'story': rs, 'bodymap': np.array([[0.0,0.0], [1.0,0.0]], dtype=np.float32),
            # 'vmap': np.array([0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0], dtype=np.float32)}
-      vs = F.tile(vs_init, (len(stories), 1, 1)) # (B, len(word2idx), len(word2idx))
+      vs = F.tile(vs_init, (len(stories), 1, 1)) # (B, V, V)
       rules.append([r, vs, enc_rule])
     # ---------------------------
     # Embed stories
@@ -280,7 +280,7 @@ class Infer(C.Chain):
     # ---------------------------
     # Compute iterative updates on variables
     rscores = list() # final rule scores
-    wordsrange = np.arange(len(word2idx)) # (len(word2idx),)
+    wordsrange = np.arange(len(word2idx)) # (V,)
     for comprule in rules:
       rule, vs, enc_rule = comprule
       # Iterative proving
@@ -292,7 +292,7 @@ class Infer(C.Chain):
       for _ in range(1):
         # ---------------------------
         # Unify query first assuming given query is ground
-        qvvalues = F.softmax(vs[:, rwords[0]], -1) # (B, qlen, len(word2idx))
+        qvvalues = F.softmax(vs[:, rwords[0]], -1) # (B, qlen, V)
         qvvalues = qvvalues @ self.embed.W # (B, qlen, E)
         qvvalues = self.var_linear(qvvalues, n_batch_axes=2) # (B, qlen, E)
         qlen = len(rwords[0])
@@ -301,33 +301,33 @@ class Infer(C.Chain):
         for i, (s, es) in enumerate(zip(stories, embedded_stories)):
           qscore, qunified = self.unify(qtoprove[i], [s['query']], (es['query'],))
           qscores.append(qscore) # ()
-          qunifieds.append(qunified) # (qlen, len(word2idx))
+          qunifieds.append(qunified) # (qlen, V)
         qscores = F.vstack(qscores) # (B, 1)
-        qunifieds = F.stack(qunifieds, 0) # (B, qlen, len(word2idx))
+        qunifieds = F.stack(qunifieds, 0) # (B, qlen, V)
         # Update variable states with new unifications
-        mask = np.isin(wordsrange, rwords[0], invert=True).astype(np.float32) # (len(word2idx),)
-        vs *= mask[:, None] # (B, len(word2idx), len(word2idx))
-        vs = F.scatter_add(vs, (batch_range, rwords[0]), qunifieds) # (len(word2idx), len(word2idx))
+        mask = np.isin(wordsrange, rwords[0], invert=True).astype(np.float32) # (V,)
+        vs *= mask[:, None] # (B, V, V)
+        vs = F.scatter_add(vs, (batch_range, rwords[0]), qunifieds) # (V, V)
         # ---------------------------
         # Regather all variable values
-        vvalues = F.softmax(vs[:, concat_rwords[qlen:]], -1) # (B, s1len+s2len+..., len(word2idx))
+        vvalues = F.softmax(vs[:, concat_rwords[qlen:]], -1) # (B, s1len+s2len+..., V)
         vvalues = vvalues @ self.embed.W # (B, s1len+s2len+..., E)
         vvalues = self.var_linear(vvalues, n_batch_axes=2) # (B, s1len+s2len+..., E)
         # Merge ground with variable values
         bodytoprove = vgates[qlen:]*vvalues + (1-vgates[qlen:])*grounds[qlen:] # (B, s1len+s2len+..., E)
         # ---------------------------
         # Unifications give new variable values and a score for match
-        scores, unifications = [qscores], [qunifieds] # [(B, 1)], [(B, qlen, len(word2idx)]
+        scores, unifications = [qscores], [qunifieds] # [(B, 1)], [(B, qlen, V)]
         # Unify body conditions
         bodiestoprove = F.split_axis(bodytoprove, np.cumsum(slens[1:-1]), 1) # [(B, s1len, E), (B, s2len, E), ...]
         for btoprove in bodiestoprove:
           bscores, bunifications = list(), list()
           for i, (s, es) in enumerate(zip(stories, embedded_stories)):
-            score, unified = self.unify(btoprove[i], s['context'], es['context']) # (), (snlen, len(word2idx))
+            score, unified = self.unify(btoprove[i], s['context'], es['context']) # (), (snlen, V)
             bscores.append(score) # ()
-            bunifications.append(unified) # (snlen, len(word2idx))
+            bunifications.append(unified) # (snlen, V)
           scores.append(F.vstack(bscores)) # (B, 1)
-          unifications.append(F.stack(bunifications, 0)) # (B, snlen, len(word2idx))
+          unifications.append(F.stack(bunifications, 0)) # (B, snlen, V)
         # ---------------------------
         # Update variables after unification
         vscores = F.concat(scores, 1) # (B, 1+len(body))
@@ -337,12 +337,12 @@ class Infer(C.Chain):
         inbody = F.pad(inbody, (slens[0], 0), 'constant', constant_values=1.0) # (qlen+s1len+...,)
         weights *= inbody # (B, qlen+s1len+...)
         normalisations = F.scatter_add(self.xp.full((len(stories), len(word2idx)), 0.001, dtype=self.xp.float32),
-                                       (batch_range, concat_rwords), weights) # (B, len(word2idx))
-        unifications = F.concat(unifications, 1) # (B, qlen+s1len+s2len+..., len(word2idx))
+                                       (batch_range, concat_rwords), weights) # (B, V)
+        unifications = F.concat(unifications, 1) # (B, qlen+s1len+s2len+..., V)
         # Weighted sum based on score
-        unifications *= weights[..., None] # (B, qlen+s1len+s2len+..., len(word2idx))
+        unifications *= weights[..., None] # (B, qlen+s1len+s2len+..., V)
         unifications = F.scatter_add(self.xp.zeros((len(stories), len(word2idx), len(word2idx)), dtype=self.xp.float32),
-                                     (batch_range, concat_rwords), unifications) # (B, len(word2idx), len(word2idx))
+                                     (batch_range, concat_rwords), unifications) # (B, V, V)
         comprule[1] = unifications / normalisations[..., None]
       # ---------------------------
       # Compute overall score for rule
@@ -366,10 +366,10 @@ class Infer(C.Chain):
     rule, vs, _ = rules[0]
     aswords = rule['story']['answers'] # (len(answers,)
     # Get ground value
-    eye = self.xp.eye(len(word2idx)) # (len(word2idx), len(word2idx))
-    asground = eye[aswords] * self.unkbias # (len(answers), len(word2idx))
+    eye = self.xp.eye(len(word2idx)) # (V, V)
+    asground = eye[aswords] * self.unkbias # (len(answers), V)
     # Get variable values
-    asvar = vs[:, aswords] # (B, len(answers), len(word2idx))
+    asvar = vs[:, aswords] # (B, len(answers), V)
     # Get maximum appearance of variable
     varinbody = [[widx in seq for seq in rule['story']['context']] for widx in aswords]
     varinbody = np.array(varinbody) # (len(answers), len(body))
@@ -379,10 +379,10 @@ class Infer(C.Chain):
     # Compute final value using variable gating values
     asvgates = rule['vmap'][aswords] # (len(answers),)
     asvgates *= maxinbody # (len(answers),)
-    prediction = asvgates[:,None]*asvar + (1-asvgates[:,None])*asground # (B, len(answers), len(word2idx))
+    prediction = asvgates[:,None]*asvar + (1-asvgates[:,None])*asground # (B, len(answers), V)
     # Compute final final value using rule score
-    noans = F.tile(vs_init[0], (len(stories), len(aswords), 1)) # (B, len(answers), len(word2idx))
-    answers = rscore[:, None, None]*prediction + (1-rscore[:, None, None])*noans # (B, len(answers), len(word2idx))
+    noans = F.tile(vs_init[0], (len(stories), len(aswords), 1)) # (B, len(answers), V)
+    answers = rscore[:, None, None]*prediction + (1-rscore[:, None, None])*noans # (B, len(answers), V)
     # Assume single word answer for now
     return answers[:, 0, :]
 
