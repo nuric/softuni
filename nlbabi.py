@@ -31,6 +31,7 @@ if ARGS.debug:
 
 EMBED = 16
 MAX_HIST = 25
+REPO_SIZE = 2
 ITERATIONS = 3
 
 # ---------------------------
@@ -155,7 +156,7 @@ def bow_encode(exs):
 def pos_encode(vxs, exs):
   """Given sentences compute positional encoding."""
   # (..., S), (..., S, E)
-  mask = (vxs != 0.0).astype(np.float32) # (..., S)
+  mask = (vxs != 0.0) # (..., S)
   slen = exs.shape[-2] # S
   pos = np.fromfunction(lambda j, k: 1 - (j + 1) / slen - (k + 1) / EMBED * (1 - 2 * (j + 1) / slen),
                         (slen, EMBED), dtype=np.float32) # (S, E)
@@ -175,8 +176,27 @@ class RuleGen(C.Chain):
       self.body_linear = L.Linear(5*EMBED, 2*EMBED)
       self.body_score = L.Linear(2*EMBED, 2)
       self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
-      self.isvariable_linear = L.Linear(EMBED+2, EMBED)
+      self.isvariable_linear = L.Linear(EMBED+1, EMBED)
       self.isvariable_score = L.Linear(EMBED, 1)
+
+  def contextual_convolve(self, vxs, exs):
+    """Given vectorised and encoded sentences convolve over last dimension."""
+    # (R, ..., S), (R, ..., S, E)
+    mask = (vxs != 0.0) # (R, ..., S)
+    toconvolve = exs # Assuming we have (R, S), (R, S, E)
+    if len(vxs.shape) > 2:
+      # We need to pad between sentences
+      padding = self.xp.zeros(exs.shape[:-2]+(1,exs.shape[-1]), dtype=exs.dtype) # (R, ..., 1, E)
+      padded = F.concat([exs, padding], -2) # (R, ..., S+1, E)
+      toconvolve = F.reshape(padded, (exs.shape[0], -1, exs.shape[-1])) # (R, *S+1, E)
+    permuted = F.transpose(toconvolve, (0, 2, 1)) # (R, E, S)
+    contextual = self.convolve_words(permuted) # (R, E, S)
+    contextual = F.transpose(contextual, (0, 2, 1)) # (R, S, E)
+    if len(vxs.shape) > 2:
+      contextual = F.reshape(contextual, padded.shape) # (R, ..., S+1, E)
+      contextual = contextual[..., :-1, :] # (R, ..., S, E)
+    contextual *= mask[..., None] # (R, ..., S, E)
+    return contextual
 
   def forward(self, vectorised_rules, embedded_rules):
     """Given a story generate a probabilistic learnable rule."""
@@ -186,51 +206,51 @@ class RuleGen(C.Chain):
     ectx, eq, ea = embedded_rules
     # Encode sequences
     enc_ctx = pos_encode(vctx, ectx) # (R, Cs, E)
-    import ipdb; ipdb.set_trace()
-    print("HERE")
-    embedded_q = embedded_story['query'] # (qlen, E)
-    enc_query = pos_encode([embedded_q])[0] # (E,)
-    embedded_as = embedded_story['answers'] # (alen, E)
-    enc_answer = pos_encode([embedded_as])[0] # (E,)
+    enc_query = pos_encode(vq, eq) # (R, E)
+    enc_answer = pos_encode(va, ea) # (R, E)
     # ---------------------------
     # Whether a fact is in the body or not, negated or not, multi-label -> (clen, 2)
-    r_answer = F.tile(enc_answer, (len(story['context']), 1)) # (clen, E)
-    r_query = F.tile(enc_query, (len(story['context']), 1)) # (clen, E)
-    r_ctx = F.concat([r_answer, r_query, enc_ctx, r_answer*enc_ctx, r_query*enc_ctx], axis=1) # (clen, 5*E)
-    inbody = self.body_linear(r_ctx) # (clen, 2*E)
-    inbody = F.tanh(inbody) # (clen, 2*E)
-    inbody = self.body_score(inbody) # (clen, 2)
-    inbody = F.sigmoid(inbody) # (clen, 2)
+    clen = enc_ctx.shape[1] # Cs
+    r_answer = F.repeat(enc_answer[:, None, :], clen, 1) # (R, Cs, E)
+    r_query = F.repeat(enc_query[:, None, :], clen, 1) # (R, Cs, E)
+    r_ctx = F.concat([r_answer, r_query, enc_ctx, r_answer*enc_ctx, r_query*enc_ctx], -1) # (R, Cs, 5*E)
+    inbody = self.body_linear(r_ctx, n_batch_axes=2) # (R, Cs, 2*E)
+    inbody = F.tanh(inbody) # (R, Cs, 2*E)
+    inbody = self.body_score(inbody, n_batch_axes=2) # (R, Cs, 2)
+    inbody = F.sigmoid(inbody) # (R, Cs, 2)
+    bodymask = (vctx != 0.0) # (R, Cs, S)
+    bodymask = np.any(bodymask, -1) # (R, Cs)
+    inbody *= bodymask[..., None] # (R, Cs, 2)
     # ---------------------------
     # Whether each word in story is a variable, binary class -> {wordid:sigmoid}
-    words = np.concatenate([story['query']]+story['context']) # (qlen+s1len+s2len+...,)
-    unique_idxs, inverse_idxs, unique_counts = np.unique(words, return_inverse=True,
-                                                         return_counts=True)
-    # unique_idxs[inverse_idxs] == words
-    # len(inverse_idxs) == len(words)
-    # len(unique_counts) == len(unique_idxs)
+    num_rules = vctx.shape[0] # R
+    words = np.reshape(vctx, (num_rules, -1)) # (R, Cs*C)
+    words = np.concatenate([vq, words], -1) # (R, Q+Cs*C)
     # Compute contextuals by convolving each sentence
-    cwords = [F.squeeze(self.convolve_words(F.expand_dims(s.T, 0)), 0).T
-              for s in (embedded_q,)+embedded_ctx] # [(qlen,16), (s1len,16), (s2len,16), ...]
-    allwords = F.concat(cwords, 0) # (qlen+s1len+s2len+..., 16)
-    # Add whether they appear more than once
-    appeartwice = (unique_counts[inverse_idxs] > 1) # (qlen+s1len+s2len+...,)
-    appeartwice = appeartwice.astype(np.float32).reshape(-1, 1) # (qlen+s1len+s2len+..., 1)
-    appearanswer = np.array([w in story['answers'] for w in words], dtype=np.float32).reshape(-1, 1) # (qlen+s1len+s2len+..., 1)
-    allwords = F.concat([allwords, appeartwice, appearanswer], axis=1) # (qlen+s1len+s2len+..., 18)
-    wordvars = self.isvariable_linear(allwords) # (qlen+s1len+s2len+..., E)
-    wordvars = F.tanh(wordvars) # (qlen+s1len+s2len+..., E)
-    wordvars = self.isvariable_score(wordvars) # (qlen+s1len+s2len+..., 1)
-    wordvars = F.squeeze(wordvars, 1) # (qlen+s1len+s2len+...,)
+    contextual_q = self.contextual_convolve(vq, eq) # (R, Q, E)
+    contextual_ctx = self.contextual_convolve(vctx, ectx) # (R, Cs, C, E)
+    flat_cctx = F.reshape(contextual_ctx, (num_rules, -1, ectx.shape[-1])) # (R, Cs * C, E)
+    cwords = F.concat([contextual_q, flat_cctx], 1) # (R, Q+Cs*C, E)
+    # Add whether they appear in the answer as a featurec
+    appearanswer = np.isin(words, va).astype(np.float32) # (R, Q+Cs*C)
+    allwords = F.concat([cwords, appearanswer[..., None]], -1) # (R, Q+Cs*C, E+1)
+    wordvars = self.isvariable_linear(allwords, n_batch_axes=2) # (R, Q+Cs*C, E)
+    wordvars = F.tanh(wordvars) # (R, Q+Cs*C, E)
+    wordvars = self.isvariable_score(wordvars, n_batch_axes=2) # (R, Q+Cs*C, 1)
+    wordvars = F.squeeze(wordvars, -1) # (R, Q+Cs*C)
     # Merge word variable predictions
-    iswordvar = F.scatter_add(self.xp.zeros(len(word2idx), dtype=self.xp.float32), words, wordvars) # (V,)
-    iswordvar = F.sigmoid(iswordvar) # (V,)
-    mask = np.isin(np.arange(len(word2idx)), words).astype(np.float32) # (V,)
-    iswordvar *= mask # (V,)
+    iswordvar = self.xp.zeros((num_rules, len(word2idx)), dtype=self.xp.float32) # (R, V)
+    iswordvar = F.scatter_add(iswordvar, (np.arange(num_rules)[:, None], words), wordvars) # (R, V)
+    iswordvar = F.sigmoid(iswordvar) # (R, V)
+    wordrange = np.arange(len(word2idx)) # (V,)
+    wordrange[0] = -1 # Null padding is never a variable
+    # np.isin flattens second argument, so we need for loop
+    mask = np.vstack([np.isin(wordrange, rws) for rws in words]) # (R, V)
+    iswordvar *= mask # (R, V)
     # ---------------------------
     # Tells whether a context is in the body, negated or not
     # and whether a word is a variable or not
-    return {'story': story, 'bodymap': inbody, 'vmap': iswordvar}
+    return {'bodymap': inbody, 'vmap': iswordvar}
 
 # ---------------------------
 
@@ -305,30 +325,14 @@ class Infer(C.Chain):
     # Setup rule repo
     self.vrules = vectorise_stories(rule_stories) # (R, Cs, C), (R, Q), (R, A)
     self.erules = tuple([self.embed(v) for v in self.vrules]) # (R, Cs, C, E), (R, Q, E), (R, A, E)
-    self.genrules = self.rulegen(self.vrules, self.erules)
-    import ipdb; ipdb.set_trace()
-    print("HERE")
-
-  def gen_rules(self):
-    """Apply rule generator on the rule repository with fresh state."""
-    rules = list()
-    for rs in self.rule_stories:
-      # Encode rule story
-      enc_rule = story_embed(rs, self.embed)
-      r = self.rulegen(rs, enc_rule) # Differentiable rule generated from story
-      # r = {'story': rs, 'bodymap': np.array([[0.0,0.0], [1.0,0.0]], dtype=np.float32),
-           # 'vmap': np.array([0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0], dtype=np.float32)}
-      vs = F.tile(self.weye, (len(stories), 1, 1)) # (B, V, V)
-      rules.append([r, vs, enc_rule])
-    return rules
+    self.genrules = self.rulegen(self.vrules, self.erules) # {'bodymap': (R, Cs, 2), 'vmap': (R, V)}
 
   def forward(self, stories):
     """Compute the forward inference pass for given stories."""
     # ---------------------------
-    # Prepare rules from rule stories
-    rules = self.gen_rules() # [[rule_story, vstate, enc_rule], ...]
-    # ---------------------------
     vctx, vq, vas = stories # (B, Cs, C), (B, Q), (B, A)
+    import ipdb; ipdb.set_trace()
+    print("HERE")
     # Embed stories
     ectx = self.embed(vctx) # (B, Cs, C, E)
     eq = self.embed(vq) # (B, Q, E)
@@ -459,12 +463,12 @@ class Infer(C.Chain):
 # Stories to generate rules from
 answers = set()
 rule_repo = list()
-rule_repo_size = 1
+np.random.shuffle(enc_stories)
 for es in enc_stories:
   if es['answers'][0] not in answers:
     rule_repo.append(es)
     answers.add(es['answers'][0])
-  if len(rule_repo) == rule_repo_size:
+  if len(rule_repo) == REPO_SIZE:
     break
 print("RULE REPO:", rule_repo)
 
