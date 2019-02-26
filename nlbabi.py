@@ -437,9 +437,6 @@ print("RULE REPO:", rule_repo)
 # Setup model
 model = Infer(rule_repo)
 cmodel = L.Classifier(model, lossfun=F.softmax_cross_entropy, accfun=F.accuracy)
-if ARGS.debug:
-  answers = model([enc_stories[1], enc_stories[20]])
-  print("INIT ANSWERS:", answers)
 
 optimiser = C.optimizers.Adam().setup(cmodel)
 optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
@@ -449,7 +446,8 @@ def converter(stories, _):
   """Coverts given batch to expected format for Classifier."""
   return stories, np.array([s['answers'][0] for s in stories])
 updater = T.StandardUpdater(train_iter, optimiser, converter=converter, device=-1)
-trainer = T.Trainer(updater, T.triggers.EarlyStoppingTrigger())
+# trainer = T.Trainer(updater, T.triggers.EarlyStoppingTrigger())
+trainer = T.Trainer(updater, (50, 'epoch'))
 
 # Trainer extensions
 val_iter = C.iterators.SerialIterator(val_enc_stories, 32, repeat=False, shuffle=False)
@@ -476,6 +474,11 @@ signal.signal(signal.SIGTERM, interrupt)
 if os.path.isfile(trainer_statef):
   C.serializers.load_npz(trainer_statef, trainer)
   print("Loaded trainer state from:", trainer_statef)
+
+if ARGS.debug:
+  import ipdb; ipdb.set_trace()
+  answers = model([enc_stories[1], enc_stories[20]])
+  print("INIT ANSWERS:", answers)
 
 # Hit the train button
 try:
