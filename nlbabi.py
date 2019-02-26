@@ -104,6 +104,27 @@ def decode_story(story):
   ds['answers'] = [idx2word[widx] for widx in story['answers']]
   return ds
 
+def vectorise_stories(encoded_stories):
+  """Given a list of encoded stories, vectorise them with padding."""
+  # Find maximum length of batch to pad
+  max_ctxlen, ctx_maxlen, q_maxlen, a_maxlen = 0, 0, 0, 0
+  for s in encoded_stories:
+    max_ctxlen = max(max_ctxlen, len(s['context']))
+    c_maxlen = max([len(c) for c in s['context']])
+    ctx_maxlen = max(ctx_maxlen, c_maxlen)
+    q_maxlen = max(q_maxlen, len(s['query']))
+    a_maxlen = max(a_maxlen, len(s['answers']))
+  # Vectorise stories
+  vctx = np.zeros((len(encoded_stories), max_ctxlen, ctx_maxlen), dtype=np.int32) # (B, Cs, C)
+  vq = np.zeros((len(encoded_stories), q_maxlen), dtype=np.int32) # (B, Q)
+  vas = np.zeros((len(encoded_stories), a_maxlen), dtype=np.int32) # (B, A)
+  for i, s in enumerate(encoded_stories):
+    vq[i,:len(s['query'])] = s['query']
+    vas[i,:len(s['answers'])] = s['answers']
+    for j, c in enumerate(s['context']):
+      vctx[i,j,:len(c)] = c
+  return vctx, vq, vas
+
 # ---------------------------
 
 # Utility functions for neural networks
@@ -131,13 +152,16 @@ def bow_encode(exs):
     # pe[pos, i] = np.sin(pos / (10000 ** ((2*i)/EMBED)))
     # pe[pos, i+1] = np.cos(pos / (10000 ** ((2*(i+1))/EMBED)))
 
-def pos_encode(exs):
+def pos_encode(vxs, exs):
   """Given sentences compute positional encoding."""
-  # [(s1len, E), (s2len, E), ...]
-  def get_weights(slen):
-    return np.fromfunction(lambda j, k: 1 - (j + 1) / slen - (k + 1) / EMBED * (1 - 2 * (j + 1) / slen),
-                           (slen, EMBED), dtype=np.float32)
-  return [F.sum(e * get_weights(e.shape[0]), axis=0) for e in exs]
+  # (..., S), (..., S, E)
+  mask = (vxs != 0.0).astype(np.float32) # (..., S)
+  slen = exs.shape[-2] # S
+  pos = np.fromfunction(lambda j, k: 1 - (j + 1) / slen - (k + 1) / EMBED * (1 - 2 * (j + 1) / slen),
+                        (slen, EMBED), dtype=np.float32) # (S, E)
+  enc = exs * pos # (..., S, E)
+  enc *= mask[..., None] # (..., S, E)
+  return F.sum(enc, -2) # (..., E)
 
 # ---------------------------
 
@@ -154,12 +178,16 @@ class RuleGen(C.Chain):
       self.isvariable_linear = L.Linear(EMBED+2, EMBED)
       self.isvariable_score = L.Linear(EMBED, 1)
 
-  def forward(self, story, embedded_story):
+  def forward(self, vectorised_rules, embedded_rules):
     """Given a story generate a probabilistic learnable rule."""
+    # vectorised_rules = [(R, Cs, C), (R, Q), (R, A)]
+    # embedded_rules = [(R, Cs, C, E), (R, Q, E), (R, A, E)]
+    vctx, vq, va = vectorised_rules
+    ectx, eq, ea = embedded_rules
     # Encode sequences
-    embedded_ctx = embedded_story['context'] # [(s1len, E), (s2len, E), ...]
-    enc_ctx = pos_encode(embedded_ctx) # [(E,), (E,), ...]
-    enc_ctx = F.vstack(enc_ctx) # (clen, E)
+    enc_ctx = pos_encode(vctx, ectx) # (R, Cs, E)
+    import ipdb; ipdb.set_trace()
+    print("HERE")
     embedded_q = embedded_story['query'] # (qlen, E)
     enc_query = pos_encode([embedded_q])[0] # (E,)
     embedded_as = embedded_story['answers'] # (alen, E)
@@ -266,13 +294,20 @@ class Infer(C.Chain):
   def __init__(self, rule_stories):
     super().__init__()
     self.rule_stories = rule_stories
+    # Create model parameters
     with self.init_scope():
-      self.embed = L.EmbedID(len(word2idx), EMBED)
+      self.embed = L.EmbedID(len(word2idx), EMBED, ignore_label=0)
       self.rulegen = RuleGen()
       self.var_linear = L.Linear(EMBED, EMBED)
       self.unify = Unify()
       self.unkbias = C.Parameter(4.0, shape=(1,), name="unkbias")
-      self.weye = self.xp.eye(len(word2idx), dtype=self.xp.float32) * self.unkbias# (V, V)
+      self.weye = self.xp.eye(len(word2idx), dtype=self.xp.float32) * self.unkbias # (V, V)
+    # Setup rule repo
+    self.vrules = vectorise_stories(rule_stories) # (R, Cs, C), (R, Q), (R, A)
+    self.erules = tuple([self.embed(v) for v in self.vrules]) # (R, Cs, C, E), (R, Q, E), (R, A, E)
+    self.genrules = self.rulegen(self.vrules, self.erules)
+    import ipdb; ipdb.set_trace()
+    print("HERE")
 
   def gen_rules(self):
     """Apply rule generator on the rule repository with fresh state."""
@@ -293,9 +328,10 @@ class Infer(C.Chain):
     # Prepare rules from rule stories
     rules = self.gen_rules() # [[rule_story, vstate, enc_rule], ...]
     # ---------------------------
+    vctx, vq, vas = stories # (B, Cs, C), (B, Q), (B, A)
     # Embed stories
-    embedded_stories = [story_embed(s, self.embed) for s in stories] # (B, [{'answers': (alen, E), 'query': (qlen, E), 'context': [(s1len, E), ...]}, ...])
-    batch_range = np.arange(len(stories)).reshape(-1, 1) # (B, 1)
+    ectx = self.embed(vctx) # (B, Cs, C, E)
+    eq = self.embed(vq) # (B, Q, E)
     # ---------------------------
     # Compute iterative updates on variables
     rscores = list() # final rule scores
@@ -441,10 +477,11 @@ cmodel = L.Classifier(model, lossfun=F.softmax_cross_entropy, accfun=F.accuracy)
 optimiser = C.optimizers.Adam().setup(cmodel)
 optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
 
-train_iter = C.iterators.SerialIterator(enc_stories, 32)
-def converter(stories, _):
+train_iter = C.iterators.SerialIterator(enc_stories, 7)
+def converter(batch_stories, _):
   """Coverts given batch to expected format for Classifier."""
-  return stories, np.array([s['answers'][0] for s in stories])
+  vctx, vq, vas = vectorise_stories(batch_stories) # (B, Cs, C), (B, Q), (B, A)
+  return (vctx, vq, vas), vas[:, 0] # (B,)
 updater = T.StandardUpdater(train_iter, optimiser, converter=converter, device=-1)
 # trainer = T.Trainer(updater, T.triggers.EarlyStoppingTrigger())
 trainer = T.Trainer(updater, (50, 'epoch'))
