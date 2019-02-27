@@ -164,6 +164,25 @@ def pos_encode(vxs, exs):
   enc *= mask[..., None] # (..., S, E)
   return F.sum(enc, -2) # (..., E)
 
+def contextual_convolve(backend, convolution, vxs, exs):
+  """Given vectorised and encoded sentences convolve over last dimension."""
+  # (B, ..., S), (B, ..., S, E)
+  mask = (vxs != 0.0) # (B, ..., S)
+  toconvolve = exs # Assuming we have (B, S), (B, S, E)
+  if len(vxs.shape) > 2:
+    # We need to pad between sentences
+    padding = backend.zeros(exs.shape[:-2]+(1,exs.shape[-1]), dtype=exs.dtype) # (B, ..., 1, E)
+    padded = F.concat([exs, padding], -2) # (B, ..., S+1, E)
+    toconvolve = F.reshape(padded, (exs.shape[0], -1, exs.shape[-1])) # (B, *S+1, E)
+  permuted = F.transpose(toconvolve, (0, 2, 1)) # (B, E, S)
+  contextual = convolution(permuted) # (B, E, S)
+  contextual = F.transpose(contextual, (0, 2, 1)) # (B, S, E)
+  if len(vxs.shape) > 2:
+    contextual = F.reshape(contextual, padded.shape) # (B, ..., S+1, E)
+    contextual = contextual[..., :-1, :] # (B, ..., S, E)
+  contextual *= mask[..., None] # (B, ..., S, E)
+  return contextual
+
 # ---------------------------
 
 # Rule generating network
@@ -178,25 +197,6 @@ class RuleGen(C.Chain):
       self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
       self.isvariable_linear = L.Linear(EMBED+1, EMBED)
       self.isvariable_score = L.Linear(EMBED, 1)
-
-  def contextual_convolve(self, vxs, exs):
-    """Given vectorised and encoded sentences convolve over last dimension."""
-    # (R, ..., S), (R, ..., S, E)
-    mask = (vxs != 0.0) # (R, ..., S)
-    toconvolve = exs # Assuming we have (R, S), (R, S, E)
-    if len(vxs.shape) > 2:
-      # We need to pad between sentences
-      padding = self.xp.zeros(exs.shape[:-2]+(1,exs.shape[-1]), dtype=exs.dtype) # (R, ..., 1, E)
-      padded = F.concat([exs, padding], -2) # (R, ..., S+1, E)
-      toconvolve = F.reshape(padded, (exs.shape[0], -1, exs.shape[-1])) # (R, *S+1, E)
-    permuted = F.transpose(toconvolve, (0, 2, 1)) # (R, E, S)
-    contextual = self.convolve_words(permuted) # (R, E, S)
-    contextual = F.transpose(contextual, (0, 2, 1)) # (R, S, E)
-    if len(vxs.shape) > 2:
-      contextual = F.reshape(contextual, padded.shape) # (R, ..., S+1, E)
-      contextual = contextual[..., :-1, :] # (R, ..., S, E)
-    contextual *= mask[..., None] # (R, ..., S, E)
-    return contextual
 
   def forward(self, vectorised_rules, embedded_rules):
     """Given a story generate a probabilistic learnable rule."""
@@ -227,8 +227,8 @@ class RuleGen(C.Chain):
     words = np.reshape(vctx, (num_rules, -1)) # (R, Cs*C)
     words = np.concatenate([vq, words], -1) # (R, Q+Cs*C)
     # Compute contextuals by convolving each sentence
-    contextual_q = self.contextual_convolve(vq, eq) # (R, Q, E)
-    contextual_ctx = self.contextual_convolve(vctx, ectx) # (R, Cs, C, E)
+    contextual_q = contextual_convolve(self.xp, self.convolve_words, vq, eq) # (R, Q, E)
+    contextual_ctx = contextual_convolve(self.xp, self.convolve_words, vctx, ectx) # (R, Cs, C, E)
     flat_cctx = F.reshape(contextual_ctx, (num_rules, -1, ectx.shape[-1])) # (R, Cs * C, E)
     cwords = F.concat([contextual_q, flat_cctx], 1) # (R, Q+Cs*C, E)
     # Add whether they appear in the answer as a featurec
@@ -250,7 +250,7 @@ class RuleGen(C.Chain):
     # ---------------------------
     # Tells whether a context is in the body, negated or not
     # and whether a word is a variable or not
-    return {'bodymap': inbody, 'vmap': iswordvar}
+    return inbody, iswordvar
 
 # ---------------------------
 
@@ -264,47 +264,60 @@ class Unify(C.Chain):
       self.match_linear = L.Linear(6*EMBED, 3*EMBED)
       self.match_score = L.Linear(3*EMBED, 1)
       self.temporal_enc = C.Parameter(C.initializers.Normal(1.0), (MAX_HIST, EMBED), name="tempenc")
+    self.eye = self.xp.eye(len(word2idx)) # (V, V)
 
-  def forward(self, toprove, candidates, embedded_candidates):
+  def forward(self, toprove, embedded_toprove, candidates, embedded_candidates):
     """Given two sentences compute variable matches and score."""
-    # toprove.shape = (plen, E)
-    # candidates = [(s1len,), (s2len,), ...]
-    # embedded_candidates = [(s1len, E), (s2len, E), ...]
-    assert len(candidates) == len(embedded_candidates), "Candidate lengths differ."
+    # toprove.shape = (R, Ps, P)
+    # embedded_toprove.shape = (B, R, Ps, P, E)
+    # candidates.shape = (B, Cs, C)
+    # embedded_candidates.shape = (B, Cs, C, E)
+    # vstate.shape = (B, R, V, V)
+    # ---------------------------
+    # Setup masks
+    mask_toprove = (toprove == 0.0) # (R, Ps, P)
+    mask_candidates = (candidates == 0.0) # (B, Cs, C)
+    sim_mask = np.logical_or(mask_toprove[None, ..., None, None], mask_candidates[:, None, None, None, ...]) # (B, R, Ps, P, Cs, C)
+    sim_mask = sim_mask.astype(np.float32) * -1000 # (B, R, Ps, P, Cs, C)
+    mask_cs = np.all(mask_candidates, -1) # (B, Cs)
+    mask_cs = mask_cs.astype(np.float32) * -1000 # (B, Cs)
     # ---------------------------
     # Calculate a match for every word in s1 to every word in s2
     # Compute contextual representations
-    cwords = [F.squeeze(self.convolve_words(F.expand_dims(s.T, 0)), 0).T
-              for s in (toprove,)+embedded_candidates] # [(plen,16), (s1len,16), (s2len,16]
-    # Compute similarity between every candidate
-    ctp, *ccandids = cwords # (plen,16), [(s1len,16), (s2len,16), ...]
-    raw_sims = [ctp @ c.T for c in ccandids] # [(plen,s1len), (plen,s2len), ...]
+    contextual_toprove = contextual_convolve(self.xp, self.convolve_words, toprove, embedded_toprove) # (B, R, Ps, P, E)
+    contextual_candidates = contextual_convolve(self.xp, self.convolve_words, candidates, embedded_candidates) # (B, Cs, C, E)
+    # Compute similarity between every provable symbol and candidate symbol
+    # (B, R, Ps, P, E) x (B, Cs, C, E)
+    raw_sims = F.einsum("ijklm,inom->ijklno", contextual_toprove, contextual_candidates) # (B, R, Ps, P, Cs, C)
+    raw_sims += sim_mask # (B, R, Ps, P, Cs, C)
     # ---------------------------
     # Calculate score for each candidate
     # Compute bag of words
-    pbow, *cbows = [F.sum(s, axis=0) for s in cwords] # (E,) [(E,), ...]
-    # pbow = pos_encode([toprove])[0] # (E,)
-    # cbows = pos_encode(embedded_candidates) # [(E,), (E,)]
-    pbow = F.repeat(F.expand_dims(pbow, 0), len(candidates), axis=0) # (len(candidates), E)
-    cbows = F.vstack(cbows) # (len(candidates), E)
-    tbows = self.temporal_enc[:cbows.shape[0], :] # (len(candidates), E)
-    pcbows = F.concat([pbow, cbows, pbow*cbows, tbows, tbows+cbows, tbows*cbows]) # (len(candidates), 6*E)
-    raw_scores = self.match_linear(pcbows) # (len(candidates, E)
-    raw_scores = F.tanh(raw_scores) # (len(candidates), E)
-    raw_scores = self.match_score(raw_scores) # (len(candidates, 1)
-    raw_scores = F.squeeze(raw_scores, 1) # (len(candidates),)
+    pbow = F.sum(contextual_toprove, -2) # (B, R, Ps, E)
+    cbows = F.sum(contextual_candidates, -2) # (B, Cs, E)
+    cbows = F.tile(cbows[:, None, None, ...], (1,) + pbow.shape[1:3] + (1, 1)) # (B, R, Ps, Cs, E)
+    pbow = F.repeat(pbow[..., None, :], cbows.shape[-2], 3) # (B, R, Ps, Cs, E)
+    # Compute features
+    tbows = self.temporal_enc[:cbows.shape[-2], :] # (Cs, E)
+    tbows = F.tile(tbows, pbow.shape[:3] + (1, 1)) # (B, R, Ps, Cs, E)
+    pcbows = F.concat([pbow, cbows, pbow*cbows, tbows, tbows+cbows, tbows*cbows], -1) # (B, R, Ps, Cs, 6*E)
+    raw_scores = self.match_linear(pcbows, n_batch_axes=4) # (B, R, Ps, Cs, 3*E)
+    raw_scores = F.tanh(raw_scores) # (B, R, Ps, Cs, 3*E)
+    raw_scores = self.match_score(raw_scores, n_batch_axes=4) # (B, R, Ps, Cs, 1)
+    raw_scores = F.squeeze(raw_scores, -1) # (B, R, Ps, Cs)
+    raw_scores += mask_cs[:, None, None, :] # (B, R, Ps, Cs)
     # ---------------------------
     # Calculate attended unified word representations for toprove
-    eye = self.xp.eye(len(word2idx))
-    unifications = [simvals @ eye[candidxs]
-                    for simvals, candidxs in zip(raw_sims, candidates)]
-                   # len(candidates) [(plen, V), ...]
-    unifications = F.stack(unifications, axis=0) # (len(candidates), plen, V)
+    unifications = self.eye[candidates] # (B, Cs, C, V)
+    # (B, R, Ps, P, Cs, C) x (B, Cs, C, V)
+    unifications = F.einsum("ijklmn,imno->ijklmo", raw_sims, unifications) # (B, R, Ps, P, Cs, V)
     # Weighted sum using scores
-    weights = F.softmax(raw_scores, 0) # (len(candidates),)
-    final_uni = F.einsum("i,ijk->jk", weights, unifications) # (plen, V)
-    final_score = F.max(raw_scores) # ()
-    return final_score, final_uni
+    weights = F.softmax(raw_scores, -1) # (B, R, Ps, Cs)
+    # (B, R, Ps, Cs) x (B, R, Ps, P, Cs, V)
+    final_unis = F.einsum("ijkc,ijklcv->ijklv", weights, unifications) # (B, R, Ps, P, V)
+    # Final overall score
+    final_scores = F.max(raw_scores, -1) # (B, R, Ps)
+    return final_scores, final_unis
 
 # ---------------------------
 
@@ -321,25 +334,62 @@ class Infer(C.Chain):
       self.var_linear = L.Linear(EMBED, EMBED)
       self.unify = Unify()
       self.unkbias = C.Parameter(4.0, shape=(1,), name="unkbias")
-      self.weye = self.xp.eye(len(word2idx), dtype=self.xp.float32) * self.unkbias # (V, V)
+      self.eye = self.xp.eye(len(word2idx), dtype=self.xp.float32) # (V, V)
     # Setup rule repo
     self.vrules = vectorise_stories(rule_stories) # (R, Cs, C), (R, Q), (R, A)
-    self.erules = tuple([self.embed(v) for v in self.vrules]) # (R, Cs, C, E), (R, Q, E), (R, A, E)
-    self.genrules = self.rulegen(self.vrules, self.erules) # {'bodymap': (R, Cs, 2), 'vmap': (R, V)}
+    self.mrules = tuple([v != 0 for v in self.vrules]) # (R, Cs, C), (R, Q), (R, A)
 
   def forward(self, stories):
     """Compute the forward inference pass for given stories."""
     # ---------------------------
     vctx, vq, vas = stories # (B, Cs, C), (B, Q), (B, A)
-    import ipdb; ipdb.set_trace()
-    print("HERE")
     # Embed stories
     ectx = self.embed(vctx) # (B, Cs, C, E)
     eq = self.embed(vq) # (B, Q, E)
     # ---------------------------
-    # Compute iterative updates on variables
-    rscores = list() # final rule scores
+    # Prepare rules and variable states
+    rvctx, rvq, rva = self.vrules # (R, Cs, C), (R, Q), (R, A)
+    rmctx, rmq, rma = self.mrules # (R, Cs, C), (R, Q), (R, A)
+    erctx, erq, era = [self.embed(v) for v in self.vrules] # (R, Cs, C, E), (R, Q, E), (R, A, E)
+    inbody, vmap = self.rulegen(self.vrules, [erctx, erq, era]) # (R, Cs, 2), (R, V)
+    nrules_range = np.arange(len(self.rule_stories)) # (R,)
+    ctxvgates = vmap[nrules_range[:, None, None], rvctx] # (R, Cs, C)
+    qvgates, avgates = [vmap[nrules_range[:, None], v] for v in (rvq, rva)] # (R, Q), (R, A)
+    eyeunk = self.eye * self.unkbias # (V, V)
+    vs_init = F.tile(eyeunk, (vq.shape[0], len(self.rule_stories), 1, 1)) # (B, R, V, V)
+    vs = vs_init # (B, R, V, V)
     wordsrange = np.arange(len(word2idx)) # (V,)
+    batchrange = np.arange(vctx.shape[0]) # (B,)
+    # ---------------------------
+    # Compute iterative updates on variables
+    for _ in range(ITERATIONS):
+      # ---------------------------
+      # Unify query first assuming given query is ground
+      qvvalues = vs[:, nrules_range[:, None], rvq, :] # (B, R, Q, V)
+      qvvalues = F.softmax(qvvalues, -1) # (B, R, Q, V)
+      qvvalues = qvvalues @ self.embed.W # (B, R, Q, E)
+      qvvalues = self.var_linear(qvvalues, n_batch_axes=3) # (B, R, Q, E)
+      qtoprove = qvgates[..., None]*qvvalues + (1-qvgates[..., None])*erq # (B, R, Q, E)
+      qtoprove *= rmq[..., None] # (B, R, Q, E)
+      qscores, qunis = self.unify(rvq[:, None, :], qtoprove[:, :, None, ...], vq[:, None, ...], eq[:, None, ...]) # (B, R, 1), (B, R, 1, Q, V)
+      qunis = F.squeeze(qunis, 2) # (B, R, Q, V)
+      # Update variable states with new unifications
+      mask = np.isin(wordsrange, rvq, invert=True) # (V,)
+      vs *= mask[:, None] # (B, R, V, V)
+      vs = F.scatter_add(vs, (batchrange[:, None, None], nrules_range[None, :, None], rvq), qunis) # (B, R, V, V)
+      # ---------------------------
+      # Regather all context variable values
+      bodyvvalues = vs[:, nrules_range[:, None, None], rvctx, :] # (B, R, Cs, C, V)
+      bodyvvalues = F.softmax(bodyvvalues, -1) # (B, R, Cs, C, V)
+      bodyvvalues = bodyvvalues @ self.embed.W # (B, R, Cs, C, E)
+      bodyvvalues = self.var_linear(bodyvvalues, n_batch_axes=4) # (B, R, Cs, C, E)
+      bodytoprove = ctxvgates[..., None]*bodyvvalues + (1-ctxvgates[..., None])*erctx # (B, R, Cs, C, E)
+      bodytoprove *= rmctx[..., None] # (B, R, Cs, C, E)
+      bscores, bunis = self.unify(rvctx, bodytoprove, vctx, ectx) # (B, R, Cs), (B, R, Cs, C, V)
+      import ipdb; ipdb.set_trace()
+      print("HERE")
+    #########################################################
+    rscores = list() # final rule scores
     for comprule in rules:
       rule, vs, enc_rule = comprule
       # Iterative proving
