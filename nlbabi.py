@@ -30,7 +30,7 @@ if ARGS.debug:
 
 EMBED = 16
 MAX_HIST = 25
-REPO_SIZE = 2
+REPO_SIZE = 1
 ITERATIONS = 3
 
 # ---------------------------
@@ -501,9 +501,9 @@ val_iter = C.iterators.SerialIterator(val_enc_stories, 32, repeat=False, shuffle
 trainer.extend(T.extensions.Evaluator(val_iter, cmodel, converter=converter, device=-1))
 # trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_best.npz'), trigger=T.triggers.MinValueTrigger('validation/main/loss'))
 trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_latest.npz'), trigger=(1, 'epoch'))
-trainer.extend(T.extensions.LogReport(log_name=ARGS.name+'_log.json'))
+trainer.extend(T.extensions.LogReport(trigger=(1, 'iteration'), log_name=ARGS.name+'_log.json'))
 trainer.extend(T.extensions.FailOnNonNumber())
-trainer.extend(T.extensions.PrintReport(['epoch', 'main/loss', 'validation/main/loss', 'main/accuracy', 'validation/main/accuracy', 'elapsed_time']))
+trainer.extend(T.extensions.PrintReport(['epoch', 'iteration', 'main/loss', 'validation/main/loss', 'main/accuracy', 'validation/main/accuracy', 'elapsed_time']))
 # trainer.extend(T.extensions.ProgressBar(update_interval=10))
 # trainer.extend(T.extensions.PlotReport(['main/loss', 'validation/main/loss'], 'iteration', marker=None, file_name=ARGS.name+'_loss.pdf'))
 # trainer.extend(T.extensions.PlotReport(['main/accuracy', 'validation/main/accuracy'],'iteration', marker=None, file_name=ARGS.name+'_acc.pdf'))
