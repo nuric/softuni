@@ -194,7 +194,7 @@ class RuleGen(C.Chain):
     with self.init_scope():
       self.body_linear = L.Linear(5*EMBED, 2*EMBED)
       self.body_score = L.Linear(2*EMBED, 2)
-      self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
+      # self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
       self.isvariable_linear = L.Linear(EMBED+1, EMBED)
       self.isvariable_score = L.Linear(EMBED, 1)
 
@@ -227,12 +227,18 @@ class RuleGen(C.Chain):
     words = np.reshape(vctx, (num_rules, -1)) # (R, Cs*C)
     words = np.concatenate([vq, words], -1) # (R, Q+Cs*C)
     # Compute contextuals by convolving each sentence
-    contextual_q = contextual_convolve(self.xp, self.convolve_words, vq, eq) # (R, Q, E)
-    contextual_ctx = contextual_convolve(self.xp, self.convolve_words, vctx, ectx) # (R, Cs, C, E)
-    flat_cctx = F.reshape(contextual_ctx, (num_rules, -1, ectx.shape[-1])) # (R, Cs * C, E)
-    cwords = F.concat([contextual_q, flat_cctx], 1) # (R, Q+Cs*C, E)
+    ###
+    # contextual_q = contextual_convolve(self.xp, self.convolve_words, vq, eq) # (R, Q, E)
+    # contextual_ctx = contextual_convolve(self.xp, self.convolve_words, vctx, ectx) # (R, Cs, C, E)
+    # flat_cctx = F.reshape(contextual_ctx, (num_rules, -1, ectx.shape[-1])) # (R, Cs * C, E)
+    # cwords = F.concat([contextual_q, flat_cctx], 1) # (R, Q+Cs*C, E)
+    ###
+    flat_ctx = F.reshape(ectx, (num_rules, -1, ectx.shape[-1])) # (R, Cs * C, E)
+    cwords = F.concat([eq, flat_ctx], 1) # (R, Q+Cs*C, E)
     # Add whether they appear in the answer as a featurec
-    appearanswer = np.isin(words, va).astype(np.float32) # (R, Q+Cs*C)
+    # np.isin flattens second argument, so we need for loop
+    appearanswer = np.array([np.isin(ws, _va) for ws, _va in zip(words, va)]) # (R, Q+Cs*C)
+    appearanswer = appearanswer.astype(np.float32) # (R, Q+Cs*C)
     allwords = F.concat([cwords, appearanswer[..., None]], -1) # (R, Q+Cs*C, E+1)
     wordvars = self.isvariable_linear(allwords, n_batch_axes=2) # (R, Q+Cs*C, E)
     wordvars = F.tanh(wordvars) # (R, Q+Cs*C, E)
@@ -294,7 +300,9 @@ class Unify(C.Chain):
     # Calculate score for each candidate
     # Compute bag of words
     pbow = F.sum(contextual_toprove, -2) # (B, R, Ps, E)
+    # pbow = pos_encode(toprove, contextual_toprove) # (B, R ,Ps, E)
     cbows = F.sum(contextual_candidates, -2) # (B, Cs, E)
+    # cbows = pos_encode(candidates, contextual_candidates) # (B, Cs, E)
     cbows = F.tile(cbows[:, None, None, ...], (1,) + pbow.shape[1:3] + (1, 1)) # (B, R, Ps, Cs, E)
     pbow = F.repeat(pbow[..., None, :], cbows.shape[-2], 3) # (B, R, Ps, Cs, E)
     # Compute features
@@ -335,6 +343,8 @@ class Infer(C.Chain):
       self.unify = Unify()
       self.unkbias = C.Parameter(4.0, shape=(1,), name="unkbias")
       self.eye = self.xp.eye(len(word2idx), dtype=self.xp.float32) # (V, V)
+      self.rule_linear = L.Linear(8*EMBED, 4*EMBED)
+      self.rule_score = L.Linear(4*EMBED, 1)
     # Setup rule repo
     self.vrules = vectorise_stories(rule_stories) # (R, Cs, C), (R, Q), (R, A)
     self.mrules = tuple([v != 0 for v in self.vrules]) # (R, Cs, C), (R, Q), (R, A)
@@ -399,126 +409,54 @@ class Infer(C.Chain):
       normalisations = F.einsum("ijk,jklm->ijm", body_weights, normalisations) # (B, R, V)
       normalisations += np.logical_not(mask) * 0.0001 # Avoid zero divide error (B, R, V)
       vs /= normalisations[..., None] # (B, R, V, V)
-      import ipdb; ipdb.set_trace()
-      print("HERE")
-    #########################################################
-    rscores = list() # final rule scores
-    for comprule in rules:
-      rule, vs, enc_rule = comprule
-      # Iterative proving
-      rwords = [rule['story']['query']]+rule['story']['context'] # [(qlen,), (s1len,), ...]
-      slens = [len(s) for s in rwords] # [qlen, s1len, s2len, ...]
-      concat_rwords = np.concatenate(rwords) # (qlen+s1len+s2len+...,)
-      grounds = F.concat((enc_rule['query'],)+enc_rule['context'], 0) # (qlen+s1len+s2len+..., E)
-      vgates = F.expand_dims(rule['vmap'][concat_rwords], 1) # (qlen+s1len+s2len+..., 1)
-      for _ in range(ITERATIONS):
-        # ---------------------------
-        # Unify query first assuming given query is ground
-        qvvalues = F.softmax(vs[:, rwords[0]], -1) # (B, qlen, V)
-        qvvalues = qvvalues @ self.embed.W # (B, qlen, E)
-        qvvalues = self.var_linear(qvvalues, n_batch_axes=2) # (B, qlen, E)
-        qlen = len(rwords[0])
-        qtoprove = vgates[:qlen]*qvvalues + (1-vgates[:qlen])*grounds[:qlen] # (B, qlen, E)
-        qscores, qunifieds = list(), list()
-        for i, (s, es) in enumerate(zip(stories, embedded_stories)):
-          qscore, qunified = self.unify(qtoprove[i], [s['query']], (es['query'],))
-          qscores.append(qscore) # ()
-          qunifieds.append(qunified) # (qlen, V)
-        qscores = F.vstack(qscores) # (B, 1)
-        qunifieds = F.stack(qunifieds, 0) # (B, qlen, V)
-        # Update variable states with new unifications
-        mask = np.isin(wordsrange, rwords[0], invert=True).astype(np.float32) # (V,)
-        vs *= mask[:, None] # (B, V, V)
-        vs = F.scatter_add(vs, (batch_range, rwords[0]), qunifieds) # (V, V)
-        # ---------------------------
-        # Regather all variable values
-        vvalues = F.softmax(vs[:, concat_rwords[qlen:]], -1) # (B, s1len+s2len+..., V)
-        vvalues = vvalues @ self.embed.W # (B, s1len+s2len+..., E)
-        vvalues = self.var_linear(vvalues, n_batch_axes=2) # (B, s1len+s2len+..., E)
-        # Merge ground with variable values
-        bodytoprove = vgates[qlen:]*vvalues + (1-vgates[qlen:])*grounds[qlen:] # (B, s1len+s2len+..., E)
-        # ---------------------------
-        # Unifications give new variable values and a score for match
-        scores, unifications = [qscores], [qunifieds] # [(B, 1)], [(B, qlen, V)]
-        # Unify body conditions
-        bodiestoprove = F.split_axis(bodytoprove, np.cumsum(slens[1:-1]), 1) # [(B, s1len, E), (B, s2len, E), ...]
-        for btoprove in bodiestoprove:
-          bscores, bunifications = list(), list()
-          for i, (s, es) in enumerate(zip(stories, embedded_stories)):
-            score, unified = self.unify(btoprove[i], s['context'], es['context']) # (), (snlen, V)
-            bscores.append(score) # ()
-            bunifications.append(unified) # (snlen, V)
-          scores.append(F.vstack(bscores)) # (B, 1)
-          unifications.append(F.stack(bunifications, 0)) # (B, snlen, V)
-        # ---------------------------
-        # Update variables after unification
-        vscores = F.concat(scores, 1) # (B, 1+len(body))
-        weights = np.repeat(np.arange(len(slens)), slens) # (qlen+s1len+...,)
-        weights = vscores[:, weights] # (B, qlen+s1len+...)
-        inbody = F.repeat(rule['bodymap'][:,0], tuple(slens[1:])) # (s1len+s2len+...,)
-        inbody = F.pad(inbody, (slens[0], 0), 'constant', constant_values=1.0) # (qlen+s1len+...,)
-        weights *= inbody # (B, qlen+s1len+...)
-        normalisations = F.scatter_add(self.xp.full((len(stories), len(word2idx)), 0.001, dtype=self.xp.float32),
-                                       (batch_range, concat_rwords), weights) # (B, V)
-        unifications = F.concat(unifications, 1) # (B, qlen+s1len+s2len+..., V)
-        # Weighted sum based on score
-        unifications *= weights[..., None] # (B, qlen+s1len+s2len+..., V)
-        unifications = F.scatter_add(self.xp.zeros((len(stories), len(word2idx), len(word2idx)), dtype=self.xp.float32),
-                                     (batch_range, concat_rwords), unifications) # (B, V, V)
-        vs = unifications / normalisations[..., None]
-        comprule[1] = vs
-      # ---------------------------
-      # Compute overall score for rule
-      # rule['bodymap'].shape == (len(body), 2) => inbody, isnegated
-      prem_scores = F.sigmoid(vscores) # (B, 1 + len(body))
-      qscore, bscores = prem_scores[:, 0], prem_scores[:, 1:] # (B,), (B, len(body))
-      # Computed negated scores: n(1-b) + (1-n)b
-      isneg = rule['bodymap'][:,1] # (len(body),)
-      nbscores = isneg*(1-bscores) + (1-isneg)*bscores # (B, len(body))
-      # Compute final scores for body premises: in*nb+(1-in)*1
-      inbody = rule['bodymap'][:,0] # (len(body),)
-      fbscores = inbody*nbscores+(1-inbody) # (B, len(body))
-      # Final score for rule following AND semantics
-      rscore = qscore * F.cumprod(fbscores, -1)[:, -1] # (B,)
-      rscores.append(rscore)
     # ---------------------------
-    # Weighted sum using rule scores to produce final result
-    allanswers = list()
-    max_alen = max([len(r[0]['story']['answers']) for r in rules])
-    for rscore, (rule, vs, _) in zip(rscores, rules):
-      # Read head of rule with variable mapping
-      aswords = rule['story']['answers'] # (len(answers),)
-      # Get ground value
-      asground = self.weye[aswords] # (len(answers), V)
-      # Get variable values
-      asvar = vs[:, aswords] # (B, len(answers), V)
-      # Get maximum appearance of variable
-      varinbody = [[widx in seq for seq in rule['story']['context']] for widx in aswords]
-      varinbody = np.array(varinbody) # (len(answers), len(body))
-      inbody = rule['bodymap'][:,0] # (len(body),)
-      maxinbody = varinbody * inbody # (len(answers), len(body))
-      maxinbody = F.max(maxinbody, -1) # (len(answers),)
-      # Compute final value using variable gating values
-      asvgates = rule['vmap'][aswords] # (len(answers),)
-      asvgates *= maxinbody # (len(answers),)
-      prediction = asvgates[:,None]*asvar + (1-asvgates[:,None])*asground # (B, len(answers), V)
-      # Compute final final value using rule score
-      noans = F.tile(self.weye[0], (len(stories), len(aswords), 1)) # (B, len(answers), V)
-      answers = rscore[:, None, None]*prediction + (1-rscore[:, None, None])*noans # (B, len(answers), V)
-      # Shorcut for single rule cases
-      if len(rules) == 1:
-        return answers[:, 0, :]
-      if len(aswords) != max_alen:
-        # Pad answers to match shapes
-        answers = F.pad(answers, (0, (0, max_alen-len(aswords)), 0), mode='constant', constant_values=0.0)
-        import ipdb; ipdb.set_trace()
-      allanswers.append(answers) # (B, max_alen, V)
-    # Aggregate answers based on rule scores
-    rscores = F.vstack(rscores) # (R, B)
-    rscores = F.softmax(rscores, 0) # (R, B)
-    allanswers = F.stack(allanswers, 0) # (R, B, max_alen, V)
-    final_answers = F.einsum("ij,ijkl->jkl", rscores, allanswers) # (B, max_alen, V)
-    # **Assume one answer for now**
+    # Compute overall rule scores
+    qscores = F.sigmoid(F.squeeze(qscores, -1)) # (B, R)
+    bscores = F.sigmoid(bscores) # (B, R, Cs)
+    # Computed negated scores: n(1-b) + (1-n)b
+    isneg = inbody[..., 1] # (R, Cs)
+    nbscores = isneg*(1-bscores) + (1-isneg)*bscores # (B, R, Cs)
+    # Compute final scores for body premises: in*nb+(1-in)*1
+    isin = inbody[..., 0] # (R, Cs)
+    fbscores = isin*nbscores + (1-isin) # (B, R, Cs)
+    # Final score for rule following AND semantics
+    fbscores = F.cumprod(fbscores, -1)[..., -1] # (B, R)
+    rscores = qscores * fbscores # (B, R)
+    # ---------------------------
+    # Compute answers based on variable and rule scores
+    agrounds = eyeunk[rva] # (R, A, V)
+    avvalues = vs[:, nrules_range[:, None], rva, :] # (B, R, A, V)
+    predictions = avgates[None, ..., None]*avvalues + (1-avgates[..., None])*agrounds # (B, R, A, V)
+    noans = F.tile(eyeunk[0], predictions.shape[:-1] + (1,)) # (B, R, A, V)
+    answers = rscores[..., None, None]*predictions + (1-rscores[..., None, None])*noans # (B, R, A, V)
+    # ---------------------------
+    # Compute rule attentions
+    num_rules = rvq.shape[0] # R
+    num_batch = vq.shape[0] # B
+    # Rule features
+    rqfeats = pos_encode(rvq, erq) # (R, E)
+    rbfeats = pos_encode(rvctx, erctx) # (R, Ls, E)
+    rbfeats = F.sum(rbfeats, -2) # (R, E)
+    rfeats = F.concat([rqfeats, rbfeats], -1) # (R, 2*E)
+    # Story features
+    qfeats = pos_encode(vq, eq) # (B, E)
+    bfeats = pos_encode(vctx, ectx) # (B, Cs, E)
+    bfeats = F.sum(bfeats, -2) # (B, E)
+    feats = F.concat([qfeats, bfeats], -1) # (B, 2*E)
+    # Compute attention score
+    rfeats = F.repeat(rfeats[None, ...], num_batch, 0) # (B, R, 2*E)
+    feats = F.repeat(feats[:, None, :], num_rules, 1) # (B, R, 2*E)
+    allfeats = F.concat([rfeats, feats, rfeats*feats, rfeats+feats], -1) # (B, R, 4*2*E)
+    rule_atts = self.rule_linear(allfeats, n_batch_axes=2) # (B, R, 4*E)
+    rule_atts = F.tanh(rule_atts) # (B, R, 4*E)
+    rule_atts = self.rule_score(rule_atts, n_batch_axes=2) # (B, R, 1)
+    rule_atts = F.squeeze(rule_atts, -1) # (B, R)
+    rule_atts = F.softmax(rule_atts, -1) # (B, R)
+    # ---------------------------
+    # Compute final rule attended answer
+    # (B, R) x (B, R, A, V)
+    final_answers = F.einsum("ij,ijkl->ikl", rule_atts, answers) # (B, A, V)
+    # **Assuming one answer for now***
     return final_answers[:, 0, :]
 
 # ---------------------------
