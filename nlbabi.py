@@ -191,13 +191,13 @@ class RuleGen(C.Chain):
   def __init__(self):
     super().__init__()
     with self.init_scope():
-      self.body_linear = L.Linear(5*EMBED, 2*EMBED)
-      self.body_score = L.Linear(2*EMBED, 2)
+      self.body_linear = L.Linear(8*EMBED, 4*EMBED)
+      self.body_score = L.Linear(4*EMBED, 2)
       # self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
       self.isvariable_linear = L.Linear(EMBED+1, EMBED)
       self.isvariable_score = L.Linear(EMBED, 1)
 
-  def forward(self, vectorised_rules, embedded_rules):
+  def forward(self, vectorised_rules, embedded_rules, temporal):
     """Given a story generate a probabilistic learnable rule."""
     # vectorised_rules = [(R, Ls, L), (R, Q), (R, A)]
     # embedded_rules = [(R, Ls, L, E), (R, Q, E), (R, A, E)]
@@ -209,12 +209,14 @@ class RuleGen(C.Chain):
     enc_answer = pos_encode(va, ea) # (R, E)
     # ---------------------------
     # Whether a fact is in the body or not, negated or not, multi-label -> (clen, 2)
-    clen = enc_ctx.shape[1] # Ls
-    r_answer = F.repeat(enc_answer[:, None, :], clen, 1) # (R, Ls, E)
-    r_query = F.repeat(enc_query[:, None, :], clen, 1) # (R, Ls, E)
-    r_ctx = F.concat([r_answer, r_query, enc_ctx, r_answer*enc_ctx, r_query*enc_ctx], -1) # (R, Ls, 5*E)
-    inbody = self.body_linear(r_ctx, n_batch_axes=2) # (R, Ls, 2*E)
-    inbody = F.tanh(inbody) # (R, Ls, 2*E)
+    bodylen = enc_ctx.shape[1] # Ls
+    r_answer = F.repeat(enc_answer[:, None, :], bodylen, 1) # (R, Ls, E)
+    r_query = F.repeat(enc_query[:, None, :], bodylen, 1) # (R, Ls, E)
+    temps = temporal[:bodylen, :] # (Ls, E)
+    temps = F.repeat(temps[None, ...], enc_ctx.shape[0], 0) # (R, Ls, E)
+    r_ctx = F.concat([r_answer, r_query, enc_ctx, temps, temps+enc_ctx, temps*enc_ctx, r_answer*enc_ctx, r_query*enc_ctx], -1) # (R, Ls, 8*E)
+    inbody = self.body_linear(r_ctx, n_batch_axes=2) # (R, Ls, 4*E)
+    inbody = F.tanh(inbody) # (R, Ls, 4*E)
     inbody = self.body_score(inbody, n_batch_axes=2) # (R, Ls, 2)
     inbody = F.sigmoid(inbody) # (R, Ls, 2)
     bodymask = (vctx != 0.0) # (R, Ls, S)
@@ -268,10 +270,9 @@ class Unify(C.Chain):
       self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
       self.match_linear = L.Linear(6*EMBED, 3*EMBED)
       self.match_score = L.Linear(3*EMBED, 1)
-      self.temporal_enc = C.Parameter(C.initializers.Normal(1.0), (MAX_HIST, EMBED), name="tempenc")
     self.eye = self.xp.eye(len(word2idx), dtype=self.xp.float32) # (V, V)
 
-  def forward(self, toprove, embedded_toprove, candidates, embedded_candidates):
+  def forward(self, toprove, embedded_toprove, candidates, embedded_candidates, temporal):
     """Given two sentences compute variable matches and score."""
     # toprove.shape = (R, Ps, P)
     # embedded_toprove.shape = (B, R, Ps, P, E)
@@ -305,7 +306,7 @@ class Unify(C.Chain):
     cbows = F.tile(cbows[:, None, None, ...], (1,) + pbow.shape[1:3] + (1, 1)) # (B, R, Ps, Cs, E)
     pbow = F.repeat(pbow[..., None, :], cbows.shape[-2], 3) # (B, R, Ps, Cs, E)
     # Compute features
-    tbows = self.temporal_enc[:cbows.shape[-2], :] # (Cs, E)
+    tbows = temporal[:cbows.shape[-2], :] # (Cs, E)
     tbows = F.tile(tbows, pbow.shape[:3] + (1, 1)) # (B, R, Ps, Cs, E)
     pcbows = F.concat([pbow, cbows, pbow*cbows, tbows, tbows+cbows, tbows*cbows], -1) # (B, R, Ps, Cs, 6*E)
     raw_scores = self.match_linear(pcbows, n_batch_axes=4) # (B, R, Ps, Cs, 3*E)
@@ -337,6 +338,7 @@ class Infer(C.Chain):
     # Create model parameters
     with self.init_scope():
       self.embed = L.EmbedID(len(word2idx), EMBED, ignore_label=0)
+      self.temporal_enc = C.Parameter(C.initializers.Normal(1.0), (MAX_HIST, EMBED), name="tempenc")
       self.rulegen = RuleGen()
       self.var_linear = L.Linear(EMBED, EMBED)
       self.unify = Unify()
@@ -351,7 +353,7 @@ class Infer(C.Chain):
   def gen_rules(self):
     """Generate the body and variable maps from rules in repository."""
     erctx, erq, era = [self.embed(v) for v in self.vrules] # (R, Ls, L, E), (R, Q, E), (R, A, E)
-    inbody, vmap = self.rulegen(self.vrules, [erctx, erq, era]) # (R, Ls, 2), (R, V)
+    inbody, vmap = self.rulegen(self.vrules, [erctx, erq, era], self.temporal_enc) # (R, Ls, 2), (R, V)
     return inbody, vmap
 
   def forward(self, stories):
@@ -366,7 +368,7 @@ class Infer(C.Chain):
     rvctx, rvq, rva = self.vrules # (R, Ls, L), (R, Q), (R, A)
     rmctx, rmq, rma = self.mrules # (R, Ls, L), (R, Q), (R, A)
     erctx, erq, era = [self.embed(v) for v in self.vrules] # (R, Ls, L, E), (R, Q, E), (R, A, E)
-    inbody, vmap = self.rulegen(self.vrules, [erctx, erq, era]) # (R, Ls, 2), (R, V)
+    inbody, vmap = self.rulegen(self.vrules, [erctx, erq, era], self.temporal_enc) # (R, Ls, 2), (R, V)
     nrules_range = np.arange(len(self.rule_stories)) # (R,)
     ctxvgates = vmap[nrules_range[:, None, None], rvctx] # (R, Ls, L)
     qvgates, avgates = [vmap[nrules_range[:, None], v] for v in (rvq, rva)] # (R, Q), (R, A)
@@ -386,7 +388,9 @@ class Infer(C.Chain):
       qvvalues = self.var_linear(qvvalues, n_batch_axes=3) # (B, R, Q, E)
       qtoprove = qvgates[..., None]*qvvalues + (1-qvgates[..., None])*erq # (B, R, Q, E)
       qtoprove *= rmq[..., None] # (B, R, Q, E)
-      qscores, qunis = self.unify(rvq[:, None, :], qtoprove[:, :, None, ...], vq[:, None, ...], eq[:, None, ...]) # (B, R, 1), (B, R, 1, Q, V)
+      qscores, qunis = self.unify(rvq[:, None, :], qtoprove[:, :, None, ...],
+                                  vq[:, None, ...], eq[:, None, ...],
+                                  self.temporal_enc) # (B, R, 1), (B, R, 1, Q, V)
       qunis = F.squeeze(qunis, 2) # (B, R, Q, V)
       # Update variable states with new unifications
       # np.isin flattens second argument, so we need for loop
@@ -401,7 +405,7 @@ class Infer(C.Chain):
       bodyvvalues = self.var_linear(bodyvvalues, n_batch_axes=4) # (B, R, Ls, L, E)
       bodytoprove = ctxvgates[..., None]*bodyvvalues + (1-ctxvgates[..., None])*erctx # (B, R, Ls, L, E)
       bodytoprove *= rmctx[..., None] # (B, R, Ls, L, E)
-      bscores, bunis = self.unify(rvctx, bodytoprove, vctx, ectx) # (B, R, Ls), (B, R, Ls, L, V)
+      bscores, bunis = self.unify(rvctx, bodytoprove, vctx, ectx, self.temporal_enc) # (B, R, Ls), (B, R, Ls, L, V)
       # ---------------------------
       # Weighted update of variable states after body unification
       body_weights = inbody[..., 0] * bscores # (B, R, Ls)
