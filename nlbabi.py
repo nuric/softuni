@@ -264,7 +264,7 @@ class Unify(C.Chain):
       self.match_linear = L.Linear(6*EMBED, 3*EMBED)
       self.match_score = L.Linear(3*EMBED, 1)
       self.temporal_enc = C.Parameter(C.initializers.Normal(1.0), (MAX_HIST, EMBED), name="tempenc")
-    self.eye = self.xp.eye(len(word2idx)) # (V, V)
+    self.eye = self.xp.eye(len(word2idx), dtype=self.xp.float32) # (V, V)
 
   def forward(self, toprove, embedded_toprove, candidates, embedded_candidates):
     """Given two sentences compute variable matches and score."""
@@ -374,11 +374,12 @@ class Infer(C.Chain):
       qscores, qunis = self.unify(rvq[:, None, :], qtoprove[:, :, None, ...], vq[:, None, ...], eq[:, None, ...]) # (B, R, 1), (B, R, 1, Q, V)
       qunis = F.squeeze(qunis, 2) # (B, R, Q, V)
       # Update variable states with new unifications
-      mask = np.isin(wordsrange, rvq, invert=True) # (V,)
-      vs *= mask[:, None] # (B, R, V, V)
+      # np.isin flattens second argument, so we need for loop
+      mask = np.vstack([np.isin(wordsrange, _rvq) for _rvq in rvq]) # (R, V)
+      vs *= mask[..., None] # (B, R, V, V)
       vs = F.scatter_add(vs, (batchrange[:, None, None], nrules_range[None, :, None], rvq), qunis) # (B, R, V, V)
       # ---------------------------
-      # Regather all context variable values
+      # Unify body with updated variable state
       bodyvvalues = vs[:, nrules_range[:, None, None], rvctx, :] # (B, R, Cs, C, V)
       bodyvvalues = F.softmax(bodyvvalues, -1) # (B, R, Cs, C, V)
       bodyvvalues = bodyvvalues @ self.embed.W # (B, R, Cs, C, E)
@@ -386,6 +387,18 @@ class Infer(C.Chain):
       bodytoprove = ctxvgates[..., None]*bodyvvalues + (1-ctxvgates[..., None])*erctx # (B, R, Cs, C, E)
       bodytoprove *= rmctx[..., None] # (B, R, Cs, C, E)
       bscores, bunis = self.unify(rvctx, bodytoprove, vctx, ectx) # (B, R, Cs), (B, R, Cs, C, V)
+      # ---------------------------
+      # Weighted update of variable states after body unification
+      body_weights = inbody[..., 0] * bscores # (B, R, Cs)
+      weighted_bunis = body_weights[..., None, None] * bunis # (B, R, Cs, C, V)
+      # np.isin flattens second argument, so we need for loop
+      mask = np.vstack([np.isin(wordsrange, _rvctx) for _rvctx in rvctx]) # (R, V)
+      vs *= mask[..., None] # (B, R, V, V)
+      vs = F.scatter_add(vs, (batchrange[:, None, None, None], nrules_range[None, :, None, None], rvctx), weighted_bunis) # (B, R, V, V)
+      normalisations = self.eye[rvctx] # (R, Cs, C, V)
+      normalisations = F.einsum("ijk,jklm->ijm", body_weights, normalisations) # (B, R, V)
+      normalisations += np.logical_not(mask) * 0.0001 # Avoid zero divide error (B, R, V)
+      vs /= normalisations[..., None] # (B, R, V, V)
       import ipdb; ipdb.set_trace()
       print("HERE")
     #########################################################
