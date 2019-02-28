@@ -19,7 +19,6 @@ np.set_printoptions(suppress=True, precision=3)
 # Arguments
 parser = argparse.ArgumentParser(description="Run NeuroLog on bAbI tasks.")
 parser.add_argument("task", help="File that contains task train.")
-parser.add_argument("validation", help="File that contains task validation.")
 parser.add_argument("--name", default="nlbabi", help="Name prefix for saving files etc.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
 ARGS = parser.parse_args()
@@ -62,7 +61,7 @@ def load_task(fname):
       prev_id = sid
   return ss
 stories = load_task(ARGS.task)
-val_stories = load_task(ARGS.validation)
+val_stories = load_task(ARGS.task.replace('train', 'test'))
 print("TRAIN:", len(stories), "stories")
 print("VAL:", len(val_stories), "stories")
 print("SAMPLE:", stories[0])
@@ -349,6 +348,12 @@ class Infer(C.Chain):
     self.vrules = vectorise_stories(rule_stories) # (R, Cs, C), (R, Q), (R, A)
     self.mrules = tuple([v != 0 for v in self.vrules]) # (R, Cs, C), (R, Q), (R, A)
 
+  def gen_rules(self):
+    """Generate the body and variable maps from rules in repository."""
+    erctx, erq, era = [self.embed(v) for v in self.vrules] # (R, Cs, C, E), (R, Q, E), (R, A, E)
+    inbody, vmap = self.rulegen(self.vrules, [erctx, erq, era]) # (R, Cs, 2), (R, V)
+    return inbody, vmap
+
   def forward(self, stories):
     """Compute the forward inference pass for given stories."""
     # ---------------------------
@@ -482,7 +487,7 @@ cmodel = L.Classifier(model, lossfun=F.softmax_cross_entropy, accfun=F.accuracy)
 optimiser = C.optimizers.Adam().setup(cmodel)
 optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
 
-train_iter = C.iterators.SerialIterator(enc_stories, 7)
+train_iter = C.iterators.SerialIterator(enc_stories, 32)
 def converter(batch_stories, _):
   """Coverts given batch to expected format for Classifier."""
   vctx, vq, vas = vectorise_stories(batch_stories) # (B, Cs, C), (B, Q), (B, A)
@@ -529,10 +534,9 @@ except KeyboardInterrupt:
   pass
 
 # Print final rules
-for r, _, _  in model.gen_rules():
-  print("RSTORY:", decode_story(r['story']))
-  print(r['bodymap'])
-  print(r['vmap'])
+print([decode_story(rs) for rs in model.rule_stories])
+print(model.vrules)
+print(model.gen_rules())
 # Extra inspection if we are debugging
 if ARGS.debug:
   import ipdb; ipdb.set_trace()
