@@ -32,6 +32,7 @@ EMBED = 16
 MAX_HIST = 25
 REPO_SIZE = 1
 ITERATIONS = 3
+MINUS_INF = -1000
 
 # ---------------------------
 
@@ -284,9 +285,9 @@ class Unify(C.Chain):
     mask_toprove = (toprove == 0.0) # (R, Ps, P)
     mask_candidates = (candidates == 0.0) # (B, Cs, C)
     sim_mask = np.logical_or(mask_toprove[None, ..., None, None], mask_candidates[:, None, None, None, ...]) # (B, R, Ps, P, Cs, C)
-    sim_mask = sim_mask.astype(np.float32) * -1000 # (B, R, Ps, P, Cs, C)
+    sim_mask = sim_mask.astype(np.float32) * MINUS_INF # (B, R, Ps, P, Cs, C)
     mask_cs = np.all(mask_candidates, -1) # (B, Cs)
-    mask_cs = mask_cs.astype(np.float32) * -1000 # (B, Cs)
+    mask_cs = mask_cs.astype(np.float32) * MINUS_INF # (B, Cs)
     # ---------------------------
     # Calculate a match for every word in s1 to every word in s2
     # Compute contextual representations
@@ -369,6 +370,8 @@ class Infer(C.Chain):
     rmctx, rmq, rma = self.mrules # (R, Ls, L), (R, Q), (R, A)
     erctx, erq, era = [self.embed(v) for v in self.vrules] # (R, Ls, L, E), (R, Q, E), (R, A, E)
     inbody, vmap = self.rulegen(self.vrules, [erctx, erq, era], self.temporal_enc) # (R, Ls, 2), (R, V)
+    # inbody = np.array([[[0,0], [1,0]]], dtype=np.float32)
+    # vmap = np.array([[0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0]], dtype=np.float32)
     nrules_range = np.arange(len(self.rule_stories)) # (R,)
     ctxvgates = vmap[nrules_range[:, None, None], rvctx] # (R, Ls, L)
     qvgates, avgates = [vmap[nrules_range[:, None], v] for v in (rvq, rva)] # (R, Q), (R, A)
@@ -394,7 +397,7 @@ class Infer(C.Chain):
       qunis = F.squeeze(qunis, 2) # (B, R, Q, V)
       # Update variable states with new unifications
       # np.isin flattens second argument, so we need for loop
-      mask = np.vstack([np.isin(wordsrange, _rvq) for _rvq in rvq]) # (R, V)
+      mask = np.vstack([np.isin(wordsrange, _rvq, invert=True) for _rvq in rvq]) # (R, V)
       vs *= mask[..., None] # (B, R, V, V)
       vs = F.scatter_add(vs, (batchrange[:, None, None], nrules_range[None, :, None], rvq), qunis) # (B, R, V, V)
       # ---------------------------
@@ -411,12 +414,12 @@ class Infer(C.Chain):
       body_weights = inbody[..., 0] * bscores # (B, R, Ls)
       weighted_bunis = body_weights[..., None, None] * bunis # (B, R, Ls, L, V)
       # np.isin flattens second argument, so we need for loop
-      mask = np.vstack([np.isin(wordsrange, _rvctx) for _rvctx in rvctx]) # (R, V)
+      mask = np.vstack([np.isin(wordsrange, _rvctx, invert=True) for _rvctx in rvctx]) # (R, V)
       vs *= mask[..., None] # (B, R, V, V)
       vs = F.scatter_add(vs, (batchrange[:, None, None, None], nrules_range[None, :, None, None], rvctx), weighted_bunis) # (B, R, V, V)
       normalisations = self.eye[rvctx] # (R, Ls, L, V)
       normalisations = F.einsum("ijk,jklm->ijm", body_weights, normalisations) # (B, R, V)
-      normalisations += np.logical_not(mask) * 0.0001 # Avoid zero divide error (B, R, V)
+      normalisations += 0.0001 # Avoid zero divide error (B, R, V)
       vs /= normalisations[..., None] # (B, R, V, V)
     # ---------------------------
     # Compute overall rule scores
@@ -527,8 +530,8 @@ if os.path.isfile(trainer_statef):
   print("Loaded trainer state from:", trainer_statef)
 
 if ARGS.debug:
-  import ipdb; ipdb.set_trace()
-  answers = model([enc_stories[1], enc_stories[20]])
+  # import ipdb; ipdb.set_trace()
+  answers = model(converter([enc_stories[1], enc_stories[20]], None)[0])
   print("INIT ANSWERS:", answers)
 
 # Hit the train button
@@ -544,5 +547,5 @@ print(model.gen_rules())
 # Extra inspection if we are debugging
 if ARGS.debug:
   import ipdb; ipdb.set_trace()
-  answers = model([enc_stories[1], enc_stories[20]])
+  answers = model(converter([enc_stories[1], enc_stories[20]], None)[0])
   print("FINAL ANSWERS:", answers)
