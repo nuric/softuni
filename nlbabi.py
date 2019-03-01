@@ -14,7 +14,7 @@ matplotlib.use('pdf')
 
 
 # Disable scientific printing
-np.set_printoptions(suppress=True, precision=3)
+np.set_printoptions(suppress=True, precision=3, linewidth=180)
 
 # Arguments
 parser = argparse.ArgumentParser(description="Run NeuroLog on bAbI tasks.")
@@ -418,8 +418,8 @@ class Infer(C.Chain):
       vs *= mask[..., None] # (B, R, V, V)
       vs = F.scatter_add(vs, (batchrange[:, None, None, None], nrules_range[None, :, None, None], rvctx), weighted_bunis) # (B, R, V, V)
       normalisations = self.eye[rvctx] # (R, Ls, L, V)
-      normalisations = F.einsum("ijk,jklm->ijm", body_weights, normalisations) # (B, R, V)
-      normalisations += 0.0001 # Avoid zero divide error (B, R, V)
+      normalisations = F.einsum("ijk,jklm->ijm", bscores, normalisations) # (B, R, V)
+      normalisations += 0.0001 # Avoid divide by zero (B, R, V)
       vs /= normalisations[..., None] # (B, R, V, V)
     # ---------------------------
     # Compute overall rule scores
