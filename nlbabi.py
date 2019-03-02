@@ -282,10 +282,10 @@ class Unify(C.Chain):
     # vstate.shape = (B, R, V, V)
     # ---------------------------
     # Setup masks
-    mask_toprove = (toprove == 0.0) # (R, Ps, P)
+    # mask_toprove = (toprove == 0.0) # (R, Ps, P)
     mask_candidates = (candidates == 0.0) # (B, Cs, C)
-    sim_mask = np.logical_or(mask_toprove[None, ..., None, None], mask_candidates[:, None, None, None, ...]) # (B, R, Ps, P, Cs, C)
-    sim_mask = sim_mask.astype(np.float32) * MINUS_INF # (B, R, Ps, P, Cs, C)
+    # sim_mask = np.logical_or(mask_toprove[None, ..., None, None], mask_candidates[:, None, None, None, ...]) # (B, R, Ps, P, Cs, C)
+    # sim_mask = sim_mask.astype(np.float32) * MINUS_INF # (B, R, Ps, P, Cs, C)
     mask_cs = np.all(mask_candidates, -1) # (B, Cs)
     mask_cs = mask_cs.astype(np.float32) * MINUS_INF # (B, Cs)
     # ---------------------------
@@ -296,7 +296,7 @@ class Unify(C.Chain):
     # Compute similarity between every provable symbol and candidate symbol
     # (B, R, Ps, P, E) x (B, Cs, C, E)
     raw_sims = F.einsum("ijklm,inom->ijklno", contextual_toprove, contextual_candidates) # (B, R, Ps, P, Cs, C)
-    raw_sims += sim_mask # (B, R, Ps, P, Cs, C)
+    # raw_sims += sim_mask # (B, R, Ps, P, Cs, C)
     # ---------------------------
     # Calculate score for each candidate
     # Compute bag of words
@@ -326,6 +326,7 @@ class Unify(C.Chain):
     final_unis = F.einsum("ijkc,ijklcv->ijklv", weights, unifications) # (B, R, Ps, P, V)
     # Final overall score
     final_scores = F.max(raw_scores, -1) # (B, R, Ps)
+    final_scores *= np.any(toprove != 0.0, -1) # (B, R, Ps)
     return final_scores, final_unis
 
 # ---------------------------
@@ -413,14 +414,15 @@ class Infer(C.Chain):
       # Weighted update of variable states after body unification
       body_weights = inbody[..., 0] * bscores # (B, R, Ls)
       weighted_bunis = body_weights[..., None, None] * bunis # (B, R, Ls, L, V)
-      # np.isin flattens second argument, so we need for loop
-      mask = np.vstack([np.isin(wordsrange, _rvctx, invert=True) for _rvctx in rvctx]) # (R, V)
-      vs *= mask[..., None] # (B, R, V, V)
-      vs = F.scatter_add(vs, (batchrange[:, None, None, None], nrules_range[None, :, None, None], rvctx), weighted_bunis) # (B, R, V, V)
       normalisations = self.eye[rvctx] # (R, Ls, L, V)
       normalisations = F.einsum("ijk,jklm->ijm", bscores, normalisations) # (B, R, V)
-      normalisations += 0.0001 # Avoid divide by zero (B, R, V)
-      vs /= normalisations[..., None] # (B, R, V, V)
+      normalisations = normalisations[batchrange[:, None, None, None], nrules_range[None, :, None, None], rvctx[None, ...]] # (B, R, Ls, L)
+      weighted_bunis /= normalisations[..., None] # (B, R, Ls, L, V)
+      # np.isin flattens second argument, so we need for loop
+      mask = np.vstack([np.isin(wordsrange, _rvctx, invert=True) for _rvctx in rvctx]) # (R, V)
+      mask[:,0] = True # Padding is not updated
+      vs *= mask[..., None] # (B, R, V, V)
+      vs = F.scatter_add(vs, (batchrange[:, None, None, None], nrules_range[None, :, None, None], rvctx), weighted_bunis) # (B, R, V, V)
     # ---------------------------
     # Compute overall rule scores
     qscores = F.sigmoid(F.squeeze(qscores, -1)) # (B, R)
