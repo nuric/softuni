@@ -11,6 +11,8 @@ import chainer.functions as F
 import chainer.training as T
 # import matplotlib
 # matplotlib.use('pdf')
+# from sklearn.decomposition import PCA
+# import matplotlib.pyplot as plt
 
 
 # Disable scientific printing
@@ -268,7 +270,7 @@ class Unify(C.Chain):
   def __init__(self):
     super().__init__()
     with self.init_scope():
-      # self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
+      self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
       self.match_linear = L.Linear(6*EMBED, 3*EMBED)
       self.match_score = L.Linear(3*EMBED, 1)
     self.eye = self.xp.eye(len(word2idx), dtype=self.xp.float32) # (V, V)
@@ -292,10 +294,8 @@ class Unify(C.Chain):
     # ---------------------------
     # Calculate a match for every word in s1 to every word in s2
     # Compute contextual representations
-    # contextual_toprove = contextual_convolve(self.xp, self.convolve_words, toprove, embedded_toprove) # (B, R, Ps, P, E)
-    # contextual_candidates = contextual_convolve(self.xp, self.convolve_words, candidates, embedded_candidates) # (B, Cs, C, E)
-    contextual_toprove = groundtoprove # (R, Ps, P, E)
-    contextual_candidates = embedded_candidates # (B, Cs, C, E)
+    contextual_toprove = contextual_convolve(self.xp, self.convolve_words, toprove, groundtoprove) # (R, Ps, P, E)
+    contextual_candidates = contextual_convolve(self.xp, self.convolve_words, candidates, embedded_candidates) # (B, Cs, C, E)
     # Compute similarity between every provable symbol and candidate symbol
     # (R, Ps, P, E) x (B, Cs, C, E)
     raw_sims = F.einsum("jklm,inom->ijklno", contextual_toprove, contextual_candidates) # (B, R, Ps, P, Cs, C)
@@ -569,5 +569,15 @@ if ARGS.debug:
       print(decode_story(val_story))
       print(f"Expected {expected} '{idx2word[expected]}' got {prediction} '{idx2word[prediction]}'.")
       break
+  # Plot Embeddings
+  # pca = PCA(2)
+  # print(model.embed.W.array)
+  # embds = pca.fit_transform(model.embed.W.array)
+  # print("PCA VAR:", pca.explained_variance_ratio_)
+  # plt.scatter(embds[:, 0], embds[:, 1])
+  # for i in range(len(idx2word)):
+    # plt.annotate(idx2word[i], xy=(embds[i,0], embds[i,1]), xytext=(10, 10), textcoords='offset points', arrowprops={'arrowstyle': '-'})
+  # plt.show()
+  # Dig in
   import ipdb; ipdb.set_trace()
   answer = model(converter([val_story], None)[0])
