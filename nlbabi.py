@@ -24,15 +24,15 @@ parser.add_argument("-d", "--debug", action="store_true", help="Enable debug out
 ARGS = parser.parse_args()
 
 # Debug
-if ARGS.debug:
-  logging.basicConfig(level=logging.DEBUG)
-  C.set_debug(True)
+# if ARGS.debug:
+  # logging.basicConfig(level=logging.DEBUG)
+  # C.set_debug(True)
 
 EMBED = 16
 MAX_HIST = 25
 REPO_SIZE = 1
 ITERATIONS = 3
-MINUS_INF = -1000
+MINUS_INF = -100
 
 # ---------------------------
 
@@ -342,7 +342,6 @@ class Infer(C.Chain):
       self.embed = L.EmbedID(len(word2idx), EMBED, ignore_label=0)
       self.temporal_enc = C.Parameter(C.initializers.Normal(1.0), (MAX_HIST, EMBED), name="tempenc")
       self.rulegen = RuleGen()
-      self.var_linear = L.Linear(EMBED, EMBED)
       self.unify = Unify()
       self.unkbias = C.Parameter(4.0, shape=(1,), name="unkbias")
       self.eye = self.xp.eye(len(word2idx), dtype=self.xp.float32) # (V, V)
@@ -389,7 +388,6 @@ class Infer(C.Chain):
       qvvalues = vs[:, nrules_range[:, None], rvq, :] # (B, R, Q, V)
       qvvalues = F.softmax(qvvalues, -1) # (B, R, Q, V)
       qvvalues = qvvalues @ self.embed.W # (B, R, Q, E)
-      qvvalues = self.var_linear(qvvalues, n_batch_axes=3) # (B, R, Q, E)
       qtoprove = qvgates[..., None]*qvvalues + (1-qvgates[..., None])*erq # (B, R, Q, E)
       qtoprove *= rmq[..., None] # (B, R, Q, E)
       qscores, qunis = self.unify(rvq[:, None, :], qtoprove[:, :, None, ...],
@@ -406,7 +404,6 @@ class Infer(C.Chain):
       bodyvvalues = vs[:, nrules_range[:, None, None], rvctx, :] # (B, R, Ls, L, V)
       bodyvvalues = F.softmax(bodyvvalues, -1) # (B, R, Ls, L, V)
       bodyvvalues = bodyvvalues @ self.embed.W # (B, R, Ls, L, E)
-      bodyvvalues = self.var_linear(bodyvvalues, n_batch_axes=4) # (B, R, Ls, L, E)
       bodytoprove = ctxvgates[..., None]*bodyvvalues + (1-ctxvgates[..., None])*erctx # (B, R, Ls, L, E)
       bodytoprove *= rmctx[..., None] # (B, R, Ls, L, E)
       bscores, bunis = self.unify(rvctx, bodytoprove, vctx, ectx, self.temporal_enc) # (B, R, Ls), (B, R, Ls, L, V)
@@ -471,14 +468,14 @@ class Infer(C.Chain):
     # (B, R) x (B, R, A, V)
     final_answers = F.einsum("ij,ijkl->ikl", rule_atts, answers) # (B, A, V)
     # **Assuming one answer for now***
-    return final_answers[:, 0, :]
+    return final_answers[:, 0, :], F.sum(vmap)*0.01
 
 # ---------------------------
 
 # Stories to generate rules from
 answers = set()
 rule_repo = list()
-np.random.shuffle(enc_stories)
+# np.random.shuffle(enc_stories)
 for es in enc_stories:
   if es['answers'][0] not in answers:
     rule_repo.append(es)
@@ -491,7 +488,17 @@ print("RULE REPO:", rule_repo)
 
 # Setup model
 model = Infer(rule_repo)
-cmodel = L.Classifier(model, lossfun=F.softmax_cross_entropy, accfun=F.accuracy)
+def lossfun(outputs, targets):
+  """Loss function for target classification."""
+  # output.shape == (B, V)
+  # targets.shape == (B,)
+  predictions, auxloss = outputs # (B, V), ()
+  classloss = F.softmax_cross_entropy(predictions, targets)
+  return classloss + auxloss
+def accfun(outputs, targets):
+  """Compute classification accuracy."""
+  return F.accuracy(outputs[0], targets)
+cmodel = L.Classifier(model, lossfun=lossfun, accfun=accfun)
 
 optimiser = C.optimizers.Adam().setup(cmodel)
 optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
@@ -509,8 +516,9 @@ trainer = T.Trainer(updater, (50, 'epoch'))
 val_iter = C.iterators.SerialIterator(val_enc_stories, 32, repeat=False, shuffle=False)
 trainer.extend(T.extensions.Evaluator(val_iter, cmodel, converter=converter, device=-1))
 # trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_best.npz'), trigger=T.triggers.MinValueTrigger('validation/main/loss'))
-trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_latest.npz'), trigger=(1, 'epoch'))
+# trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_latest.npz'), trigger=(1, 'epoch'))
 trainer.extend(T.extensions.LogReport(trigger=(1, 'iteration'), log_name=ARGS.name+'_log.json'))
+# trainer.extend(T.extensions.LogReport(trigger=(1, 'iteration'), log_name=ARGS.name+'_log.json'))
 trainer.extend(T.extensions.FailOnNonNumber())
 trainer.extend(T.extensions.PrintReport(['epoch', 'iteration', 'main/loss', 'validation/main/loss', 'main/accuracy', 'validation/main/accuracy', 'elapsed_time']))
 # trainer.extend(T.extensions.ProgressBar(update_interval=10))
