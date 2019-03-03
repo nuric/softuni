@@ -9,10 +9,10 @@ import chainer as C
 import chainer.links as L
 import chainer.functions as F
 import chainer.training as T
-# import matplotlib
+import matplotlib
 # matplotlib.use('pdf')
-# from sklearn.decomposition import PCA
-# import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
 
 
 # Disable scientific printing
@@ -270,7 +270,8 @@ class Unify(C.Chain):
   def __init__(self):
     super().__init__()
     with self.init_scope():
-      self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
+      # self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
+      self.words_linear = L.Linear(EMBED, EMBED)
       self.match_linear = L.Linear(6*EMBED, 3*EMBED)
       self.match_score = L.Linear(3*EMBED, 1)
     self.eye = self.xp.eye(len(word2idx), dtype=self.xp.float32) # (V, V)
@@ -294,8 +295,10 @@ class Unify(C.Chain):
     # ---------------------------
     # Calculate a match for every word in s1 to every word in s2
     # Compute contextual representations
-    contextual_toprove = contextual_convolve(self.xp, self.convolve_words, toprove, groundtoprove) # (R, Ps, P, E)
-    contextual_candidates = contextual_convolve(self.xp, self.convolve_words, candidates, embedded_candidates) # (B, Cs, C, E)
+    # contextual_toprove = contextual_convolve(self.xp, self.convolve_words, toprove, groundtoprove) # (R, Ps, P, E)
+    # contextual_candidates = contextual_convolve(self.xp, self.convolve_words, candidates, embedded_candidates) # (B, Cs, C, E)
+    contextual_toprove = self.words_linear(groundtoprove, n_batch_axes=3) # (R, Ps, P, E)
+    contextual_candidates = self.words_linear(embedded_candidates, n_batch_axes=3) # (B, Cs, C, E)
     # Compute similarity between every provable symbol and candidate symbol
     # (R, Ps, P, E) x (B, Cs, C, E)
     raw_sims = F.einsum("jklm,inom->ijklno", contextual_toprove, contextual_candidates) # (B, R, Ps, P, Cs, C)
