@@ -158,13 +158,15 @@ def bow_encode(exs):
 def pos_encode(vxs, exs):
   """Given sentences compute positional encoding."""
   # (..., S), (..., S, E)
-  mask = (vxs != 0.0) # (..., S)
-  slen = exs.shape[-2] # S
-  pos = np.fromfunction(lambda j, k: 1 - (j + 1) / slen - (k + 1) / EMBED * (1 - 2 * (j + 1) / slen),
-                        (slen, EMBED), dtype=np.float32) # (S, E)
-  enc = exs * pos # (..., S, E)
-  enc *= mask[..., None] # (..., S, E)
-  return F.sum(enc, -2) # (..., E)
+  n_words, n_units = exs.shape[-2:] # S, E
+  # To avoid 0/0, we use max(length, 1) here.
+  length = np.maximum(np.sum((vxs != 0).astype(np.float32), axis=-1), 1) # (...,)
+  length = length[..., None, None] # (..., 1, 1)
+  k = np.arange(1, n_units + 1, dtype=np.float32) / n_units # (E,)
+  i = np.arange(1, n_words + 1, dtype=np.float32)[:, None] # (S, 1)
+  coeff = (1 - i / length) - k * (1 - 2.0 * i / length) # (..., S, E)
+  enc = coeff * exs # (..., S, E)
+  return F.sum(enc, axis=-2) # (..., E)
 
 def contextual_convolve(backend, convolution, vxs, exs):
   """Given vectorised and encoded sentences convolve over last dimension."""
@@ -212,12 +214,9 @@ class RuleGen(C.Chain):
     enc_answer = pos_encode(va, ea) # (R, E)
     # ---------------------------
     # Whether a fact is in the body or not, negated or not, multi-label -> (clen, 2)
-    bodylen = enc_ctx.shape[1] # Ls
-    r_answer = F.repeat(enc_answer[:, None, :], bodylen, 1) # (R, Ls, E)
-    r_query = F.repeat(enc_query[:, None, :], bodylen, 1) # (R, Ls, E)
-    temps = temporal[:bodylen, :] # (Ls, E)
-    temps = F.repeat(temps[None, ...], enc_ctx.shape[0], 0) # (R, Ls, E)
-    r_ctx = F.concat([r_answer, r_query, enc_ctx, temps, temps+enc_ctx, temps*enc_ctx, r_answer*enc_ctx, r_query*enc_ctx], -1) # (R, Ls, 8*E)
+    temps = temporal[:enc_ctx.shape[1], :] # (Ls, E)
+    enc_ctx, enc_query, enc_answer, temps = F.broadcast(enc_ctx, enc_query[:, None, :], enc_answer[:, None, :], temps[None, ...]) # (R, Ls, E)
+    r_ctx = F.concat([enc_answer, enc_query, enc_ctx, temps, temps+enc_ctx, temps*enc_ctx, enc_answer*enc_ctx, enc_query*enc_ctx], -1) # (R, Ls, 8*E)
     inbody = self.body_linear(r_ctx, n_batch_axes=2) # (R, Ls, 4*E)
     inbody = F.tanh(inbody) # (R, Ls, 4*E)
     inbody = self.body_score(inbody, n_batch_axes=2) # (R, Ls, 2)
