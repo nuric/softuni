@@ -30,7 +30,7 @@ ARGS = parser.parse_args()
   # logging.basicConfig(level=logging.DEBUG)
   # C.set_debug(True)
 
-EMBED = 20
+EMBED = 16
 MAX_HIST = 25
 REPO_SIZE = 1
 ITERATIONS = 1
@@ -270,12 +270,12 @@ class Unify(C.Chain):
     super().__init__()
     with self.init_scope():
       # self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
-      self.words_linear = L.Linear(EMBED, EMBED)
-      self.match_linear = L.Linear(6*EMBED, 3*EMBED)
+      self.words_linear = L.Linear(EMBED, EMBED, initialW=C.initializers.Orthogonal())
+      self.match_linear = L.Linear(5*EMBED, 3*EMBED)
       self.match_score = L.Linear(3*EMBED, 1)
     self.eye = self.xp.eye(len(word2idx), dtype=self.xp.float32) # (V, V)
 
-  def forward(self, toprove, groundtoprove, vartoprove, candidates, embedded_candidates, temporal):
+  def forward(self, toprove, groundtoprove, vartoprove, candidates, embedded_candidates, temporal=None):
     """Given two sentences compute variable matches and score."""
     # toprove.shape = (R, Ps, P)
     # groundtoprove.shape = (R, Ps, P, E)
@@ -297,10 +297,13 @@ class Unify(C.Chain):
     # contextual_toprove = contextual_convolve(self.xp, self.convolve_words, toprove, groundtoprove) # (R, Ps, P, E)
     # contextual_candidates = contextual_convolve(self.xp, self.convolve_words, candidates, embedded_candidates) # (B, Cs, C, E)
     contextual_toprove = self.words_linear(groundtoprove, n_batch_axes=3) # (R, Ps, P, E)
+    contextual_toprove = F.normalize(contextual_toprove, axis=-1) # (R, Ps, P, E)
     contextual_candidates = self.words_linear(embedded_candidates, n_batch_axes=3) # (B, Cs, C, E)
+    contextual_candidates = F.normalize(contextual_candidates, axis=-1) # (B, Cs, C, E)
     # Compute similarity between every provable symbol and candidate symbol
     # (R, Ps, P, E) x (B, Cs, C, E)
     raw_sims = F.einsum("jklm,inom->ijklno", contextual_toprove, contextual_candidates) # (B, R, Ps, P, Cs, C)
+    raw_sims *= 10 # scale
     raw_sims += sim_mask # (B, R, Ps, P, Cs, C)
     # ---------------------------
     # Calculate score for each candidate
@@ -313,7 +316,7 @@ class Unify(C.Chain):
     tbows = temporal[:cbows.shape[-2], :] # (Cs, E)
     pbow, cbows, tbows = F.broadcast(pbow[..., None, :], cbows[:, None, None, ...], tbows[None, None, None, ...]) # (B, R, Ps, Cs, E)
     # Compute features
-    pcbows = F.concat([pbow, cbows, pbow*cbows, tbows, tbows+cbows, tbows*cbows], -1) # (B, R, Ps, Cs, 6*E)
+    pcbows = F.concat([pbow, cbows, pbow*cbows, tbows+cbows, tbows*cbows], -1) # (B, R, Ps, Cs, 5*E)
     raw_scores = self.match_linear(pcbows, n_batch_axes=4) # (B, R, Ps, Cs, 3*E)
     raw_scores = F.tanh(raw_scores) # (B, R, Ps, Cs, 3*E)
     raw_scores = self.match_score(raw_scores, n_batch_axes=4) # (B, R, Ps, Cs, 1)
@@ -324,10 +327,12 @@ class Unify(C.Chain):
     sim_weights = F.softmax(raw_sims, -1) # (B, R, Ps, P, Cs, C)
     # (B, R, Ps, P, Cs, C) x (B, Cs, C, E)
     unifications = F.einsum("ijklmn,imno->ijklmo", sim_weights, embedded_candidates) # (B, R, Ps, P, Cs, E)
+    if candidates.shape[1] == 1:
+      return 1.0, unifications[..., 0, :] # (B, R, Ps, P, E)
     # Weighted sum using scores
     weights = F.softmax(raw_scores, -1) # (B, R, Ps, Cs)
-    # (B, R, Ps, Cs) x (B, R, Ps, P, Cs, V)
-    final_unis = F.einsum("ijkc,ijklcv->ijklv", weights, unifications) # (B, R, Ps, P, V)
+    # (B, R, Ps, Cs) x (B, R, Ps, P, Cs, E)
+    final_unis = F.einsum("ijkc,ijklcv->ijklv", weights, unifications) # (B, R, Ps, P, E)
     # Final overall score
     final_scores = F.max(raw_scores, -1) # (B, R, Ps)
     final_scores *= np.any(toprove != 0.0, -1) # (B, R, Ps)
@@ -347,16 +352,20 @@ class Infer(C.Chain):
     self.rule_stories = rule_stories
     # Create model parameters
     with self.init_scope():
-      # self.embed = L.EmbedID(len(word2idx), EMBED, ignore_label=0)
+      self.embed = L.EmbedID(len(word2idx), EMBED, ignore_label=0)
       # self.embed = L.EmbedID(len(word2idx), EMBED, initialW=np.eye(len(word2idx)), ignore_label=0)
-      self.embed = Embed()
+      # self.embed = Embed()
       self.temporal_enc = C.Parameter(C.initializers.Normal(1.0), (MAX_HIST, EMBED), name="tempenc")
       # self.rulegen = RuleGen()
       self.unify = Unify()
       self.eye = self.xp.eye(len(word2idx), dtype=self.xp.float32) # (V, V)
+      self.body_linear = L.Linear(7*EMBED, 4*EMBED)
+      self.body_score = L.Linear(4*EMBED, 1)
+      self.rule_state_gate = L.Linear(EMBED, 1)
+      self.body_update = L.Linear(EMBED, EMBED)
       self.rule_linear = L.Linear(8*EMBED, 4*EMBED)
       self.rule_score = L.Linear(4*EMBED, 1)
-      self.answer_linear = L.Linear(EMBED, len(word2idx))
+      self.answer_linear = L.Linear(EMBED, len(word2idx), initialW=self.embed.W.array)
     # Setup rule repo
     self.vrules = vectorise_stories(rule_stories) # (R, Ls, L), (R, Q), (R, A)
     self.mrules = tuple([v != 0 for v in self.vrules]) # (R, Ls, L), (R, Q), (R, A)
@@ -385,23 +394,25 @@ class Infer(C.Chain):
     # Prepare rules and variable states
     rvctx, rvq, rva = self.vrules # (R, Ls, L), (R, Q), (R, A)
     rmctx, rmq, rma = self.mrules # (R, Ls, L), (R, Q), (R, A)
+    bodyzeromask = np.all(rvctx == 0, -1) # (R, Ls)
     erctx, erq, era = [self.embed(v) for v in self.vrules] # (R, Ls, L, E), (R, Q, E), (R, A, E)
     erctx, erq, era = erctx*rmctx[..., None], erq*rmq[..., None], era*rma[..., None] # (R, Ls, L, E), (R, Q, E), (R, A, E)
-    # inbody, vmap = self.rulegen(self.vrules, [erctx, erq, era], self.temporal_enc) # (R, Ls, 2), (R, V)
-    # inbody = np.zeros((1,9,2), dtype=np.float32)
-    # inbody[0,0,0] = 1
-    # inbody[0,2,0] = 1
-    # inbody[0,3,0] = 1
+    # _, vmap = self.rulegen(self.vrules, [erctx, erq, era], self.temporal_enc) # (R, Ls, 2), (R, V)
     # vmap = np.array([[0,1,0,0,1,0,1,1,0,0,0,0,0,0,0,0,0,0,]], dtype=np.float32)
-    inbody = np.array([[[0,0],[1,0]]], dtype=np.float32)
     vmap = np.array([[0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0]], dtype=np.float32)
     nrules_range = np.arange(len(self.rule_stories)) # (R,)
     ctxvgates = vmap[nrules_range[:, None, None], rvctx] # (R, Ls, L)
     qvgates, avgates = [vmap[nrules_range[:, None], v] for v in (rvq, rva)] # (R, Q), (R, A)
     vs_init = F.tile(self.embed.W[0], (vq.shape[0], len(self.rule_stories), len(word2idx), 1)) # (B, R, V, E)
+    # vs_init = self.xp.zeros((vq.shape[0], len(self.rule_stories), len(word2idx), EMBED), dtype=self.xp.float32) # (B, R, V, E)
     vs = vs_init # (B, R, V, E)
+    enc_erq = pos_encode(rvq, erq) # (R, E)
+    rs = enc_erq # (R, E)
+    enc_erctx = pos_encode(rvctx, erctx) # (R, Ls, E)
+    ctx_rstates = self.body_update(enc_erctx, n_batch_axes=2) # (R, Ls, E)
     wordsrange = np.arange(len(word2idx)) # (V,)
     batchrange = np.arange(vctx.shape[0]) # (B,)
+    bodyrange = np.arange(rvctx.shape[1]) # (Ls,)
     # ---------------------------
     # Compute iterative updates on variables
     for _ in range(ITERATIONS):
@@ -425,40 +436,52 @@ class Infer(C.Chain):
       bodytoprove *= rmctx[..., None] # (B, R, Ls, L, E)
       bscores, bunis = self.unify(rvctx, erctx, bodytoprove, vctx, ectx, self.temporal_enc) # (B, R, Ls), (B, R, Ls, L, E)
       # ---------------------------
-      # Weighted update of variable states after body unification
-      body_weights = inbody[..., 0] * bscores # (B, R, Ls)
-      weighted_bunis = body_weights[..., None, None] * bunis # (B, R, Ls, L, E)
-      normalisations = self.eye[rvctx] # (R, Ls, L, V)
-      normalisations = F.einsum("ijk,jklm->ijm", body_weights, normalisations) # (B, R, V)
-      normalisations = normalisations[batchrange[:, None, None, None], nrules_range[None, :, None, None], rvctx[None, ...]] # (B, R, Ls, L)
-      import ipdb; ipdb.set_trace()
-      print("HERE")
-      weighted_bunis /= normalisations[..., None] # (B, R, Ls, L, E)
-      # np.isin flattens second argument, so we need for loop
-      mask = np.vstack([np.isin(wordsrange, _rvctx, invert=True) for _rvctx in rvctx]) # (R, V)
-      mask[:,0] = True # Padding is not updated
-      vs *= mask[..., None] # (B, R, V, E)
-      vs = F.scatter_add(vs, (batchrange[:, None, None, None], nrules_range[None, :, None, None], rvctx), weighted_bunis) # (B, R, V, E)
+      # Compute which body literal to prove using rule state
+      temps = self.temporal_enc[:rvctx.shape[1], :] # (Ls, E)
+      r_rs, r_encq, r_encs, temps = F.broadcast(rs[:, None, :], enc_erq[:, None, :], enc_erctx, temps[None, ...]) # (R, Ls, E)
+      body_att = F.concat([r_rs, r_encq, r_encs, r_rs*r_encs, r_encq*r_encs, temps*r_encs, temps+r_encs], -1) # (R, Ls, 7*E)
+      body_att = self.body_linear(body_att, n_batch_axes=2) # (R, Ls, 4*E)
+      body_att = F.tanh(body_att) # (R, Ls, 4*E)
+      body_att = self.body_score(body_att, n_batch_axes= 2) # (R, Ls, 1)
+      body_att = F.squeeze(body_att, -1) # (R, Ls)
+      body_att += bodyzeromask * MINUS_INF # (R, Ls) can't attend to literals not in body
+      body_att = F.softmax(body_att, -1) # (R, Ls)
+      # Update state with gating
+      rgates = self.rule_state_gate(rs) # (R, 1)
+      rgates = F.sigmoid(rgates) # (R, 1)
+      # (R, Ls) x (R, Ls, E)
+      new_rstates = F.einsum("ij,ijk->ik", body_att, ctx_rstates) # (R, E)
+      rs = rgates*new_rstates + (1-rgates)*rs
+      # ---------------------------
+      # Weighted update of variable states after body unification based on attention
+      new_vs = F.repeat(vs[:, :, None, :, :], rvctx.shape[1], 2) # (B, R, Ls, V, E)
+      mask = np.array([[np.isin(wordsrange, l, invert=True) for l in ls] for ls in rvctx]) # (R, Ls, V)
+      new_vs *= mask[..., None] # (B, R, Ls, V, E)
+      new_vs = F.scatter_add(new_vs, (batchrange[:, None, None, None], nrules_range[None, :, None, None], bodyrange[None, None, :, None], rvctx), bunis) # (B, R, Ls, V, E)
+      # (R, Ls) x (B, R, Ls, V, E)
+      new_vs = F.einsum("jk,ijklm->ijlm", body_att, new_vs) # (B, R, V, E)
+      vs = rgates[..., None, None]*new_vs + (1-rgates[..., None, None])*vs
     # ---------------------------
     # Compute overall rule scores
-    qscores = F.sigmoid(F.squeeze(qscores, -1)) # (B, R)
-    bscores = F.sigmoid(bscores) # (B, R, Ls)
+    # qscores = F.sigmoid(F.squeeze(qscores, -1)) # (B, R)
+    # bscores = F.sigmoid(bscores) # (B, R, Ls)
     # Computed negated scores: n(1-b) + (1-n)b
-    isneg = inbody[..., 1] # (R, Ls)
-    nbscores = isneg*(1-bscores) + (1-isneg)*bscores # (B, R, Ls)
+    # isneg = inbody[..., 1] # (R, Ls)
+    # nbscores = isneg*(1-bscores) + (1-isneg)*bscores # (B, R, Ls)
     # Compute final scores for body premises: in*nb+(1-in)*1
-    isin = inbody[..., 0] # (R, Ls)
-    fbscores = isin*nbscores + (1-isin) # (B, R, Ls)
+    # isin = inbody[..., 0] # (R, Ls)
+    # fbscores = isin*nbscores + (1-isin) # (B, R, Ls)
     # Final score for rule following AND semantics
-    fbscores = F.cumprod(fbscores, -1)[..., -1] # (B, R)
-    rscores = qscores * fbscores # (B, R)
+    # fbscores = F.cumprod(fbscores, -1)[..., -1] # (B, R)
+    # rscores = qscores * fbscores # (B, R)
     # ---------------------------
     # Compute answers based on variable and rule scores
     agrounds = era # (R, A, E)
     avvalues = vs[:, nrules_range[:, None], rva, :] # (B, R, A, E)
     predictions = avgates[None, ..., None]*avvalues + (1-avgates[..., None])*agrounds # (B, R, A, E)
-    noans = F.tile(self.embed.W[0], predictions.shape[:-1] + (1,)) # (B, R, A, E)
-    answers = rscores[..., None, None]*predictions + (1-rscores[..., None, None])*noans # (B, R, A, E)
+    # noans = F.tile(self.embed.W[0], predictions.shape[:-1] + (1,)) # (B, R, A, E)
+    # answers = rscores[..., None, None]*predictions + (1-rscores[..., None, None])*noans # (B, R, A, E)
+    answers = predictions # (B, R, A, E)
     answers = self.answer_linear(answers, n_batch_axes=3) # (B, R, A, V)
     # ---------------------------
     # Compute rule attentions
@@ -522,7 +545,7 @@ def accfun(outputs, targets):
 cmodel = L.Classifier(model, lossfun=lossfun, accfun=accfun)
 
 optimiser = C.optimizers.Adam().setup(cmodel)
-optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
+# optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
 
 train_iter = C.iterators.SerialIterator(enc_stories, 32)
 def converter(batch_stories, _):
@@ -582,14 +605,14 @@ if ARGS.debug:
       print(f"Expected {expected} '{idx2word[expected]}' got {prediction} '{idx2word[prediction]}'.")
       break
   # Plot Embeddings
-  pca = PCA(2)
-  print(model.unify.words_linear.W.array)
-  embds = pca.fit_transform(model.unify.words_linear.W.array)
-  print("PCA VAR:", pca.explained_variance_ratio_)
-  plt.scatter(embds[:, 0], embds[:, 1])
-  for i in range(len(idx2word)):
-    plt.annotate(idx2word[i], xy=(embds[i,0], embds[i,1]), xytext=(10, 10), textcoords='offset points', arrowprops={'arrowstyle': '-'})
-  plt.show()
+  # pca = PCA(2)
+  # print(model.unify.words_linear.W.array.T)
+  # embds = pca.fit_transform(model.unify.words_linear.W.array.T)
+  # print("PCA VAR:", pca.explained_variance_ratio_)
+  # plt.scatter(embds[:, 0], embds[:, 1])
+  # for i in range(len(idx2word)):
+    # plt.annotate(idx2word[i], xy=(embds[i,0], embds[i,1]), xytext=(10, 10), textcoords='offset points', arrowprops={'arrowstyle': '-'})
+  # plt.show()
   # Dig in
   import ipdb; ipdb.set_trace()
   answer = model(converter([val_story], None)[0])
