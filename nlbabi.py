@@ -107,7 +107,7 @@ def decode_story(story):
   ds['answers'] = [idx2word[widx] for widx in story['answers']]
   return ds
 
-def vectorise_stories(encoded_stories):
+def vectorise_stories(encoded_stories, noise=False):
   """Given a list of encoded stories, vectorise them with padding."""
   # Find maximum length of batch to pad
   max_ctxlen, ctx_maxlen, q_maxlen, a_maxlen = 0, 0, 0, 0
@@ -117,15 +117,21 @@ def vectorise_stories(encoded_stories):
     ctx_maxlen = max(ctx_maxlen, c_maxlen)
     q_maxlen = max(q_maxlen, len(s['query']))
     a_maxlen = max(a_maxlen, len(s['answers']))
+  max_noise = 0
+  if noise:
+    max_noise = max_ctxlen // 10 # 10 percent noise
   # Vectorise stories
-  vctx = np.zeros((len(encoded_stories), max_ctxlen, ctx_maxlen), dtype=np.int32) # (B, Cs, C)
+  vctx = np.zeros((len(encoded_stories), max_ctxlen+max_noise, ctx_maxlen), dtype=np.int32) # (B, Cs, C)
   vq = np.zeros((len(encoded_stories), q_maxlen), dtype=np.int32) # (B, Q)
   vas = np.zeros((len(encoded_stories), a_maxlen), dtype=np.int32) # (B, A)
   for i, s in enumerate(encoded_stories):
+    offset = 0
     vq[i,:len(s['query'])] = s['query']
     vas[i,:len(s['answers'])] = s['answers']
     for j, c in enumerate(s['context']):
-      vctx[i,j,:len(c)] = c
+      if offset < max_noise and np.random.rand() < 0.1:
+        offset += 1
+      vctx[i,j+offset,:len(c)] = c
   return vctx, vq, vas
 
 # ---------------------------
@@ -550,7 +556,7 @@ optimiser = C.optimizers.Adam().setup(cmodel)
 train_iter = C.iterators.SerialIterator(enc_stories, 32)
 def converter(batch_stories, _):
   """Coverts given batch to expected format for Classifier."""
-  vctx, vq, vas = vectorise_stories(batch_stories) # (B, Cs, C), (B, Q), (B, A)
+  vctx, vq, vas = vectorise_stories(batch_stories, noise=True) # (B, Cs, C), (B, Q), (B, A)
   return (vctx, vq, vas), vas[:, 0] # (B,)
 updater = T.StandardUpdater(train_iter, optimiser, converter=converter, device=-1)
 # trainer = T.Trainer(updater, T.triggers.EarlyStoppingTrigger())
@@ -584,6 +590,7 @@ if os.path.isfile(trainer_statef):
   print("Loaded trainer state from:", trainer_statef)
 
 answer = model(converter([val_enc_stories[0]], None)[0])[0].array
+print("INIT ANSWER:", answer)
 # Hit the train button
 try:
   trainer.run()
@@ -591,9 +598,11 @@ except KeyboardInterrupt:
   pass
 
 # Print final rules
-print([decode_story(rs) for rs in model.rule_stories])
-print(model.vrules)
-print(model.gen_rules())
+answer = model(converter([val_enc_stories[0]], None)[0])[0].array
+print("POST ANSWER:", answer)
+print("RULE STORY:", [decode_story(rs) for rs in model.rule_stories])
+print("ENC RULE STORY:", model.vrules)
+print("RULE PARAMS:", model.gen_rules())
 # Extra inspection if we are debugging
 if ARGS.debug:
   for val_story in val_enc_stories:
