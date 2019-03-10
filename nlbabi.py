@@ -312,16 +312,34 @@ class MemAttention(C.Chain):
   def __init__(self):
     super().__init__()
     initW = C.initializers.Normal(0.1)
+    self.drop = 0.2
     with self.init_scope():
-      self.tempAC_encs = C.ChainList(*[L.EmbedID(MAX_HIST, EMBED, initialW=initW) for _ in range(ITERATIONS+1)])
-      self.memAC_embed = C.ChainList(*[L.EmbedID(len(word2idx), EMBED, initialW=initW, ignore_label=0) for _ in range(ITERATIONS+1)])
+      self.embed = L.EmbedID(len(word2idx), EMBED)
+      # self.word_mask = L.Linear(EMBED, 1)
+      self.q_linear = L.Linear(EMBED, EMBED)
+      self.att_linear = L.Linear(4*EMBED, EMBED)
+      self.temporal = L.EmbedID(MAX_HIST, EMBED)
+      self.att_score = L.Linear(EMBED, 1)
+      self.state_linear = L.Linear(3*EMBED, EMBED)
+
+  def seq_embed(self, vxs):
+    """Embed a given sequence."""
+    # vxs.shape == (..., S)
+    exs = self.embed(vxs) # (..., S, E)
+    # mask = self.word_mask(exs, n_batch_axes=len(vxs.shape)) # (..., S, 1)
+    # mask = F.sigmoid(mask) # (..., S, 1)
+    mask = (vxs != 0)[..., None] # (..., S, 1)
+    exs *= mask # (..., S, E)
+    return F.sum(exs, -2) # (..., E)
 
   def init_state(self, vxs):
     """Initialise given state."""
     # vxs.shape == (..., S)
-    exs = self.memAC_embed[0](vxs) # (..., S, E)
-    ns = seq_encode(vxs, exs) # (..., E)
-    return ns # (..., E)
+    s = self.seq_embed(vxs) # (..., E)
+    s = self.q_linear(s, n_batch_axes=len(vxs.shape)-1) # (..., E)
+    s = F.tanh(s) # (..., E)
+    # s = F.dropout(s, self.drop) # (..., E)
+    return s # (..., E)
 
   def forward(self, equery, vmemory, mask=None, iteration=0):
     """Compute an attention over memory given the query."""
@@ -329,13 +347,17 @@ class MemAttention(C.Chain):
     # vmemory.shape == (..., Ms, M)
     # mask.shape == (..., Ms)
     # Setup memory embedding
-    ememory = self.memAC_embed[iteration](vmemory) # (..., Ms, M, E)
-    ememory = seq_encode(vmemory, ememory) # (..., Ms, E)
+    ememory = self.seq_embed(vmemory) # (..., Ms, E)
+    eq, em = F.broadcast(equery[..., None, :], ememory) # (..., Ms, E)
+    merged = F.concat([eq, em, eq*em, F.squared_difference(eq, em)], -1) # (..., Ms, 4*E)
+    inter = self.att_linear(merged, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, E)
     tidxs = self.xp.arange(vmemory.shape[-2], dtype=self.xp.int32) # (Ms,)
-    temps = self.tempAC_encs[iteration](tidxs) # (Ms, E)
-    ememory += temps # (..., Ms, E)
-    # (..., E) x (..., Ms, E) -> (..., Ms)
-    att = F.einsum("...j,...ij->...i", equery, ememory) # (..., Ms)
+    temps = self.temporal(tidxs) # (Ms, E)
+    inter += temps # (..., Ms, E)
+    inter = F.tanh(inter) # (..., Ms, E)
+    # inter = F.dropout(inter, self.drop) # (..., Ms, E)
+    att = self.att_score(inter, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, 1)
+    att = F.squeeze(att, -1) # (..., Ms)
     if mask is not None:
       att += mask * MINUS_INF # (..., Ms)
     att = F.softmax(att, -1) # (..., Ms)
@@ -347,14 +369,14 @@ class MemAttention(C.Chain):
     # mem_att.shape == (..., Ms)
     # vmemory.shape == (..., Ms, M)
     # Setup memory output embedding
-    ememory = self.memAC_embed[iteration+1](vmemory) # (..., Ms, M, E)
-    ememory = seq_encode(vmemory, ememory) # (..., Ms, E)
-    tidxs = self.xp.arange(vmemory.shape[-2], dtype=self.xp.int32) # (Ms,)
-    temps = self.tempAC_encs[iteration+1](tidxs) # (Ms, E)
-    ememory += temps # (..., Ms, E)
+    ememory = self.seq_embed(vmemory) # (..., Ms, E)
+    os, em = F.broadcast(oldstate[..., None, :], ememory) # (..., Ms, E)
+    merged = F.concat([os, em, os+em], -1) # (..., Ms, 3*E)
+    new_states = self.state_linear(merged, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, E)
+    new_states = F.tanh(new_states) # (..., Ms, E)
     # (..., Ms) x (..., Ms, E) -> (..., E)
-    ns = F.einsum("...i,...ij->...j", mem_att, ememory) # (..., E)
-    new_state = oldstate + ns # (..., E)
+    new_state = F.einsum("...i,...ij->...j", mem_att, new_states) # (..., E)
+    # new_state = F.dropout(new_state, self.drop) # (..., E)
     return new_state
 
 # ---------------------------
@@ -379,7 +401,7 @@ class Infer(C.Chain):
       # self.rule_state_gate = L.Linear(EMBED, 1)
       self.rule_linear = L.Linear(8*EMBED, 4*EMBED)
       self.rule_score = L.Linear(4*EMBED, 1)
-      # self.answer_linear = L.Linear(EMBED, len(word2idx))
+      self.answer_linear = L.Linear(EMBED, len(word2idx))
     # Setup rule repo
     self.eye = self.xp.eye(len(word2idx), dtype=self.xp.float32) # (V, V)
     self.vrules = vectorise_stories(rule_stories) # (R, Ls, L), (R, Q), (R, A)
@@ -465,8 +487,7 @@ class Infer(C.Chain):
       cs = self.mematt.update_state(cs, cands_att, vctx, t) # (B, R, E)
     # ---------------------------
     # Compute answers based on variable and rule scores
-    # prediction = self.answer_linear(cs, n_batch_axes=1) # (B, R, V)
-    prediction = cs @ self.mematt.memAC_embed[-1].W.T # (B, V)
+    prediction = self.answer_linear(cs, n_batch_axes=1) # (B, R, V)
     # ---------------------------
     # Compute aux losses
     vmap_loss = F.sum(vmap) # ()
