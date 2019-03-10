@@ -4,6 +4,7 @@ import logging
 import os
 import signal
 import time
+from collections import OrderedDict
 import numpy as np
 import chainer as C
 import chainer.links as L
@@ -31,9 +32,9 @@ ARGS = parser.parse_args()
   # C.set_debug(True)
 
 EMBED = 16
-MAX_HIST = 25
+MAX_HIST = 200
 REPO_SIZE = 1
-ITERATIONS = 1
+ITERATIONS = 2
 MINUS_INF = -100
 
 # ---------------------------
@@ -42,26 +43,27 @@ def load_task(fname):
   """Load task stories from given file name."""
   ss = []
   with open(fname) as f:
-    prev_id = 1
-    context = list()
+    context = OrderedDict()
     for line in f:
       line = line.strip()
       sid, sl = line.split(' ', 1)
       # Is this a new story?
-      sid = int(sid)-1
-      if sid < prev_id:
-        context = list()
+      sid = int(sid)
+      if sid in context:
+        context = OrderedDict()
       # Check for question or not
       if '\t' in sl:
-        q, a, _ = sl.split('\t')
-        cctx = context.copy()
-        cctx.reverse()
+        q, a, supps= sl.split('\t')
+        idxs = list(context.keys())
+        supps = [idxs.index(int(s)) for s in supps.split(' ')]
+        assert len(supps) == ITERATIONS, "Not enough iterations for supporting facts."
+        cctx = list(context.values())
+        # cctx.reverse()
         ss.append({'context': cctx[:MAX_HIST], 'query': q,
-                        'answers': a.split(',')})
+                   'answers': a.split(','), 'supps': supps})
       else:
         # Just a statement
-        context.append(sl)
-      prev_id = sid
+        context[sid] = sl
   return ss
 stories = load_task(ARGS.task)
 val_stories = load_task(ARGS.task.replace('train', 'test'))
@@ -91,6 +93,7 @@ def encode_story(story):
   es['context'] = [np.array([word2idx.setdefault(w, len(word2idx)) for w in tokenise(s)], dtype=np.int32) for s in story['context']]
   es['query'] = np.array([word2idx.setdefault(w, len(word2idx)) for w in tokenise(story['query'])], dtype=np.int32)
   es['answers'] = np.array([word2idx.setdefault(w, len(word2idx)) for w in story['answers']], dtype=np.int32)
+  es['supps'] = np.array(story['supps'], dtype=np.int32)
   return es
 enc_stories = list(map(encode_story, stories))
 print("TRAIN VOCAB:", len(word2idx))
@@ -105,6 +108,7 @@ def decode_story(story):
   ds['context'] = [[idx2word[widx] for widx in c] for c in story['context']]
   ds['query'] = [idx2word[widx] for widx in story['query']]
   ds['answers'] = [idx2word[widx] for widx in story['answers']]
+  ds['supps'] = story['supps']
   return ds
 
 def vectorise_stories(encoded_stories, noise=False):
@@ -124,6 +128,7 @@ def vectorise_stories(encoded_stories, noise=False):
   vctx = np.zeros((len(encoded_stories), max_ctxlen+max_noise, ctx_maxlen), dtype=np.int32) # (B, Cs, C)
   vq = np.zeros((len(encoded_stories), q_maxlen), dtype=np.int32) # (B, Q)
   vas = np.zeros((len(encoded_stories), a_maxlen), dtype=np.int32) # (B, A)
+  supps = np.zeros((len(encoded_stories), ITERATIONS), dtype=np.int32) # (B, I)
   for i, s in enumerate(encoded_stories):
     offset = 0
     vq[i,:len(s['query'])] = s['query']
@@ -132,11 +137,12 @@ def vectorise_stories(encoded_stories, noise=False):
     # target = [c[0] for c in s['context'] if c[-1] == what and c[0] != who]
     vas[i,:len(s['answers'])] = s['answers']
     # vas[i,:len(s['answers'])] = what
+    supps[i] = s['supps']
     for j, c in enumerate(s['context']):
       if offset < max_noise and np.random.rand() < 0.1:
         offset += 1
       vctx[i,j+offset,:len(c)] = c
-  return vctx, vq, vas
+  return vctx, vq, vas, supps
 
 # ---------------------------
 
@@ -154,10 +160,10 @@ def story_embed(story, embed):
   encs = sequence_embed([story['answers'], story['query']] + story['context'], embed)
   return {'answers': encs[0], 'query': encs[1], 'context': encs[2:]}
 
-def bow_encode(exs):
+def bow_encode(_, exs):
   """Given sentences compute is bag-of-words representation."""
-  # [(s1len, E), (s2len, E), ...]
-  return [F.sum(e, axis=0) for e in exs]
+  # _, (..., S, E)
+  return F.sum(exs, -2) # (..., E)
 
 def pos_encode(vxs, exs):
   """Given sentences compute positional encoding."""
@@ -171,6 +177,11 @@ def pos_encode(vxs, exs):
   coeff = (1 - i / length) - k * (1 - 2.0 * i / length) # (..., S, E)
   enc = coeff * exs # (..., S, E)
   return F.sum(enc, axis=-2) # (..., E)
+
+def seq_encode(vxs, exs):
+  """Encode a sequence."""
+  # (..., S), (..., S, E)
+  return bow_encode(vxs, exs)
 
 def contextual_convolve(backend, convolution, vxs, exs):
   """Given vectorised and encoded sentences convolve over last dimension."""
@@ -210,7 +221,7 @@ class RuleGen(C.Chain):
     """Given a story generate a probabilistic learnable rule."""
     # vectorised_rules = [(R, Ls, L), (R, Q), (R, A)]
     # embedded_rules = [(R, Ls, L, E), (R, Q, E), (R, A, E)]
-    vctx, vq, va = vectorised_rules
+    vctx, vq, va, _ = vectorised_rules
     ectx, eq, ea = embedded_rules
     # ---------------------------
     # Whether each word in story is a variable, binary class -> {wordid:sigmoid}
@@ -300,42 +311,50 @@ class MemAttention(C.Chain):
   """Computes attention over memory components given query."""
   def __init__(self):
     super().__init__()
+    initW = C.initializers.Normal(0.1)
     with self.init_scope():
-      self.att_linear = L.Linear(6*EMBED, 3*EMBED)
-      self.att_score = L.Linear(3*EMBED, 1)
-      self.temporal_enc = C.Parameter(C.initializers.Normal(1.0), (MAX_HIST, EMBED), name="tempenc")
-      self.state_linear = L.Linear(3*EMBED, EMBED)
+      self.tempAC_encs = C.ChainList(*[L.EmbedID(MAX_HIST, EMBED, initialW=initW) for _ in range(ITERATIONS+1)])
+      self.memAC_embed = C.ChainList(*[L.EmbedID(len(word2idx), EMBED, initialW=initW, ignore_label=0) for _ in range(ITERATIONS+1)])
 
-  def forward(self, equery, ememory, mask=None):
+  def init_state(self, vxs):
+    """Initialise given state."""
+    # vxs.shape == (..., S)
+    exs = self.memAC_embed[0](vxs) # (..., S, E)
+    ns = seq_encode(vxs, exs) # (..., E)
+    return ns # (..., E)
+
+  def forward(self, equery, vmemory, mask=None, iteration=0):
     """Compute an attention over memory given the query."""
     # equery.shape == (..., E)
-    # ememory.shape == (..., Ms, E)
+    # vmemory.shape == (..., Ms, M)
     # mask.shape == (..., Ms)
-    # Setup mask
-    nbatch = len(ememory.shape) - 2 # ...+1
-    temps = self.temporal_enc[:ememory.shape[-2], :] # (Ms, E)
-    temps = F.reshape(temps, [1]*nbatch+list(temps.shape)) # (1*..., Ms, E)
-    evq, emem, temps = F.broadcast(equery[..., None, :], ememory, temps) # (..., Ms, E)
-    att = F.concat([evq, emem, temps, evq*emem, temps*emem, temps+emem], -1) # (..., Ms, 6*E)
-    att = self.att_linear(att, n_batch_axes=nbatch+1) # (..., Ms, 3*E)
-    att = F.tanh(att) # (..., Ms, 3*E)
-    att = self.att_score(att, n_batch_axes=nbatch+1) # (..., Ms, 1)
-    att = F.squeeze(att, -1) # (..., Ms)
+    # Setup memory embedding
+    ememory = self.memAC_embed[iteration](vmemory) # (..., Ms, M, E)
+    ememory = seq_encode(vmemory, ememory) # (..., Ms, E)
+    tidxs = self.xp.arange(vmemory.shape[-2], dtype=self.xp.int32) # (Ms,)
+    temps = self.tempAC_encs[iteration](tidxs) # (Ms, E)
+    ememory += temps # (..., Ms, E)
+    # (..., E) x (..., Ms, E) -> (..., Ms)
+    att = F.einsum("...j,...ij->...i", equery, ememory) # (..., Ms)
     if mask is not None:
       att += mask * MINUS_INF # (..., Ms)
     att = F.softmax(att, -1) # (..., Ms)
     return att
 
-  def update_state(self, oldstate, state_att, newstates):
+  def update_state(self, oldstate, mem_att, vmemory, iteration=0):
     """Update state given old, attention and new possible states."""
     # oldstate.shape == (..., E)
-    # state_att.shape == (..., Ms)
-    # newstates.shape == (..., Ms, E)
-    # (..., Ms) x (..., Ms, E)
-    ns = F.einsum("...i,...ij->...j", state_att, newstates) # (..., E)
-    concat = F.concat([oldstate, ns, oldstate*ns], -1) # (..., 3*E)
-    new_state = self.state_linear(concat, n_batch_axes=len(oldstate.shape)-1) # (..., E)
-    new_state = F.relu(new_state) # (..., E)
+    # mem_att.shape == (..., Ms)
+    # vmemory.shape == (..., Ms, M)
+    # Setup memory output embedding
+    ememory = self.memAC_embed[iteration+1](vmemory) # (..., Ms, M, E)
+    ememory = seq_encode(vmemory, ememory) # (..., Ms, E)
+    tidxs = self.xp.arange(vmemory.shape[-2], dtype=self.xp.int32) # (Ms,)
+    temps = self.tempAC_encs[iteration+1](tidxs) # (Ms, E)
+    ememory += temps # (..., Ms, E)
+    # (..., Ms) x (..., Ms, E) -> (..., E)
+    ns = F.einsum("...i,...ij->...j", mem_att, ememory) # (..., E)
+    new_state = oldstate + ns # (..., E)
     return new_state
 
 # ---------------------------
@@ -353,7 +372,6 @@ class Infer(C.Chain):
     # Create model parameters
     with self.init_scope():
       self.embed = L.EmbedID(len(word2idx), EMBED, ignore_label=0)
-      # self.embed = L.EmbedID(len(word2idx), EMBED, initialW=np.eye(len(word2idx)), ignore_label=0)
       # self.embed = Embed()
       self.rulegen = RuleGen()
       self.unify = Unify()
@@ -361,7 +379,7 @@ class Infer(C.Chain):
       # self.rule_state_gate = L.Linear(EMBED, 1)
       self.rule_linear = L.Linear(8*EMBED, 4*EMBED)
       self.rule_score = L.Linear(4*EMBED, 1)
-      self.answer_linear = L.Linear(EMBED, len(word2idx))
+      # self.answer_linear = L.Linear(EMBED, len(word2idx))
     # Setup rule repo
     self.eye = self.xp.eye(len(word2idx), dtype=self.xp.float32) # (V, V)
     self.vrules = vectorise_stories(rule_stories) # (R, Ls, L), (R, Q), (R, A)
@@ -370,7 +388,7 @@ class Infer(C.Chain):
 
   def gen_rules(self):
     """Generate the body and variable maps from rules in repository."""
-    erctx, erq, era = [self.embed(v) for v in self.vrules] # (R, Ls, L, E), (R, Q, E), (R, A, E)
+    erctx, erq, era = [self.embed(v) for v in self.vrules[:-1]] # (R, Ls, L, E), (R, Q, E), (R, A, E)
     vmap = self.rulegen(self.vrules, [erctx, erq, era]) # (R, V)
     # vmap = np.array([[0,1,0,0,1,0,1,1,0,0,0,0,0,0,0,0,0,0,]], dtype=np.float32)
     # vmap = np.array([[0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0]], dtype=np.float32)
@@ -380,39 +398,38 @@ class Infer(C.Chain):
     """Compute the forward inference pass for given stories."""
     self.atts = {k:list() for k in ('bodyatts', 'candsatt', 'rule_atts')}
     # ---------------------------
-    vctx, vq, va = stories # (B, Cs, C), (B, Q), (B, A)
+    vctx, vq, va, supps = stories # (B, Cs, C), (B, Q), (B, A), (B, I)
     # Embed stories
-    ectx = self.embed(vctx) # (B, Cs, C, E)
-    pos_ectx = pos_encode(vctx, ectx) # (B, Cs, E)
-    eq = self.embed(vq) # (B, Q, E)
+    # ectx = self.embed(vctx) # (B, Cs, C, E)
+    # eq = self.embed(vq) # (B, Q, E)
     # ---------------------------
     # Prepare rules and variable states
-    rvctx, rvq, rva = self.vrules # (R, Ls, L), (R, Q), (R, A)
-    rmctx, rmq, rma = self.mrules # (R, Ls, L), (R, Q), (R, A)
-    erctx, erq, era = [self.embed(v) for v in self.vrules] # (R, Ls, L, E), (R, Q, E), (R, A, E)
-    pos_erctx = pos_encode(rvctx, erctx) # (R, Ls, E)
+    rvctx, rvq, rva, rsupps = self.vrules # (R, Ls, L), (R, Q), (R, A)
+    # rmctx, rmq, rma = self.mrules # (R, Ls, L), (R, Q), (R, A)
+    erctx, erq, era = [self.embed(v) for v in self.vrules[:-1]] # (R, Ls, L, E), (R, Q, E), (R, A, E)
     # erctx, erq, era = erctx*rmctx[..., None], erq*rmq[..., None], era*rma[..., None] # (R, Ls, L, E), (R, Q, E), (R, A, E)
     vmap = self.rulegen(self.vrules, [erctx, erq, era]) # (R, V)
     # Setup variable maps and states
     # vmap = np.array([[0,1,0,0,1,0,1,1,0,0,0,0,0,0,0,0,0,0,]], dtype=np.float32)
     # vmap = np.array([[0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0]], dtype=np.float32)
-    nrules_range = np.arange(len(self.rule_stories)) # (R,)
-    ctxvgates = vmap[nrules_range[:, None, None], rvctx] # (R, Ls, L)
-    qvgates, avgates = [vmap[nrules_range[:, None], v] for v in (rvq, rva)] # (R, Q), (R, A)
+    # nrules_range = np.arange(len(self.rule_stories)) # (R,)
+    # ctxvgates = vmap[nrules_range[:, None, None], rvctx] # (R, Ls, L)
+    # qvgates, avgates = [vmap[nrules_range[:, None], v] for v in (rvq, rva)] # (R, Q), (R, A)
     # Rule states
-    rs = pos_encode(rvq, erq) # (R, E)
+    # rs = self.mematt.init_state(rvq) # (R, E)
     bodyattmask = np.all(rvctx == 0, -1) # (R, Ls)
     # Candidate states
     candattmask = np.all(vctx == 0, -1) # (B, Cs)
     # ---------------------------
     # Unify query first assuming given query is ground
-    qunis = self.unify(rvq[:, None, :], erq[:, None, ...], vq[:, None, ...], eq[:, None, ...]) # (B, R, 1, Q, 1, E)
-    qunis = F.squeeze(qunis, (2, 4)) # (B, R, Q, E)
+    # qunis = self.unify(rvq[:, None, :], erq[:, None, ...], vq[:, None, ...], eq[:, None, ...]) # (B, R, 1, Q, 1, E)
+    # qunis = F.squeeze(qunis, (2, 4)) # (B, R, Q, E)
     # ---------------------------
     # Get initial candidate state
-    qstate = qvgates[..., None]*qunis + (1-qvgates[..., None])*erq # (B, R, Q, E)
-    qstate *= rmq[..., None] # (B, R, Q, E)
-    cs = pos_encode(vq[:, None, :], qstate) # (B, R, E)
+    # qstate = qvgates[..., None]*qunis + (1-qvgates[..., None])*erq # (B, R, Q, E)
+    # qstate *= rmq[..., None] # (B, R, Q, E)
+    # cs = seq_encode(vq[:, None, :], qstate) # (B, R, E)
+    cs = self.mematt.init_state(vq) # (B, E)
     # Compute iterative updates on variables
     # dummy_att = np.zeros((3, 1, 9), dtype=np.float32)
     # dummy_att[0,0,0] = 1
@@ -421,50 +438,57 @@ class Infer(C.Chain):
     for t in range(ITERATIONS):
       # ---------------------------
       # Unify body with updated variable state
-      bunis = self.unify(rvctx, erctx, vctx, ectx) # (B, R, Ls, L, Cs, E)
+      # bunis = self.unify(rvctx, erctx, vctx, ectx) # (B, R, Ls, L, Cs, E)
       # ---------------------------
       # Compute which body literal to prove using rule state
-      body_att = self.mematt(rs, pos_erctx, bodyattmask) # (R, Ls)
+      # body_att = self.mematt(rs, rvctx, bodyattmask, t) # (R, Ls)
       # body_att = dummy_att[t] # (R, Ls)
-      self.atts['bodyatts'].append(body_att)
+      # self.atts['bodyatts'].append(body_att)
       # Compute candidate attentions
-      cands_att = self.mematt(cs, pos_ectx[:, None, ...], candattmask[:, None, ...]) # (B, R, Cs)
+      # cands_att = self.mematt(cs, pos_ectx[:, None, ...], candattmask[:, None, ...]) # (B, R, Cs)
+      cands_att = self.mematt(cs, vctx, candattmask, t) # (B, Cs)
       self.atts['candsatt'].append(cands_att)
       # ---------------------------
       # Update rule states
-      rs = self.mematt.update_state(rs, body_att, pos_erctx) # (R, E)
+      # rs = self.mematt.update_state(rs, body_att, rvctx, t) # (R, E)
       # ---------------------------
       # Compute attended unification over candidates
       # (B, R, Cs) x (R, Ls, L) x (R, Ls, L) x (B, R, Ls, L, Cs, E)
-      unis = F.einsum("ijm,jkl,jkl,ijklmo->ijklo", cands_att, rmctx.astype(np.float32), ctxvgates, bunis) # (B, R, Ls, L, E)
+      # unis = F.einsum("ijm,jkl,jkl,ijklmo->ijklo", cands_att, rmctx.astype(np.float32), ctxvgates, bunis) # (B, R, Ls, L, E)
       # ---------------------------
       # Update candidate states with new variable bindings
-      ground = (1-ctxvgates[..., None])*erctx # (R, Ls, L, E)
-      bstate = ground + unis # (B, R, Ls, L, E)
-      new_cs = pos_encode(rvctx, bstate) # (B, R, Ls, E)
-      att = F.repeat(body_att[None, ...], new_cs.shape[0], 0) # (B, R, Ls)
-      cs = self.mematt.update_state(cs, att, new_cs) # (B, R, E)
+      # ground = (1-ctxvgates[..., None])*erctx # (R, Ls, L, E)
+      # bstate = ground + unis # (B, R, Ls, L, E)
+      # new_cs = seq_encode(rvctx, bstate) # (B, R, Ls, E)
+      # att = F.repeat(body_att[None, ...], new_cs.shape[0], 0) # (B, R, Ls)
+      # cs = self.mematt.update_state(cs, att, new_cs) # (B, R, E)
+      cs = self.mematt.update_state(cs, cands_att, vctx, t) # (B, R, E)
     # ---------------------------
     # Compute answers based on variable and rule scores
-    prediction = self.answer_linear(cs, n_batch_axes=2) # (B, R, V)
+    # prediction = self.answer_linear(cs, n_batch_axes=1) # (B, R, V)
+    prediction = cs @ self.mematt.memAC_embed[-1].W.T # (B, V)
     # ---------------------------
     # Compute aux losses
     vmap_loss = F.sum(vmap) # ()
-    aux_rloss = self.answer_linear(rs) # (R, V)
-    aux_rloss = F.softmax_cross_entropy(aux_rloss, rva[:,0]) # ()
+    # aux_rloss = self.answer_linear(rs) # (R, V)
+    # aux_rloss = F.softmax_cross_entropy(aux_rloss, rva[:,0]) # ()
+    attloss = F.stack(self.atts['candsatt'], 1) # (B, I, Cs)
+    attloss = F.hstack([F.softmax_cross_entropy(attloss[:,i,:], supps[:,i]) for i in range(ITERATIONS)]) # (I,)
+    attloss = F.sum(attloss) # ()
     # ---------------------------
     # Compute rule attentions
     num_rules = rvq.shape[0] # R
     if num_rules == 1:
-      return prediction[:, 0, :], 0.01*(vmap_loss+aux_rloss) # (B, V), ()
+      # return prediction[:, 0, :], 0.01*(vmap_loss+aux_rloss) # (B, V), ()
+      return prediction, 0.01*vmap_loss+attloss # (B, V), ()
     # Rule features
-    rqfeats = pos_encode(rvq, erq) # (R, E)
-    rbfeats = pos_encode(rvctx, erctx) # (R, Ls, E)
+    rqfeats = seq_encode(rvq, erq) # (R, E)
+    rbfeats = seq_encode(rvctx, erctx) # (R, Ls, E)
     rbfeats = F.sum(rbfeats, -2) # (R, E)
     rfeats = F.concat([rqfeats, rbfeats], -1) # (R, 2*E)
     # Story features
-    qfeats = pos_encode(vq, eq) # (B, E)
-    bfeats = pos_encode(vctx, ectx) # (B, Cs, E)
+    qfeats = seq_encode(vq, eq) # (B, E)
+    bfeats = seq_encode(vctx, ectx) # (B, Cs, E)
     bfeats = F.sum(bfeats, -2) # (B, E)
     feats = F.concat([qfeats, bfeats], -1) # (B, 2*E)
     # Compute attention score
@@ -514,15 +538,16 @@ cmodel = L.Classifier(model, lossfun=lossfun, accfun=accfun)
 
 optimiser = C.optimizers.Adam().setup(cmodel)
 optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
+# optimiser.add_hook(C.optimizer_hooks.GradientClipping(40))
 
 train_iter = C.iterators.SerialIterator(enc_stories, 7)
 def converter(batch_stories, _):
   """Coverts given batch to expected format for Classifier."""
-  vctx, vq, vas = vectorise_stories(batch_stories, noise=False) # (B, Cs, C), (B, Q), (B, A)
-  return (vctx, vq, vas), vas[:, 0] # (B,)
+  vctx, vq, vas, supps = vectorise_stories(batch_stories, noise=False) # (B, Cs, C), (B, Q), (B, A)
+  return (vctx, vq, vas, supps), vas[:, 0] # (B,)
 updater = T.StandardUpdater(train_iter, optimiser, converter=converter, device=-1)
 # trainer = T.Trainer(updater, T.triggers.EarlyStoppingTrigger())
-trainer = T.Trainer(updater, (50, 'epoch'))
+trainer = T.Trainer(updater, (100, 'epoch'))
 
 # Trainer extensions
 val_iter = C.iterators.SerialIterator(val_enc_stories, 128, repeat=False, shuffle=False)
