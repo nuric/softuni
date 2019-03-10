@@ -34,7 +34,7 @@ ARGS = parser.parse_args()
 EMBED = 16
 MAX_HIST = 200
 REPO_SIZE = 1
-ITERATIONS = 2
+ITERATIONS = 3
 MINUS_INF = -100
 
 # ---------------------------
@@ -474,7 +474,7 @@ class Infer(C.Chain):
     # aux_rloss = F.softmax_cross_entropy(aux_rloss, rva[:,0]) # ()
     attloss = F.stack(self.atts['candsatt'], 1) # (B, I, Cs)
     attloss = F.hstack([F.softmax_cross_entropy(attloss[:,i,:], supps[:,i]) for i in range(ITERATIONS)]) # (I,)
-    attloss = F.sum(attloss) # ()
+    attloss = F.mean(attloss) # ()
     # ---------------------------
     # Compute rule attentions
     num_rules = rvq.shape[0] # R
@@ -540,7 +540,7 @@ optimiser = C.optimizers.Adam().setup(cmodel)
 optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
 # optimiser.add_hook(C.optimizer_hooks.GradientClipping(40))
 
-train_iter = C.iterators.SerialIterator(enc_stories, 7)
+train_iter = C.iterators.SerialIterator(enc_stories, 64)
 def converter(batch_stories, _):
   """Coverts given batch to expected format for Classifier."""
   vctx, vq, vas, supps = vectorise_stories(batch_stories, noise=False) # (B, Cs, C), (B, Q), (B, A)
