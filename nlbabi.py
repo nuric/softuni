@@ -34,7 +34,7 @@ ARGS = parser.parse_args()
 EMBED = 16
 MAX_HIST = 200
 REPO_SIZE = 1
-ITERATIONS = 3
+ITERATIONS = 2
 MINUS_INF = -100
 
 # ---------------------------
@@ -311,14 +311,14 @@ class MemAttention(C.Chain):
   """Computes attention over memory components given query."""
   def __init__(self):
     super().__init__()
-    initW = C.initializers.Normal(0.1)
-    self.drop = 0.2
+    self.drop = 0.1
     with self.init_scope():
       self.embed = L.EmbedID(len(word2idx), EMBED)
       # self.word_mask = L.Linear(EMBED, 1)
       self.q_linear = L.Linear(EMBED, EMBED)
-      self.att_linear = L.Linear(4*EMBED, EMBED)
+      self.mem_linear = L.Linear(EMBED, EMBED)
       self.temporal = L.EmbedID(MAX_HIST, EMBED)
+      self.att_linear = L.Linear(4*EMBED, EMBED)
       self.att_score = L.Linear(EMBED, 1)
       self.state_linear = L.Linear(3*EMBED, EMBED)
 
@@ -338,8 +338,20 @@ class MemAttention(C.Chain):
     s = self.seq_embed(vxs) # (..., E)
     s = self.q_linear(s, n_batch_axes=len(vxs.shape)-1) # (..., E)
     s = F.tanh(s) # (..., E)
-    # s = F.dropout(s, self.drop) # (..., E)
+    s = F.dropout(s, self.drop) # (..., E)
     return s # (..., E)
+
+  def self_att(self, ememory, mask=None):
+    """Compute self attention over embedded memory."""
+    # ememory.shape == (..., Ms, E)
+    # mask.shape == (..., Ms)
+    keys = self.mem_linear(ememory, n_batch_axes=len(ememory.shape)-1) # (..., Ms, E)
+    att = F.einsum("...ik,...jk->...ij", keys, ememory) # (..., Ms, Ms)
+    if mask is not None:
+      att += mask[..., None, :] * MINUS_INF # (..., Ms, Ms)
+    att = F.softmax(att, -1) # (..., Ms, Ms)
+    attended = F.einsum("...ij,...jk->...ik", att, ememory) # (..., Ms, E)
+    return attended
 
   def forward(self, equery, vmemory, mask=None, iteration=0):
     """Compute an attention over memory given the query."""
@@ -349,13 +361,14 @@ class MemAttention(C.Chain):
     # Setup memory embedding
     ememory = self.seq_embed(vmemory) # (..., Ms, E)
     eq, em = F.broadcast(equery[..., None, :], ememory) # (..., Ms, E)
+    # sem = self.self_att(ememory, mask) # (..., Ms, E)
     merged = F.concat([eq, em, eq*em, F.squared_difference(eq, em)], -1) # (..., Ms, 4*E)
     inter = self.att_linear(merged, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, E)
+    inter = F.tanh(inter) # (..., Ms, E)
     tidxs = self.xp.arange(vmemory.shape[-2], dtype=self.xp.int32) # (Ms,)
     temps = self.temporal(tidxs) # (Ms, E)
     inter += temps # (..., Ms, E)
-    inter = F.tanh(inter) # (..., Ms, E)
-    # inter = F.dropout(inter, self.drop) # (..., Ms, E)
+    inter = F.dropout(inter, self.drop) # (..., Ms, E)
     att = self.att_score(inter, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, 1)
     att = F.squeeze(att, -1) # (..., Ms)
     if mask is not None:
@@ -372,11 +385,14 @@ class MemAttention(C.Chain):
     ememory = self.seq_embed(vmemory) # (..., Ms, E)
     os, em = F.broadcast(oldstate[..., None, :], ememory) # (..., Ms, E)
     merged = F.concat([os, em, os+em], -1) # (..., Ms, 3*E)
+    # TODO(nuric): add temporal on state updating
+    tidxs = self.xp.arange(vmemory.shape[-2], dtype=self.xp.int32) # (Ms,)
+    temps = self.temporal(tidxs) # (Ms, E)
     new_states = self.state_linear(merged, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, E)
     new_states = F.tanh(new_states) # (..., Ms, E)
     # (..., Ms) x (..., Ms, E) -> (..., E)
     new_state = F.einsum("...i,...ij->...j", mem_att, new_states) # (..., E)
-    # new_state = F.dropout(new_state, self.drop) # (..., E)
+    new_state = F.dropout(new_state, self.drop) # (..., E)
     return new_state
 
 # ---------------------------
@@ -568,7 +584,7 @@ def converter(batch_stories, _):
   return (vctx, vq, vas, supps), vas[:, 0] # (B,)
 updater = T.StandardUpdater(train_iter, optimiser, converter=converter, device=-1)
 # trainer = T.Trainer(updater, T.triggers.EarlyStoppingTrigger())
-trainer = T.Trainer(updater, (100, 'epoch'))
+trainer = T.Trainer(updater, (200, 'epoch'))
 
 # Trainer extensions
 val_iter = C.iterators.SerialIterator(val_enc_stories, 128, repeat=False, shuffle=False)
