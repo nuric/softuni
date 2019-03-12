@@ -373,7 +373,7 @@ class MemAttention(C.Chain):
     att = F.squeeze(att, -1) # (..., Ms)
     if mask is not None:
       att += mask * MINUS_INF # (..., Ms)
-    att = F.softmax(att, -1) # (..., Ms)
+    # att = F.softmax(att, -1) # (..., Ms)
     return att
 
   def update_state(self, oldstate, mem_att, vmemory, iteration=0):
@@ -422,19 +422,15 @@ class Infer(C.Chain):
     self.eye = self.xp.eye(len(word2idx), dtype=self.xp.float32) # (V, V)
     self.vrules = vectorise_stories(rule_stories) # (R, Ls, L), (R, Q), (R, A)
     self.mrules = tuple([v != 0 for v in self.vrules]) # (R, Ls, L), (R, Q), (R, A)
-    self.atts = None
+    self.log = None
 
-  def gen_rules(self):
-    """Generate the body and variable maps from rules in repository."""
-    erctx, erq, era = [self.embed(v) for v in self.vrules[:-1]] # (R, Ls, L, E), (R, Q, E), (R, A, E)
-    vmap = self.rulegen(self.vrules, [erctx, erq, era]) # (R, V)
-    # vmap = np.array([[0,1,0,0,1,0,1,1,0,0,0,0,0,0,0,0,0,0,]], dtype=np.float32)
-    # vmap = np.array([[0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0]], dtype=np.float32)
-    return self.atts, vmap
+  def get_log(self):
+    """Return last mini-batch log."""
+    return self.log
 
   def forward(self, stories):
     """Compute the forward inference pass for given stories."""
-    self.atts = {k:list() for k in ('bodyatts', 'candsatt', 'rule_atts')}
+    self.log = {k:list() for k in ('vmap', 'bodyatts', 'candsatt', 'rule_atts')}
     # ---------------------------
     vctx, vq, va, supps = stories # (B, Cs, C), (B, Q), (B, A), (B, I)
     # Embed stories
@@ -447,6 +443,7 @@ class Infer(C.Chain):
     erctx, erq, era = [self.embed(v) for v in self.vrules[:-1]] # (R, Ls, L, E), (R, Q, E), (R, A, E)
     # erctx, erq, era = erctx*rmctx[..., None], erq*rmq[..., None], era*rma[..., None] # (R, Ls, L, E), (R, Q, E), (R, A, E)
     vmap = self.rulegen(self.vrules, [erctx, erq, era]) # (R, V)
+    self.log['vmap'] = vmap
     # Setup variable maps and states
     # vmap = np.array([[0,1,0,0,1,0,1,1,0,0,0,0,0,0,0,0,0,0,]], dtype=np.float32)
     # vmap = np.array([[0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0]], dtype=np.float32)
@@ -484,8 +481,9 @@ class Infer(C.Chain):
       # self.atts['bodyatts'].append(body_att)
       # Compute candidate attentions
       # cands_att = self.mematt(cs, pos_ectx[:, None, ...], candattmask[:, None, ...]) # (B, R, Cs)
-      cands_att = self.mematt(cs, vctx, candattmask, t) # (B, Cs)
-      self.atts['candsatt'].append(cands_att)
+      raw_cands_att = self.mematt(cs, vctx, candattmask, t) # (B, Cs)
+      self.log['candsatt'].append(raw_cands_att)
+      cands_att = F.softmax(raw_cands_att, -1) # (B, Cs)
       # ---------------------------
       # Update rule states
       # rs = self.mematt.update_state(rs, body_att, rvctx, t) # (R, E)
@@ -509,7 +507,7 @@ class Infer(C.Chain):
     vmap_loss = F.sum(vmap) # ()
     # aux_rloss = self.answer_linear(rs) # (R, V)
     # aux_rloss = F.softmax_cross_entropy(aux_rloss, rva[:,0]) # ()
-    attloss = F.stack(self.atts['candsatt'], 1) # (B, I, Cs)
+    attloss = F.stack(self.log['candsatt'], 1) # (B, I, Cs)
     attloss = F.hstack([F.softmax_cross_entropy(attloss[:,i,:], supps[:,i]) for i in range(ITERATIONS)]) # (I,)
     attloss = F.mean(attloss) # ()
     # ---------------------------
@@ -536,12 +534,30 @@ class Infer(C.Chain):
     rule_atts = self.rule_score(rule_atts, n_batch_axes=2) # (B, R, 1)
     rule_atts = F.squeeze(rule_atts, -1) # (B, R)
     rule_atts = F.softmax(rule_atts, -1) # (B, R)
-    self.atts['rule_atts'].append(rule_atts)
+    self.log['rule_atts'].append(rule_atts)
     # ---------------------------
     # Compute final rule attended answer
     # (B, R) x (B, R, V)
     final_prediction = F.einsum("ij,ijk->ik", rule_atts, prediction) # (B, V)
     return final_prediction, 0.01*(vmap_loss+aux_rloss) # (B, V), ()
+
+# ---------------------------
+
+# Wrapper chain for training and predicting
+class Classifier(C.Chain):
+  """Compute loss and accuracy of underlying model."""
+  def __init__(self, predictor):
+    super().__init__()
+    with self.init_scope():
+      self.predictor = predictor
+
+  def forward(self, xin, targets):
+    """Compute total loss to train."""
+    predictions, auxloss = self.predictor(xin) # (B, V), ()
+    mainloss = F.softmax_cross_entropy(predictions, targets) # ()
+    acc = F.accuracy(predictions, targets) # ()
+    C.reporter.report({'loss': mainloss, 'aux': auxloss, 'acc': acc}, self)
+    return mainloss + auxloss # ()
 
 # ---------------------------
 
@@ -561,17 +577,7 @@ print("RULE REPO:", rule_repo)
 
 # Setup model
 model = Infer(rule_repo)
-def lossfun(outputs, targets):
-  """Loss function for target classification."""
-  # output.shape == (B, V)
-  # targets.shape == (B,)
-  predictions, auxloss = outputs # (B, V), ()
-  classloss = F.softmax_cross_entropy(predictions, targets)
-  return classloss + auxloss
-def accfun(outputs, targets):
-  """Compute classification accuracy."""
-  return F.accuracy(outputs[0], targets)
-cmodel = L.Classifier(model, lossfun=lossfun, accfun=accfun)
+cmodel = Classifier(model)
 
 optimiser = C.optimizers.Adam().setup(cmodel)
 optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
@@ -594,7 +600,7 @@ trainer.extend(T.extensions.Evaluator(val_iter, cmodel, converter=converter, dev
 trainer.extend(T.extensions.LogReport(log_name=ARGS.name+'_log.json'))
 # trainer.extend(T.extensions.LogReport(trigger=(1, 'iteration'), log_name=ARGS.name+'_log.json'))
 trainer.extend(T.extensions.FailOnNonNumber())
-trainer.extend(T.extensions.PrintReport(['epoch', 'main/loss', 'validation/main/loss', 'main/accuracy', 'validation/main/accuracy', 'elapsed_time']))
+trainer.extend(T.extensions.PrintReport(['epoch', 'main/loss', 'validation/main/loss', 'main/aux', 'validation/main/aux', 'main/acc', 'validation/main/acc', 'elapsed_time']))
 # trainer.extend(T.extensions.ProgressBar(update_interval=10))
 # trainer.extend(T.extensions.PlotReport(['main/loss', 'validation/main/loss'], 'iteration', marker=None, file_name=ARGS.name+'_loss.pdf'))
 # trainer.extend(T.extensions.PlotReport(['main/accuracy', 'validation/main/accuracy'],'iteration', marker=None, file_name=ARGS.name+'_acc.pdf'))
@@ -626,17 +632,20 @@ answer = model(converter([val_enc_stories[0]], None)[0])[0].array
 print("POST ANSWER:", answer)
 print("RULE STORY:", [decode_story(rs) for rs in model.rule_stories])
 print("ENC RULE STORY:", model.vrules)
-print("RULE PARAMS:", model.gen_rules())
+print("RULE PARAMS:", model.get_log())
 # Extra inspection if we are debugging
 if ARGS.debug:
   for val_story in val_enc_stories:
-    answer = model(converter([val_story], None)[0])[0].array
-    prediction = np.argmax(answer)
+    answer, auxloss = model(converter([val_story], None)[0])
+    prediction = np.argmax(answer.array)
     expected = val_story['answers'][0]
     if prediction != expected:
       print(decode_story(val_story))
       print(f"Expected {expected} '{idx2word[expected]}' got {prediction} '{idx2word[prediction]}'.")
-      break
+      print(f"Aux loss: {auxloss}")
+      print(model.get_log())
+      import ipdb; ipdb.set_trace()
+      answer = model(converter([val_story], None)[0])
   # Plot Embeddings
   # pca = PCA(2)
   # print(model.unify.words_linear.W.array.T)
@@ -646,6 +655,3 @@ if ARGS.debug:
   # for i in range(len(idx2word)):
     # plt.annotate(idx2word[i], xy=(embds[i,0], embds[i,1]), xytext=(10, 10), textcoords='offset points', arrowprops={'arrowstyle': '-'})
   # plt.show()
-  # Dig in
-  import ipdb; ipdb.set_trace()
-  answer = model(converter([val_story], None)[0])
