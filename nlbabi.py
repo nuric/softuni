@@ -316,12 +316,9 @@ class MemAttention(C.Chain):
       self.embed = L.EmbedID(len(word2idx), EMBED)
       # self.word_mask = L.Linear(EMBED, 1)
       self.q_linear = L.Linear(EMBED, EMBED)
-      self.mem_linear = L.Linear(2*EMBED, EMBED)
-      self.temporal = L.EmbedID(MAX_HIST+1, EMBED)
-      self.catt_linear = L.Linear(4*EMBED, EMBED)
-      self.catt_score = L.Linear(EMBED, 1)
-      self.tatt_linear = L.Linear(3*EMBED, 1)
-      self.state_linear = L.Linear(3*EMBED, EMBED)
+      self.att_linear = L.Linear(4*EMBED, EMBED)
+      self.att_birnn = L.NStepBiGRU(1, EMBED, EMBED, self.drop)
+      self.att_score = L.Linear(2*EMBED, 1)
 
   def seq_embed(self, vxs):
     """Embed a given sequence."""
@@ -339,12 +336,8 @@ class MemAttention(C.Chain):
     # vq.shape == (..., S)
     # vctx.shape == (..., Cs, C)
     s = self.seq_embed(vq) # (..., E)
-    #s = self.q_linear(s, n_batch_axes=len(vq.shape)-1) # (..., E)
-    lengths = np.sum(np.any((vctx != 0), -1), -1) # (...,)
+    # s = self.q_linear(s, n_batch_axes=len(vq.shape)-1) # (..., E)
     # s = F.tanh(s) # (..., E)
-    st = self.temporal(lengths) # (..., E)
-    # s += st # (..., E)
-    s = F.concat([s, st], -1) # (..., 2*E)
     s = F.dropout(s, self.drop) # (..., 2*E)
     return s # (..., 2*E)
 
@@ -370,25 +363,20 @@ class MemAttention(C.Chain):
     # mask.shape == (..., Ms)
     # Setup memory embedding
     ememory = self.seq_embed(vmemory) # (..., Ms, E)
-    eq = F.repeat(equery[..., None, :], vmemory.shape[-2], -2) # (..., Ms, 2*E)
+    eq = F.repeat(equery[..., None, :], vmemory.shape[-2], -2) # (..., Ms, E)
     # sem = self.self_att(eq, em, mask) # (..., Ms, E)
     # Compute content based attention
-    # ceq = eq[..., :EMBED] # (..., Ms, E)
-    tidxs = self.xp.arange(vmemory.shape[-2], dtype=self.xp.int32) # (Ms,)
-    temps = self.temporal(tidxs) # (Ms, E)
-    temps = F.broadcast_to(temps, ememory.shape) # (..., Ms, E)
-    # em = ememory + temps
-    merged = F.concat([eq, ememory, temps], -1) # (..., Ms, 4*E)
-    inter = self.catt_linear(merged, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, E)
+    merged = F.concat([eq, ememory, eq*ememory, F.squared_difference(eq, ememory)], -1) # (..., Ms, 4*E)
+    inter = self.att_linear(merged, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, E)
     inter = F.tanh(inter) # (..., Ms, E)
     inter = F.dropout(inter, self.drop) # (..., Ms, E)
-    att = self.catt_score(inter, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, 1)
-    # catt = F.squeeze(catt, -1) # (..., Ms)
-    # Compute time based attention
-    # merged = F.concat([temps, eq], -1) # (..., Ms, 3*E)
-    # tatt = self.tatt_linear(merged, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, 1)
-    # Final attention
-    # att = catt + tatt # (..., Ms, 1)
+    # att = self.catt_score(inter, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, E)
+    # Split into sentences
+    lengths = np.sum(np.any((vmemory != 0), -1), -1) # (...,)
+    mems = [s[..., :l, :] for s, l in zip(F.separate(inter, 0), lengths)] # B x [(M1, E), (M2, E), ...]
+    _, bimems = self.att_birnn(None, mems) # B x [(M1, 2*E), (M2, 2*E), ...]
+    bimems = F.pad_sequence(bimems) # (..., Ms, 2*E)
+    att = self.att_score(bimems, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, 1)
     att = F.squeeze(att, -1) # (..., Ms)
     if mask is not None:
       att += mask * MINUS_INF # (..., Ms)
@@ -408,12 +396,10 @@ class MemAttention(C.Chain):
     #new_state = self.state_linear(merged, n_batch_axes=len(oldstate.shape)-1) # (..., E)
     # new_state = F.tanh(new_state) # (..., E)
     # Add time
-    tidxs = self.xp.arange(vmemory.shape[-2], dtype=self.xp.int32) # (Ms,)
-    temps = self.temporal(tidxs) # (Ms, E)
-    temp = F.einsum("...i,ij->...j", mem_att, temps) # (..., E)
-    new_state = F.concat([select_mem, temp], -1) # (..., 2*E)
+    # new_state = F.concat([select_mem, temp], -1) # (..., 2*E)
     # new_state = select_mem + temp
-    new_state = F.dropout(new_state, self.drop) # (..., 2*E)
+    # new_state = F.dropout(new_state, self.drop) # (..., 2*E)
+    new_state = select_mem
     return new_state
 
 # ---------------------------
@@ -643,14 +629,12 @@ if os.path.isfile(trainer_statef):
 # answer = model(converter([val_enc_stories[0]], None)[0])[0].array
 # print("INIT ANSWER:", answer)
 # Hit the train button
-print(model.mematt.catt_linear.W)
 try:
   trainer.run()
 except KeyboardInterrupt:
   pass
 
 # Print final rules
-print(model.mematt.catt_linear.W)
 answer = model(converter([val_enc_stories[0]], None)[0])[0].array
 print("POST ANSWER:", answer)
 print("RULE STORY:", [decode_story(rs) for rs in model.rule_stories])
