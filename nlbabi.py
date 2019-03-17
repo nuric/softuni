@@ -31,8 +31,8 @@ ARGS = parser.parse_args()
   # logging.basicConfig(level=logging.DEBUG)
   # C.set_debug(True)
 
-EMBED = 16
-MAX_HIST = 200
+EMBED = 32
+MAX_HIST = 120
 REPO_SIZE = 1
 ITERATIONS = 2
 MINUS_INF = -100
@@ -316,10 +316,11 @@ class MemAttention(C.Chain):
       self.embed = L.EmbedID(len(word2idx), EMBED)
       # self.word_mask = L.Linear(EMBED, 1)
       self.q_linear = L.Linear(EMBED, EMBED)
-      self.mem_linear = L.Linear(EMBED, EMBED)
-      self.temporal = L.EmbedID(MAX_HIST, EMBED)
-      self.att_linear = L.Linear(4*EMBED, EMBED)
-      self.att_score = L.Linear(EMBED, 1)
+      self.mem_linear = L.Linear(2*EMBED, EMBED)
+      self.temporal = L.EmbedID(MAX_HIST+1, EMBED)
+      self.catt_linear = L.Linear(4*EMBED, EMBED)
+      self.catt_score = L.Linear(EMBED, 1)
+      self.tatt_linear = L.Linear(3*EMBED, 1)
       self.state_linear = L.Linear(3*EMBED, EMBED)
 
   def seq_embed(self, vxs):
@@ -330,69 +331,89 @@ class MemAttention(C.Chain):
     # mask = F.sigmoid(mask) # (..., S, 1)
     mask = (vxs != 0)[..., None] # (..., S, 1)
     exs *= mask # (..., S, E)
-    return F.sum(exs, -2) # (..., E)
+    return pos_encode(vxs, exs) # (..., E)
+    # return F.sum(exs, -2) # (..., E)
 
-  def init_state(self, vxs):
+  def init_state(self, vq, vctx):
     """Initialise given state."""
-    # vxs.shape == (..., S)
-    s = self.seq_embed(vxs) # (..., E)
-    s = self.q_linear(s, n_batch_axes=len(vxs.shape)-1) # (..., E)
-    s = F.tanh(s) # (..., E)
-    s = F.dropout(s, self.drop) # (..., E)
-    return s # (..., E)
+    # vq.shape == (..., S)
+    # vctx.shape == (..., Cs, C)
+    s = self.seq_embed(vq) # (..., E)
+    #s = self.q_linear(s, n_batch_axes=len(vq.shape)-1) # (..., E)
+    lengths = np.sum(np.any((vctx != 0), -1), -1) # (...,)
+    # s = F.tanh(s) # (..., E)
+    st = self.temporal(lengths) # (..., E)
+    # s += st # (..., E)
+    s = F.concat([s, st], -1) # (..., 2*E)
+    s = F.dropout(s, self.drop) # (..., 2*E)
+    return s # (..., 2*E)
 
-  def self_att(self, ememory, mask=None):
+  def self_att(self, equery, ememory, mask=None):
     """Compute self attention over embedded memory."""
+    # equery.shape == (..., Ms, E)
     # ememory.shape == (..., Ms, E)
     # mask.shape == (..., Ms)
-    keys = self.mem_linear(ememory, n_batch_axes=len(ememory.shape)-1) # (..., Ms, E)
+    merged = F.concat([equery, ememory], -1) # (..., Ms, 2*E)
+    keys = self.mem_linear(merged, n_batch_axes=len(ememory.shape)-1) # (..., Ms, E)
     att = F.einsum("...ik,...jk->...ij", keys, ememory) # (..., Ms, Ms)
     if mask is not None:
       att += mask[..., None, :] * MINUS_INF # (..., Ms, Ms)
     att = F.softmax(att, -1) # (..., Ms, Ms)
     attended = F.einsum("...ij,...jk->...ik", att, ememory) # (..., Ms, E)
+    attended *= mask[..., None] # (..., Ms, E)
     return attended
 
   def forward(self, equery, vmemory, mask=None, iteration=0):
     """Compute an attention over memory given the query."""
-    # equery.shape == (..., E)
+    # equery.shape == (..., 2*E)
     # vmemory.shape == (..., Ms, M)
     # mask.shape == (..., Ms)
     # Setup memory embedding
     ememory = self.seq_embed(vmemory) # (..., Ms, E)
-    eq, em = F.broadcast(equery[..., None, :], ememory) # (..., Ms, E)
-    # sem = self.self_att(ememory, mask) # (..., Ms, E)
-    merged = F.concat([eq, em, eq*em, F.squared_difference(eq, em)], -1) # (..., Ms, 4*E)
-    inter = self.att_linear(merged, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, E)
-    inter = F.tanh(inter) # (..., Ms, E)
+    eq = F.repeat(equery[..., None, :], vmemory.shape[-2], -2) # (..., Ms, 2*E)
+    # sem = self.self_att(eq, em, mask) # (..., Ms, E)
+    # Compute content based attention
+    # ceq = eq[..., :EMBED] # (..., Ms, E)
     tidxs = self.xp.arange(vmemory.shape[-2], dtype=self.xp.int32) # (Ms,)
     temps = self.temporal(tidxs) # (Ms, E)
-    inter += temps # (..., Ms, E)
+    temps = F.broadcast_to(temps, ememory.shape) # (..., Ms, E)
+    # em = ememory + temps
+    merged = F.concat([eq, ememory, temps], -1) # (..., Ms, 4*E)
+    inter = self.catt_linear(merged, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, E)
+    inter = F.tanh(inter) # (..., Ms, E)
     inter = F.dropout(inter, self.drop) # (..., Ms, E)
-    att = self.att_score(inter, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, 1)
+    att = self.catt_score(inter, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, 1)
+    # catt = F.squeeze(catt, -1) # (..., Ms)
+    # Compute time based attention
+    # merged = F.concat([temps, eq], -1) # (..., Ms, 3*E)
+    # tatt = self.tatt_linear(merged, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, 1)
+    # Final attention
+    # att = catt + tatt # (..., Ms, 1)
     att = F.squeeze(att, -1) # (..., Ms)
     if mask is not None:
       att += mask * MINUS_INF # (..., Ms)
-    # att = F.softmax(att, -1) # (..., Ms)
     return att
 
   def update_state(self, oldstate, mem_att, vmemory, iteration=0):
     """Update state given old, attention and new possible states."""
-    # oldstate.shape == (..., E)
+    # oldstate.shape == (..., 2*E)
     # mem_att.shape == (..., Ms)
     # vmemory.shape == (..., Ms, M)
     # Setup memory output embedding
     ememory = self.seq_embed(vmemory) # (..., Ms, E)
-    os, em = F.broadcast(oldstate[..., None, :], ememory) # (..., Ms, E)
-    merged = F.concat([os, em, os+em], -1) # (..., Ms, 3*E)
-    # TODO(nuric): add temporal on state updating
+    # (..., Ms) x (..., Ms, E) -> (..., E)
+    select_mem = F.einsum("...i,...ij->...j", mem_att, ememory) # (..., E)
+    #oldcontent = oldstate[..., :EMBED] # (..., E)
+    #merged = F.concat([oldcontent, select_mem, oldcontent+select_mem], -1) # (..., 3*E)
+    #new_state = self.state_linear(merged, n_batch_axes=len(oldstate.shape)-1) # (..., E)
+    # new_state = F.tanh(new_state) # (..., E)
+    # Add time
     tidxs = self.xp.arange(vmemory.shape[-2], dtype=self.xp.int32) # (Ms,)
     temps = self.temporal(tidxs) # (Ms, E)
-    new_states = self.state_linear(merged, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, E)
-    new_states = F.tanh(new_states) # (..., Ms, E)
-    # (..., Ms) x (..., Ms, E) -> (..., E)
-    new_state = F.einsum("...i,...ij->...j", mem_att, new_states) # (..., E)
-    new_state = F.dropout(new_state, self.drop) # (..., E)
+    temp = F.einsum("...i,ij->...j", mem_att, temps) # (..., E)
+    new_state = F.concat([select_mem, temp], -1) # (..., 2*E)
+    # new_state = select_mem + temp
+    new_state = F.dropout(new_state, self.drop) # (..., 2*E)
     return new_state
 
 # ---------------------------
@@ -464,7 +485,7 @@ class Infer(C.Chain):
     # qstate = qvgates[..., None]*qunis + (1-qvgates[..., None])*erq # (B, R, Q, E)
     # qstate *= rmq[..., None] # (B, R, Q, E)
     # cs = seq_encode(vq[:, None, :], qstate) # (B, R, E)
-    cs = self.mematt.init_state(vq) # (B, E)
+    cs = self.mematt.init_state(vq, vctx) # (B, E)
     # Compute iterative updates on variables
     # dummy_att = np.zeros((3, 1, 9), dtype=np.float32)
     # dummy_att[0,0,0] = 1
@@ -501,7 +522,7 @@ class Infer(C.Chain):
       cs = self.mematt.update_state(cs, cands_att, vctx, t) # (B, R, E)
     # ---------------------------
     # Compute answers based on variable and rule scores
-    prediction = self.answer_linear(cs, n_batch_axes=1) # (B, R, V)
+    prediction = self.answer_linear(cs[:, :EMBED], n_batch_axes=1) # (B, R, V)
     # ---------------------------
     # Compute aux losses
     vmap_loss = F.sum(vmap) # ()
@@ -515,7 +536,7 @@ class Infer(C.Chain):
     num_rules = rvq.shape[0] # R
     if num_rules == 1:
       # return prediction[:, 0, :], 0.01*(vmap_loss+aux_rloss) # (B, V), ()
-      return prediction, 0.01*vmap_loss+attloss # (B, V), ()
+      return prediction, attloss#0.01*vmap_loss+attloss # (B, V), ()
     # Rule features
     rqfeats = seq_encode(rvq, erq) # (R, E)
     rbfeats = seq_encode(rvctx, erctx) # (R, Ls, E)
@@ -622,12 +643,14 @@ if os.path.isfile(trainer_statef):
 # answer = model(converter([val_enc_stories[0]], None)[0])[0].array
 # print("INIT ANSWER:", answer)
 # Hit the train button
+print(model.mematt.catt_linear.W)
 try:
   trainer.run()
 except KeyboardInterrupt:
   pass
 
 # Print final rules
+print(model.mematt.catt_linear.W)
 answer = model(converter([val_enc_stories[0]], None)[0])[0].array
 print("POST ANSWER:", answer)
 print("RULE STORY:", [decode_story(rs) for rs in model.rule_stories])
