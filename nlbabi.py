@@ -34,7 +34,7 @@ ARGS = parser.parse_args()
 EMBED = 32
 MAX_HIST = 120
 REPO_SIZE = 1
-ITERATIONS = 2
+ITERATIONS = 3
 MINUS_INF = -100
 
 # ---------------------------
@@ -56,7 +56,7 @@ def load_task(fname):
         q, a, supps= sl.split('\t')
         idxs = list(context.keys())
         supps = [idxs.index(int(s)) for s in supps.split(' ')]
-        assert len(supps) == ITERATIONS, "Not enough iterations for supporting facts."
+        # assert len(supps) == ITERATIONS, "Not enough iterations for supporting facts."
         cctx = list(context.values())
         # cctx.reverse()
         ss.append({'context': cctx[:MAX_HIST], 'query': q,
@@ -137,7 +137,7 @@ def vectorise_stories(encoded_stories, noise=False):
     # target = [c[0] for c in s['context'] if c[-1] == what and c[0] != who]
     vas[i,:len(s['answers'])] = s['answers']
     # vas[i,:len(s['answers'])] = what
-    supps[i] = s['supps']
+    supps[i] = np.pad(s['supps'], (0, ITERATIONS-s['supps'].size), 'edge')
     for j, c in enumerate(s['context']):
       if offset < max_noise and np.random.rand() < 0.1:
         offset += 1
@@ -403,6 +403,60 @@ class MemAttention(C.Chain):
     return new_state
 
 # ---------------------------
+
+# End-to-End Memory Network
+class MemN2N(C.Chain):
+  """Compute iterations over memory using end-to-end mem approach."""
+  def __init__(self):
+    super().__init__()
+    initW = C.initializers.Normal(0.1)
+    with self.init_scope():
+      self.embedAC = C.ChainList(*[L.EmbedID(len(word2idx), EMBED, initialW=initW) for _ in range(ITERATIONS+1)])
+      self.temporal = C.ChainList(*[L.EmbedID(MAX_HIST, EMBED, initialW=initW) for _ in range(ITERATIONS+1)])
+
+  def seq_embed(self, vxs, iteration=0):
+    """Embed a given sequence."""
+    # vxs.shape == (..., S)
+    exs = self.embedAC[iteration](vxs) # (..., S, E)
+    mask = (vxs != 0)[..., None] # (..., S, 1)
+    exs *= mask # (..., S, E)
+    return pos_encode(vxs, exs) # (..., E)
+
+  def init_state(self, vq, vctx):
+    """Initialise given state."""
+    # vq.shape == (..., S)
+    # vctx.shape == (..., Cs, C)
+    s = self.seq_embed(vq) # (..., E)
+    return s # (..., E)
+
+  def forward(self, equery, vmemory, mask=None, iteration=0):
+    """Compute an attention over memory given the query."""
+    # equery.shape == (..., E)
+    # vmemory.shape == (..., Ms, M)
+    # mask.shape == (..., Ms)
+    ememory = self.seq_embed(vmemory, iteration) # (..., Ms, E)
+    tidxs = self.xp.arange(vmemory.shape[-2], dtype=self.xp.int32) # (Ms,)
+    temps = self.temporal[iteration](tidxs) # (Ms, E)
+    em = ememory + temps # (..., Ms, E)
+    att = F.einsum("...j,...ij->...i", equery, em) # (..., Ms)
+    if mask is not None:
+      att += mask * MINUS_INF # (..., Ms)
+    return att
+
+  def update_state(self, oldstate, mem_att, vmemory, iteration=0):
+    """Update state given old, attention and new possible states."""
+    # oldstate.shape == (..., E)
+    # mem_att.shape == (..., Ms)
+    # vmemory.shape == (..., Ms, M)
+    # Setup memory output embedding
+    ememory = self.seq_embed(vmemory, iteration+1) # (..., Ms, E)
+    tidxs = self.xp.arange(vmemory.shape[-2], dtype=self.xp.int32) # (Ms,)
+    temps = self.temporal[iteration+1](tidxs) # (Ms, E)
+    em = ememory + temps # (..., Ms, E)
+    select_mem = F.einsum("...i,...ij->...j", mem_att, em) # (..., E)
+    return select_mem
+
+# ---------------------------
 class Embed:
   W = np.eye(len(word2idx), dtype=np.float32)
   def __call__(self, x):
@@ -420,11 +474,12 @@ class Infer(C.Chain):
       # self.embed = Embed()
       self.rulegen = RuleGen()
       self.unify = Unify()
-      self.mematt = MemAttention()
+      # self.mematt = MemAttention()
+      self.mematt = MemN2N()
       # self.rule_state_gate = L.Linear(EMBED, 1)
       self.rule_linear = L.Linear(8*EMBED, 4*EMBED)
       self.rule_score = L.Linear(4*EMBED, 1)
-      self.answer_linear = L.Linear(EMBED, len(word2idx))
+      # self.answer_linear = L.Linear(EMBED, len(word2idx))
     # Setup rule repo
     self.eye = self.xp.eye(len(word2idx), dtype=self.xp.float32) # (V, V)
     self.vrules = vectorise_stories(rule_stories) # (R, Ls, L), (R, Q), (R, A)
@@ -508,7 +563,8 @@ class Infer(C.Chain):
       cs = self.mematt.update_state(cs, cands_att, vctx, t) # (B, R, E)
     # ---------------------------
     # Compute answers based on variable and rule scores
-    prediction = self.answer_linear(cs, n_batch_axes=1) # (B, R, V)
+    # prediction = self.answer_linear(cs, n_batch_axes=1) # (B, R, V)
+    prediction = cs @ self.mematt.embedAC[-1].W.T # (B, V)
     # ---------------------------
     # Compute rule attentions
     num_rules = rvq.shape[0] # R
