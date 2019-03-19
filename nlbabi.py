@@ -10,10 +10,10 @@ import chainer as C
 import chainer.links as L
 import chainer.functions as F
 import chainer.training as T
-import matplotlib
+# import matplotlib
 # matplotlib.use('pdf')
-from sklearn.decomposition import PCA
-import matplotlib.pyplot as plt
+# from sklearn.decomposition import PCA
+# import matplotlib.pyplot as plt
 
 
 # Disable scientific printing
@@ -508,21 +508,12 @@ class Infer(C.Chain):
       cs = self.mematt.update_state(cs, cands_att, vctx, t) # (B, R, E)
     # ---------------------------
     # Compute answers based on variable and rule scores
-    prediction = self.answer_linear(cs[:, :EMBED], n_batch_axes=1) # (B, R, V)
-    # ---------------------------
-    # Compute aux losses
-    vmap_loss = F.sum(vmap) # ()
-    # aux_rloss = self.answer_linear(rs) # (R, V)
-    # aux_rloss = F.softmax_cross_entropy(aux_rloss, rva[:,0]) # ()
-    attloss = F.stack(self.log['candsatt'], 1) # (B, I, Cs)
-    attloss = F.hstack([F.softmax_cross_entropy(attloss[:,i,:], supps[:,i]) for i in range(ITERATIONS)]) # (I,)
-    attloss = F.mean(attloss) # ()
+    prediction = self.answer_linear(cs, n_batch_axes=1) # (B, R, V)
     # ---------------------------
     # Compute rule attentions
     num_rules = rvq.shape[0] # R
     if num_rules == 1:
-      # return prediction[:, 0, :], 0.01*(vmap_loss+aux_rloss) # (B, V), ()
-      return prediction, attloss#0.01*vmap_loss+attloss # (B, V), ()
+      return prediction # (B, V)
     # Rule features
     rqfeats = seq_encode(rvq, erq) # (R, E)
     rbfeats = seq_encode(rvctx, erctx) # (R, Ls, E)
@@ -546,7 +537,7 @@ class Infer(C.Chain):
     # Compute final rule attended answer
     # (B, R) x (B, R, V)
     final_prediction = F.einsum("ij,ijk->ik", rule_atts, prediction) # (B, V)
-    return final_prediction, 0.01*(vmap_loss+aux_rloss) # (B, V), ()
+    return final_prediction # (B, V)
 
 # ---------------------------
 
@@ -560,9 +551,18 @@ class Classifier(C.Chain):
 
   def forward(self, xin, targets):
     """Compute total loss to train."""
-    predictions, auxloss = self.predictor(xin) # (B, V), ()
+    vctx, vq, va, supps = xin # (B, Cs, C), (B, Q), (B, A), (B, I)
+    # ---------------------------
+    # Compute main loss
+    predictions = self.predictor(xin) # (B, V)
     mainloss = F.softmax_cross_entropy(predictions, targets) # ()
     acc = F.accuracy(predictions, targets) # ()
+    # ---------------------------
+    # Compute aux losses
+    vmap_loss = F.sum(self.predictor.log['vmap']) # ()
+    attloss = F.stack(self.predictor.log['candsatt'], 1) # (B, I, Cs)
+    attloss = F.hstack([F.softmax_cross_entropy(attloss[:,i,:], supps[:,i]) for i in range(ITERATIONS)]) # (I,)
+    auxloss = F.mean(attloss) # ()
     C.reporter.report({'loss': mainloss, 'aux': auxloss, 'acc': acc}, self)
     return mainloss + auxloss # ()
 
@@ -601,13 +601,13 @@ trainer = T.Trainer(updater, (200, 'epoch'))
 
 # Trainer extensions
 val_iter = C.iterators.SerialIterator(val_enc_stories, 128, repeat=False, shuffle=False)
-trainer.extend(T.extensions.Evaluator(val_iter, cmodel, converter=converter, device=-1))
+trainer.extend(T.extensions.Evaluator(val_iter, cmodel, converter=converter, device=-1), name='val')
 # trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_best.npz'), trigger=T.triggers.MinValueTrigger('validation/main/loss'))
 # trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_latest.npz'), trigger=(1, 'epoch'))
 trainer.extend(T.extensions.LogReport(log_name=ARGS.name+'_log.json'))
 # trainer.extend(T.extensions.LogReport(trigger=(1, 'iteration'), log_name=ARGS.name+'_log.json'))
 trainer.extend(T.extensions.FailOnNonNumber())
-trainer.extend(T.extensions.PrintReport(['epoch', 'main/loss', 'validation/main/loss', 'main/aux', 'validation/main/aux', 'main/acc', 'validation/main/acc', 'elapsed_time']))
+trainer.extend(T.extensions.PrintReport(['epoch', 'main/loss', 'val/main/loss', 'main/aux', 'val/main/aux', 'main/acc', 'val/main/acc', 'elapsed_time']))
 # trainer.extend(T.extensions.ProgressBar(update_interval=10))
 # trainer.extend(T.extensions.PlotReport(['main/loss', 'validation/main/loss'], 'iteration', marker=None, file_name=ARGS.name+'_loss.pdf'))
 # trainer.extend(T.extensions.PlotReport(['main/accuracy', 'validation/main/accuracy'],'iteration', marker=None, file_name=ARGS.name+'_acc.pdf'))
@@ -643,13 +643,12 @@ print("RULE PARAMS:", model.get_log())
 # Extra inspection if we are debugging
 if ARGS.debug:
   for val_story in val_enc_stories:
-    answer, auxloss = model(converter([val_story], None)[0])
+    answer = model(converter([val_story], None)[0])
     prediction = np.argmax(answer.array)
     expected = val_story['answers'][0]
     if prediction != expected:
       print(decode_story(val_story))
       print(f"Expected {expected} '{idx2word[expected]}' got {prediction} '{idx2word[prediction]}'.")
-      print(f"Aux loss: {auxloss}")
       print(model.get_log())
       import ipdb; ipdb.set_trace()
       answer = model(converter([val_story], None)[0])
