@@ -474,12 +474,11 @@ class Infer(C.Chain):
       # self.embed = Embed()
       self.rulegen = RuleGen()
       self.unify = Unify()
-      # self.mematt = MemAttention()
-      self.mematt = MemN2N()
-      # self.rule_state_gate = L.Linear(EMBED, 1)
+      self.mematt = MemAttention()
+      # self.mematt = MemN2N()
       self.rule_linear = L.Linear(8*EMBED, 4*EMBED)
       self.rule_score = L.Linear(4*EMBED, 1)
-      # self.answer_linear = L.Linear(EMBED, len(word2idx))
+      self.answer_linear = L.Linear(EMBED, len(word2idx))
     # Setup rule repo
     self.eye = self.xp.eye(len(word2idx), dtype=self.xp.float32) # (V, V)
     self.vrules = vectorise_stories(rule_stories) # (R, Ls, L), (R, Q), (R, A)
@@ -528,10 +527,6 @@ class Infer(C.Chain):
     # cs = seq_encode(vq[:, None, :], qstate) # (B, R, E)
     cs = self.mematt.init_state(vq, vctx) # (B, E)
     # Compute iterative updates on variables
-    # dummy_att = np.zeros((3, 1, 9), dtype=np.float32)
-    # dummy_att[0,0,0] = 1
-    # dummy_att[1,0,3] = 1
-    # dummy_att[2,0,2] = 1
     for t in range(ITERATIONS):
       # ---------------------------
       # Unify body with updated variable state
@@ -539,7 +534,6 @@ class Infer(C.Chain):
       # ---------------------------
       # Compute which body literal to prove using rule state
       # body_att = self.mematt(rs, rvctx, bodyattmask, t) # (R, Ls)
-      # body_att = dummy_att[t] # (R, Ls)
       # self.atts['bodyatts'].append(body_att)
       # Compute candidate attentions
       # cands_att = self.mematt(cs, pos_ectx[:, None, ...], candattmask[:, None, ...]) # (B, R, Cs)
@@ -563,8 +557,8 @@ class Infer(C.Chain):
       cs = self.mematt.update_state(cs, cands_att, vctx, t) # (B, R, E)
     # ---------------------------
     # Compute answers based on variable and rule scores
-    # prediction = self.answer_linear(cs, n_batch_axes=1) # (B, R, V)
-    prediction = cs @ self.mematt.embedAC[-1].W.T # (B, V)
+    prediction = self.answer_linear(cs, n_batch_axes=1) # (B, R, V)
+    # prediction = cs @ self.mematt.embedAC[-1].W.T # (B, V)
     # ---------------------------
     # Compute rule attentions
     num_rules = rvq.shape[0] # R
@@ -699,7 +693,8 @@ print("RULE PARAMS:", model.get_log())
 # Extra inspection if we are debugging
 if ARGS.debug:
   for val_story in val_enc_stories:
-    answer = model(converter([val_story], None)[0])
+    with C.using_config('train', False):
+      answer = model(converter([val_story], None)[0])
     prediction = np.argmax(answer.array)
     expected = val_story['answers'][0]
     if prediction != expected:
@@ -707,7 +702,8 @@ if ARGS.debug:
       print(f"Expected {expected} '{idx2word[expected]}' got {prediction} '{idx2word[prediction]}'.")
       print(model.get_log())
       import ipdb; ipdb.set_trace()
-      answer = model(converter([val_story], None)[0])
+      with C.using_config('train', False):
+        answer = model(converter([val_story], None)[0])
   # Plot Embeddings
   # pca = PCA(2)
   # print(model.unify.words_linear.W.array.T)
