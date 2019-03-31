@@ -485,13 +485,14 @@ class Infer(C.Chain):
     self.mrules = tuple([v != 0 for v in self.vrules]) # (R, Ls, L), (R, Q), (R, A)
     self.log = None
 
-  def get_log(self):
-    """Return last mini-batch log."""
-    return self.log
+  def tolog(self, key, value):
+    """Append to log dictionary given key value pair."""
+    loglist = self.log.setdefault(key, [])
+    loglist.append(value)
 
   def forward(self, stories):
     """Compute the forward inference pass for given stories."""
-    self.log = {k:list() for k in ('vmap', 'bodyatts', 'candsatt', 'rule_atts')}
+    self.log = dict()
     # ---------------------------
     vctx, vq, va, supps = stories # (B, Cs, C), (B, Q), (B, A), (B, I)
     # Embed stories
@@ -504,7 +505,7 @@ class Infer(C.Chain):
     erctx, erq, era = [self.embed(v) for v in self.vrules[:-1]] # (R, Ls, L, E), (R, Q, E), (R, A, E)
     # erctx, erq, era = erctx*rmctx[..., None], erq*rmq[..., None], era*rma[..., None] # (R, Ls, L, E), (R, Q, E), (R, A, E)
     vmap = self.rulegen(self.vrules, [erctx, erq, era]) # (R, V)
-    self.log['vmap'] = vmap
+    self.tolog('vmap', vmap)
     # Setup variable maps and states
     # vmap = np.array([[0,1,0,0,1,0,1,1,0,0,0,0,0,0,0,0,0,0,]], dtype=np.float32)
     # vmap = np.array([[0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0]], dtype=np.float32)
@@ -538,7 +539,7 @@ class Infer(C.Chain):
       # Compute candidate attentions
       # cands_att = self.mematt(cs, pos_ectx[:, None, ...], candattmask[:, None, ...]) # (B, R, Cs)
       raw_cands_att = self.mematt(cs, vctx, candattmask, t) # (B, Cs)
-      self.log['candsatt'].append(raw_cands_att)
+      self.tolog('candsatt', raw_cands_att)
       cands_att = F.softmax(raw_cands_att, -1) # (B, Cs)
       # ---------------------------
       # Update rule states
@@ -582,7 +583,7 @@ class Infer(C.Chain):
     rule_atts = self.rule_score(rule_atts, n_batch_axes=2) # (B, R, 1)
     rule_atts = F.squeeze(rule_atts, -1) # (B, R)
     rule_atts = F.softmax(rule_atts, -1) # (B, R)
-    self.log['rule_atts'].append(rule_atts)
+    # self.log['rule_atts'].append(rule_atts)
     # ---------------------------
     # Compute final rule attended answer
     # (B, R) x (B, R, V)
@@ -609,7 +610,7 @@ class Classifier(C.Chain):
     acc = F.accuracy(predictions, targets) # ()
     # ---------------------------
     # Compute aux losses
-    vmap_loss = F.sum(self.predictor.log['vmap']) # ()
+    vmap_loss = F.sum(self.predictor.log['vmap'][0]) # ()
     attloss = F.stack(self.predictor.log['candsatt'], 1) # (B, I, Cs)
     attloss = F.hstack([F.softmax_cross_entropy(attloss[:,i,:], supps[:,i]) for i in range(ITERATIONS)]) # (I,)
     auxloss = F.mean(attloss) # ()
@@ -689,7 +690,7 @@ answer = model(converter([val_enc_stories[0]], None)[0])[0].array
 print("POST ANSWER:", answer)
 print("RULE STORY:", [decode_story(rs) for rs in model.rule_stories])
 print("ENC RULE STORY:", model.vrules)
-print("RULE PARAMS:", model.get_log())
+print("RULE PARAMS:", model.log)
 # Extra inspection if we are debugging
 if ARGS.debug:
   for val_story in val_enc_stories:
@@ -700,7 +701,7 @@ if ARGS.debug:
     if prediction != expected:
       print(decode_story(val_story))
       print(f"Expected {expected} '{idx2word[expected]}' got {prediction} '{idx2word[prediction]}'.")
-      print(model.get_log())
+      print(model.log)
       import ipdb; ipdb.set_trace()
       with C.using_config('train', False):
         answer = model(converter([val_story], None)[0])
