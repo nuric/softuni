@@ -426,6 +426,7 @@ class Infer(C.Chain):
       self.vmap_score = L.Linear(EMBED, 1)
       self.mematt = MemAttention()
       # self.mematt = MemN2N()
+      self.uni_linear = L.Linear(EMBED, EMBED, initialW=C.initializers.Orthogonal())
       self.rule_linear = L.Linear(8*EMBED, 4*EMBED)
       self.rule_score = L.Linear(4*EMBED, 1)
       self.answer_linear = L.Linear(EMBED, len(word2idx))
@@ -451,6 +452,7 @@ class Infer(C.Chain):
     wordrange[0] = -1 # Null padding is never a variable
     mask = np.vstack([np.isin(wordrange, rws) for rws in rwords]) # (R, V)
     vmap = self.vmap_linear(embedded_words) # (V, E)
+    vmap = F.tanh(vmap) # (V, E)
     vmap = self.vmap_score(vmap) # (V, 1)
     vmap = F.squeeze(vmap, -1) # (V,)
     vmap = F.sigmoid(vmap) # (V,)
@@ -475,17 +477,17 @@ class Infer(C.Chain):
     # Compute contextual representations
     # contextual_toprove = contextual_convolve(self.xp, self.convolve_words, toprove, groundtoprove) # (R, Ps, P, E)
     # contextual_candidates = contextual_convolve(self.xp, self.convolve_words, candidates, embedded_candidates) # (B, Cs, C, E)
-    contextual_toprove = self.vmap_linear(embedded_toprove, n_batch_axes=3) # (R, Ps, P, E)
-    contextual_candidates = self.vmap_linear(embedded_candidates, n_batch_axes=3) # (B, Cs, C, E)
-    # contextual_toprove = F.normalize(contextual_toprove, axis=-1) # (B, R, Ps, P, E)
-    # contextual_candidates = F.normalize(contextual_candidates, axis=-1) # (B, Cs, C, E)
+    contextual_toprove = self.uni_linear(embedded_toprove, n_batch_axes=3) # (R, Ps, P, E)
+    contextual_candidates = self.uni_linear(embedded_candidates, n_batch_axes=3) # (B, Cs, C, E)
+    contextual_toprove = F.normalize(contextual_toprove, axis=-1) # (B, R, Ps, P, E)
+    contextual_candidates = F.normalize(contextual_candidates, axis=-1) # (B, Cs, C, E)
     # Compute similarity between every provable symbol and candidate symbol
     # (R, Ps, P, E) x (B, Cs, C, E)
     raw_sims = F.einsum("jklm,inom->ijklno", contextual_toprove, contextual_candidates) # (B, R, Ps, P, Cs, C)
-    raw_sims += sim_mask # (B, R, Ps, P, Cs, C)
-    # raw_sims *= 10 # scale up for softmax
+    raw_sims *= 10 # scale up for softmax
     # ---------------------------
     # Calculate attended unified word representations for toprove
+    raw_sims += sim_mask # (B, R, Ps, P, Cs, C)
     sim_weights = F.softmax(raw_sims, -1) # (B, R, Ps, P, Cs, C)
     # (B, R, Ps, P, Cs, C) x (B, Cs, C, E)
     unifications = F.einsum("ijklmn,imno->ijklmo", sim_weights, embedded_candidates) # (B, R, Ps, P, Cs, E)
@@ -506,9 +508,11 @@ class Infer(C.Chain):
     erctx, erq, era = [self.embed(v) for v in self.vrules[:-1]] # (R, Ls, L, E), (R, Q, E), (R, A, E)
     # erctx, erq, era = erctx*rmctx[..., None], erq*rmq[..., None], era*rma[..., None] # (R, Ls, L, E), (R, Q, E), (R, A, E)
     # Compute variable map
-    vmap = self.compute_vmap()
+    # vmap = self.compute_vmap()
     # vmap = np.array([[0,1,0,0,1,0,1,1,0,0,0,0,0,0,0,0,0,0,]], dtype=np.float32)
-    # vmap = np.array([[0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0]], dtype=np.float32)
+    vmap = np.array([[0,1,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0]], dtype=np.float32)
+    # vmap = np.array([[0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]], dtype=np.float32)
+    self.tolog('vmap', vmap)
     # Setup variable maps and states
     nrules_range = np.arange(len(self.rule_stories)) # (R,)
     ctxvgates = vmap[nrules_range[:, None, None], rvctx] # (R, Ls, L)
@@ -562,7 +566,8 @@ class Infer(C.Chain):
     # Compute answers based on variable and rule scores
     prediction = self.answer_linear(cs, n_batch_axes=len(cs.shape)-1) # (B, R, V)
     rpred = self.answer_linear(rs) # (R, V)
-    self.tolog('rpred', rpred)
+    rpredloss = F.softmax_cross_entropy(rpred, rva[:,0]) # ()
+    self.tolog('rpredloss', rpredloss)
     # prediction = cs @ self.mematt.embedAC[-1].W.T # (B, V)
     # ---------------------------
     # Compute rule attentions
@@ -622,9 +627,9 @@ class Classifier(C.Chain):
     rattloss = F.stack(self.predictor.log['bodyatt'], 1) # (R, I, Ls)
     rattloss = F.hstack([F.softmax_cross_entropy(rattloss[:,i,:], rsupps[:,i]) for i in range(ITERATIONS)]) # (I,)
     rattloss = F.mean(rattloss) # ()
-    rpredloss = F.softmax_cross_entropy(self.predictor.log['rpred'][0], rva[:,0]) # ()
+    rpredloss = self.predictor.log['rpredloss'][0] # ()
     C.reporter.report({'loss': mainloss, 'vmap': vmaploss, 'att': attloss, 'ratt': rattloss, 'rpred': rpredloss, 'acc': acc}, self)
-    return mainloss + attloss + 0.1*rattloss + 0.01*vmaploss + rpredloss # ()
+    return mainloss + attloss + rattloss + 0.1*vmaploss + rpredloss # ()
 
 # ---------------------------
 
@@ -715,6 +720,12 @@ if ARGS.debug:
       import ipdb; ipdb.set_trace()
       with C.using_config('train', False):
         answer = model(converter([val_story], None)[0])
+  print(decode_story(val_story))
+  print(f"Expected {expected} '{idx2word[expected]}' got {prediction} '{idx2word[prediction]}'.")
+  print(model.log)
+  import ipdb; ipdb.set_trace()
+  with C.using_config('train', False):
+    answer = model(converter([val_story], None)[0])
   # Plot Embeddings
   # pca = PCA(2)
   # print(model.unify.words_linear.W.array.T)
