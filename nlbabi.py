@@ -508,9 +508,9 @@ class Infer(C.Chain):
     erctx, erq, era = [self.embed(v) for v in self.vrules[:-1]] # (R, Ls, L, E), (R, Q, E), (R, A, E)
     # erctx, erq, era = erctx*rmctx[..., None], erq*rmq[..., None], era*rma[..., None] # (R, Ls, L, E), (R, Q, E), (R, A, E)
     # Compute variable map
-    # vmap = self.compute_vmap()
+    vmap = self.compute_vmap()
     # vmap = np.array([[0,1,0,0,1,0,1,1,0,0,0,0,0,0,0,0,0,0,]], dtype=np.float32)
-    vmap = np.array([[0,1,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0]], dtype=np.float32)
+    # vmap = np.array([[0,1,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0]], dtype=np.float32)
     # vmap = np.array([[0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]], dtype=np.float32)
     self.tolog('vmap', vmap)
     # Setup variable maps and states
@@ -530,50 +530,65 @@ class Infer(C.Chain):
     # Get initial candidate state
     qstate = qvgates[..., None]*qunis + (1-qvgates[..., None])*erq # (B, R, Q, E)
     qstate *= rmq[..., None] # (B, R, Q, E)
-    cs = self.mematt.init_state(rvq, qstate) # (B, R, E)
-    # cs = self.mematt.init_state(vq, vctx) # (B, E)
+    uni_cs = self.mematt.init_state(rvq, qstate) # (B, R, E)
+    # Assume one rule for now
+    uni_cs = uni_cs[:, 0] # (B, E)
+    orig_cs = self.mematt.init_state(vq, eq) # (B, E)
+    uniloss = F.mean_squared_error(uni_cs, orig_cs) # ()
+    self.tolog('uniloss', uniloss)
+    # ---------------------------
+    # Unify body, every symbol to every symbol
+    bunis = self.unify(rvctx, erctx, vctx, ectx) # (B, R, Ls, L, Cs, E)
+    # ---------------------------
     # Compute iterative updates on variables
     for t in range(ITERATIONS):
       # ---------------------------
-      # Unify body with updated variable state
-      bunis = self.unify(rvctx, erctx, vctx, ectx) # (B, R, Ls, L, Cs, E)
-      # ---------------------------
       # Compute which body literal to prove using rule state
       raw_body_att = self.mematt(rs, rvctx, erctx, bodyattmask, t) # (R, Ls)
-      self.tolog('bodyatt', raw_body_att)
+      self.tolog('raw_body_att', raw_body_att)
       body_att = F.softmax(raw_body_att, -1) # (R, Ls)
-      # Compute candidate attentions for every rule
-      raw_cands_att = [self.mematt(cs[:,r,:], vctx, ectx, candattmask, t) for r in range(cs.shape[1])] # R x (B, Cs)
-      raw_cands_att = F.stack(raw_cands_att, 1) # (B, R, Cs)
-      # raw_cands_att = self.mematt(cs, vctx, candattmask, t) # (B, Cs)
-      self.tolog('candsatt', raw_cands_att)
-      cands_att = F.softmax(raw_cands_att, -1) # (B, R, Cs)
+      # Compute unified candidate attention
+      raw_uni_cands_att = self.mematt(uni_cs, vctx, ectx, candattmask, t) # (B, Cs)
+      self.tolog('raw_uni_cands_att', raw_uni_cands_att)
+      uni_cands_att = F.softmax(raw_uni_cands_att, -1) # (B, Cs)
+      # Compute original candidate attention
+      raw_orig_cands_att = self.mematt(orig_cs, vctx, ectx, candattmask, t) # (B, Cs)
+      self.tolog('raw_orig_cands_att', raw_orig_cands_att)
+      orig_cands_att = F.softmax(raw_orig_cands_att, -1) # (B, Cs)
       # ---------------------------
       # Update rule states
       rs = self.mematt.update_state(rs, body_att, rvctx, erctx, t) # (R, E)
       # ---------------------------
       # Compute attended unification over candidates
-      # (B, R, Cs) x (R, Ls, L) x (B, R, Ls, L, Cs, E)
-      unis = F.einsum("ijm,jkl,ijklmo->ijklo", cands_att, ctxvgates, bunis) # (B, R, Ls, L, E)
+      # (B, Cs) x (R, Ls, L) x (B, R, Ls, L, Cs, E)
+      unis = F.einsum("im,jkl,ijklmo->ijklo", uni_cands_att, ctxvgates, bunis) # (B, R, Ls, L, E)
       # ---------------------------
       # Update candidate states with new variable bindings
       ground = (1-ctxvgates[..., None])*erctx # (R, Ls, L, E)
       bstate = ground + unis # (B, R, Ls, L, E)
       body_att = F.broadcast_to(body_att, bstate.shape[:3]) # (B, R, Ls)
-      cs = self.mematt.update_state(cs, body_att, rvctx, bstate, t) # (B, R, E)
-      # cs = self.mematt.update_state(cs, cands_att, vctx, t) # (B, R, E)
+      uni_cs = self.mematt.update_state(uni_cs, body_att, rvctx, bstate, t) # (B, R, E)
+      # Assume one rule for now
+      uni_cs = uni_cs[:, 0] # (B, E)
+      orig_cs = self.mematt.update_state(orig_cs, orig_cands_att, vctx, ectx, t) # (B, E)
+      uniloss = F.mean_squared_error(uni_cs, orig_cs) # ()
+      self.tolog('uniloss', uniloss)
     # ---------------------------
     # Compute answers based on variable and rule scores
-    prediction = self.answer_linear(cs, n_batch_axes=len(cs.shape)-1) # (B, R, V)
+    prediction = self.answer_linear(uni_cs) # (B, V)
+    # Compute auxilary answers
     rpred = self.answer_linear(rs) # (R, V)
     rpredloss = F.softmax_cross_entropy(rpred, rva[:,0]) # ()
     self.tolog('rpredloss', rpredloss)
+    opred = self.answer_linear(orig_cs) # (B, V)
+    opredloss = F.softmax_cross_entropy(opred, va[:,0]) # ()
+    self.tolog('opredloss', opredloss)
     # prediction = cs @ self.mematt.embedAC[-1].W.T # (B, V)
     # ---------------------------
     # Compute rule attentions
     num_rules = rvq.shape[0] # R
     if num_rules == 1:
-      return prediction[:, 0, :] # (B, V)
+      return prediction # (B, V)
     # Rule features
     rqfeats = seq_encode(rvq, erq) # (R, E)
     rbfeats = seq_encode(rvctx, erctx) # (R, Ls, E)
@@ -621,15 +636,25 @@ class Classifier(C.Chain):
     # ---------------------------
     # Compute aux losses
     vmaploss = F.sum(self.predictor.log['vmap'][0]) # ()
-    attloss = F.stack(self.predictor.log['candsatt'], 1) # (B, I, R, Cs)
-    attloss = F.hstack([F.softmax_cross_entropy(attloss[:,i,0,:], supps[:,i]) for i in range(ITERATIONS)]) # (I,)
-    attloss = F.mean(attloss) # ()
-    rattloss = F.stack(self.predictor.log['bodyatt'], 1) # (R, I, Ls)
+    uattloss = F.stack(self.predictor.log['raw_uni_cands_att'], 1) # (B, I, Cs)
+    uattloss = F.hstack([F.softmax_cross_entropy(uattloss[:,i,:], supps[:,i]) for i in range(ITERATIONS)]) # (I,)
+    uattloss = F.mean(uattloss) # ()
+    # ---
+    oattloss = F.stack(self.predictor.log['raw_orig_cands_att'], 1) # (B, I, Cs)
+    oattloss = F.hstack([F.softmax_cross_entropy(oattloss[:,i,:], supps[:,i]) for i in range(ITERATIONS)]) # (I,)
+    oattloss = F.mean(oattloss) # ()
+    # ---
+    rattloss = F.stack(self.predictor.log['raw_body_att'], 1) # (R, I, Ls)
     rattloss = F.hstack([F.softmax_cross_entropy(rattloss[:,i,:], rsupps[:,i]) for i in range(ITERATIONS)]) # (I,)
     rattloss = F.mean(rattloss) # ()
+    # ---
     rpredloss = self.predictor.log['rpredloss'][0] # ()
-    C.reporter.report({'loss': mainloss, 'vmap': vmaploss, 'att': attloss, 'ratt': rattloss, 'rpred': rpredloss, 'acc': acc}, self)
-    return mainloss + attloss + rattloss + 0.1*vmaploss + rpredloss # ()
+    opredloss = self.predictor.log['opredloss'][0] # ()
+    uniloss = F.hstack(self.predictor.log['uniloss']) # (I+1,)
+    uniloss = F.mean(uniloss) # ()
+    # ---
+    C.reporter.report({'loss': mainloss, 'vmap': vmaploss, 'uatt': uattloss, 'oatt': oattloss, 'ratt': rattloss, 'rpred': rpredloss, 'opred': opredloss, 'uniloss': uniloss, 'acc': acc}, self)
+    return mainloss + 0.1*vmaploss + uattloss + oattloss + rattloss + opredloss + rpredloss + uniloss # ()
 
 # ---------------------------
 
@@ -672,7 +697,7 @@ trainer.extend(T.extensions.Evaluator(val_iter, cmodel, converter=converter, dev
 trainer.extend(T.extensions.LogReport(log_name=ARGS.name+'_log.json'))
 # trainer.extend(T.extensions.LogReport(trigger=(1, 'iteration'), log_name=ARGS.name+'_log.json'))
 trainer.extend(T.extensions.FailOnNonNumber())
-report_keys = ['loss', 'vmap', 'att', 'ratt', 'rpred', 'acc']
+report_keys = ['loss', 'vmap', 'uatt', 'oatt', 'ratt', 'rpred', 'opred', 'uniloss', 'acc']
 trainer.extend(T.extensions.PrintReport(['epoch'] + ['main/'+s for s in report_keys] + ['val/main/'+s for s in report_keys] + ['elapsed_time']))
 # trainer.extend(T.extensions.ProgressBar(update_interval=10))
 # trainer.extend(T.extensions.PlotReport(['main/loss', 'validation/main/loss'], 'iteration', marker=None, file_name=ARGS.name+'_loss.pdf'))
