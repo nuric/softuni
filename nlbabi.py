@@ -479,12 +479,12 @@ class Infer(C.Chain):
     # contextual_candidates = contextual_convolve(self.xp, self.convolve_words, candidates, embedded_candidates) # (B, Cs, C, E)
     contextual_toprove = self.uni_linear(embedded_toprove, n_batch_axes=3) # (R, Ps, P, E)
     contextual_candidates = self.uni_linear(embedded_candidates, n_batch_axes=3) # (B, Cs, C, E)
-    contextual_toprove = F.normalize(contextual_toprove, axis=-1) # (B, R, Ps, P, E)
-    contextual_candidates = F.normalize(contextual_candidates, axis=-1) # (B, Cs, C, E)
+    # contextual_toprove = F.normalize(contextual_toprove, axis=-1) # (B, R, Ps, P, E)
+    # contextual_candidates = F.normalize(contextual_candidates, axis=-1) # (B, Cs, C, E)
     # Compute similarity between every provable symbol and candidate symbol
     # (R, Ps, P, E) x (B, Cs, C, E)
     raw_sims = F.einsum("jklm,inom->ijklno", contextual_toprove, contextual_candidates) # (B, R, Ps, P, Cs, C)
-    raw_sims *= 10 # scale up for softmax
+    # raw_sims *= 10 # scale up for softmax
     # ---------------------------
     # Calculate attended unified word representations for toprove
     raw_sims += sim_mask # (B, R, Ps, P, Cs, C)
