@@ -299,14 +299,12 @@ class MemAttention(C.Chain):
     """Compute an attention over memory given the query."""
     # equery.shape == (..., E)
     # vmemory.shape == (..., Ms, M)
-    # ememory.shape == (..., Ms, M, E)
+    # ememory.shape == (..., Ms, E)
     # mask.shape == (..., Ms)
     # Setup memory embedding
-    emem = self.seq_embed(vmemory, ememory) # (..., Ms, E)
     eq = F.repeat(equery[..., None, :], vmemory.shape[-2], -2) # (..., Ms, E)
-    # sem = self.self_att(eq, em, mask) # (..., Ms, E)
     # Compute content based attention
-    merged = F.concat([eq, emem, eq*emem, F.squared_difference(eq, emem)], -1) # (..., Ms, 4*E)
+    merged = F.concat([eq, ememory, eq*ememory, F.squared_difference(eq, ememory)], -1) # (..., Ms, 4*E)
     inter = self.att_linear(merged, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, E)
     inter = F.tanh(inter) # (..., Ms, E)
     inter = F.dropout(inter, self.drop) # (..., Ms, E)
@@ -327,14 +325,9 @@ class MemAttention(C.Chain):
     # oldstate.shape == (..., E)
     # mem_att.shape == (..., Ms)
     # vmemory.shape == (..., Ms, M)
-    # ememory.shape == (..., Ms, M, E)
-    # Setup memory output embedding
-    emem = self.seq_embed(vmemory, ememory) # (..., Ms, E)
+    # ememory.shape == (..., Ms, E)
     # (..., Ms) x (..., Ms, E) -> (..., E)
-    new_state = F.einsum("...i,...ij->...j", mem_att, emem) # (..., E)
-    #merged = F.concat([oldcontent, select_mem, oldcontent+select_mem], -1) # (..., 3*E)
-    #new_state = self.state_linear(merged, n_batch_axes=len(oldstate.shape)-1) # (..., E)
-    # new_state = F.tanh(new_state) # (..., E)
+    new_state = F.einsum("...i,...ij->...j", mem_att, ememory) # (..., E)
     new_state = F.dropout(new_state, self.drop) # (..., E)
     return new_state
 
@@ -499,15 +492,15 @@ class Infer(C.Chain):
     # vmap = np.array([[0,1,0,0,1,0,1,1,0,0,0,0,0,0,0,0,0,0,]], dtype=np.float32)
     # vmap = np.array([[0,1,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0]], dtype=np.float32)
     # vmap = np.array([[0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]], dtype=np.float32)
-    self.tolog('vmap', vmap)
+    # self.tolog('vmap', vmap)
     # Setup variable maps and states
     nrules_range = np.arange(len(self.rule_stories)) # (R,)
     ctxvgates = vmap[nrules_range[:, None, None], rvctx] # (R, Ls, L)
     qvgates = vmap[nrules_range[:, None], rvq] # (R, Q)
     # Rule states
     rs = self.mematt.init_state(rvq, erq) # (R, E)
+    # Attention masks
     bodyattmask = np.all(rvctx == 0, -1) # (R, Ls)
-    # Candidate states
     candattmask = np.all(vctx == 0, -1) # (B, Cs)
     # ---------------------------
     # Unify query first assuming given query is ground
@@ -528,24 +521,27 @@ class Infer(C.Chain):
     # Unify body, every symbol to every symbol
     bunis = self.unify(rvctx, erctx, vctx, ectx) # (B, R, Ls, L, Cs, E)
     # ---------------------------
+    # Setup memory sequence embeddings
+    mem_erctx = self.mematt.seq_embed(rvctx, erctx) # (R, Ls, E)
+    mem_ectx = self.mematt.seq_embed(vctx, ectx) # (B, Cs, E)
     # Compute iterative updates on variables
     for t in range(ITERATIONS):
       # ---------------------------
       # Compute which body literal to prove using rule state
-      raw_body_att = self.mematt(rs, rvctx, erctx, bodyattmask, t) # (R, Ls)
+      raw_body_att = self.mematt(rs, rvctx, mem_erctx, bodyattmask, t) # (R, Ls)
       self.tolog('raw_body_att', raw_body_att)
       body_att = F.softmax(raw_body_att, -1) # (R, Ls)
       # Compute unified candidate attention
-      raw_uni_cands_att = self.mematt(uni_cs, vctx, ectx, candattmask, t) # (B, Cs)
+      raw_uni_cands_att = self.mematt(uni_cs, vctx, mem_ectx, candattmask, t) # (B, Cs)
       self.tolog('raw_uni_cands_att', raw_uni_cands_att)
       uni_cands_att = F.softmax(raw_uni_cands_att, -1) # (B, Cs)
       # Compute original candidate attention
-      raw_orig_cands_att = self.mematt(orig_cs, vctx, ectx, candattmask, t) # (B, Cs)
+      raw_orig_cands_att = self.mematt(orig_cs, vctx, mem_ectx, candattmask, t) # (B, Cs)
       self.tolog('raw_orig_cands_att', raw_orig_cands_att)
       orig_cands_att = F.softmax(raw_orig_cands_att, -1) # (B, Cs)
       # ---------------------------
       # Update rule states
-      rs = self.mematt.update_state(rs, body_att, rvctx, erctx, t) # (R, E)
+      rs = self.mematt.update_state(rs, body_att, rvctx, mem_erctx, t) # (R, E)
       # ---------------------------
       # Compute attended unification over candidates
       # (B, Cs) x (R, Ls, L) x (B, R, Ls, L, Cs, E)
@@ -556,10 +552,11 @@ class Infer(C.Chain):
       bstate = ground + unis # (B, R, Ls, L, E)
       body_att = F.broadcast_to(body_att, bstate.shape[:3]) # (B, R, Ls)
       brvctx = np.repeat(rvctx[None, ...], bstate.shape[0], 0) # (B, R, Ls, L)
-      uni_cs = self.mematt.update_state(uni_cs, body_att, brvctx, bstate, t) # (B, R, E)
+      mem_bstate = self.mematt.seq_embed(brvctx, bstate) # (B, R, Ls, E)
+      uni_cs = self.mematt.update_state(uni_cs, body_att, brvctx, mem_bstate, t) # (B, R, E)
       # Assume one rule for now
       uni_cs = uni_cs[:, 0] # (B, E)
-      orig_cs = self.mematt.update_state(orig_cs, orig_cands_att, vctx, ectx, t) # (B, E)
+      orig_cs = self.mematt.update_state(orig_cs, orig_cands_att, vctx, mem_ectx, t) # (B, E)
       uniloss = F.mean_squared_error(uni_cs, orig_cs) # ()
       self.tolog('uniloss', uniloss)
     # ---------------------------
