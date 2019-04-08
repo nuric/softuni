@@ -266,8 +266,7 @@ class MemAttention(C.Chain):
     super().__init__()
     self.drop = 0.1
     with self.init_scope():
-      # self.word_mask = L.Linear(EMBED, 1)
-      self.q_linear = L.Linear(EMBED, EMBED)
+      self.seq_birnn = L.NStepBiGRU(1, EMBED, EMBED, self.drop)
       self.att_linear = L.Linear(4*EMBED, EMBED)
       self.att_birnn = L.NStepBiGRU(1, EMBED, EMBED, self.drop)
       self.att_score = L.Linear(2*EMBED, 1)
@@ -276,37 +275,25 @@ class MemAttention(C.Chain):
     """Embed a given sequence."""
     # vxs.shape == (..., S)
     # exs.shape == (..., S, E)
-    # mask = self.word_mask(exs, n_batch_axes=len(vxs.shape)) # (..., S, 1)
-    # mask = F.sigmoid(mask) # (..., S, 1)
-    mask = (vxs != 0)[..., None] # (..., S, 1)
-    exs *= mask # (..., S, E)
-    return pos_encode(vxs, exs) # (..., E)
-    # return F.sum(exs, -2) # (..., E)
+    lengths = np.sum(vxs != 0, -1).flatten() # (X,)
+    seqs = F.reshape(exs, (-1,)+exs.shape[-2:]) # (X, S, E)
+    toembed = [s[..., :l, :] for s, l in zip(F.separate(seqs, 0), lengths) if l != 0] # B x [(S1, E), (S2, E), ...]
+    sembeds, _ = self.seq_birnn(None, toembed) # (2, Y, E)
+    sembeds = F.mean(sembeds, 0) # (Y, E)
+    # Add zero values back to match original shape
+    embeds = self.xp.zeros((lengths.size, EMBED), dtype=self.xp.float32) # (X, E)
+    idxs = np.nonzero(lengths) # (Y,)
+    embeds = F.scatter_add(embeds, idxs, sembeds) # (X, E)
+    embeds = F.reshape(embeds, vxs.shape[:-1] + (EMBED,)) # (..., E)
+    return embeds
 
   def init_state(self, vq, eq):
     """Initialise given state."""
     # vq.shape == (..., S)
     # eq.shape == (..., S, E)
     s = self.seq_embed(vq, eq) # (..., E)
-    # s = self.q_linear(s, n_batch_axes=len(vq.shape)-1) # (..., E)
-    # s = F.tanh(s) # (..., E)
     s = F.dropout(s, self.drop) # (..., E)
     return s # (..., E)
-
-  def self_att(self, equery, ememory, mask=None):
-    """Compute self attention over embedded memory."""
-    # equery.shape == (..., Ms, E)
-    # ememory.shape == (..., Ms, E)
-    # mask.shape == (..., Ms)
-    merged = F.concat([equery, ememory], -1) # (..., Ms, 2*E)
-    keys = self.mem_linear(merged, n_batch_axes=len(ememory.shape)-1) # (..., Ms, E)
-    att = F.einsum("...ik,...jk->...ij", keys, ememory) # (..., Ms, Ms)
-    if mask is not None:
-      att += mask[..., None, :] * MINUS_INF # (..., Ms, Ms)
-    att = F.softmax(att, -1) # (..., Ms, Ms)
-    attended = F.einsum("...ij,...jk->...ik", att, ememory) # (..., Ms, E)
-    attended *= mask[..., None] # (..., Ms, E)
-    return attended
 
   def forward(self, equery, vmemory, ememory, mask=None, iteration=0):
     """Compute an attention over memory given the query."""
@@ -530,7 +517,8 @@ class Infer(C.Chain):
     # Get initial candidate state
     qstate = qvgates[..., None]*qunis + (1-qvgates[..., None])*erq # (B, R, Q, E)
     qstate *= rmq[..., None] # (B, R, Q, E)
-    uni_cs = self.mematt.init_state(rvq, qstate) # (B, R, E)
+    brvq = np.repeat(rvq[None, ...], qstate.shape[0], 0) # (B, R, Q)
+    uni_cs = self.mematt.init_state(brvq, qstate) # (B, R, E)
     # Assume one rule for now
     uni_cs = uni_cs[:, 0] # (B, E)
     orig_cs = self.mematt.init_state(vq, eq) # (B, E)
@@ -567,7 +555,8 @@ class Infer(C.Chain):
       ground = (1-ctxvgates[..., None])*erctx # (R, Ls, L, E)
       bstate = ground + unis # (B, R, Ls, L, E)
       body_att = F.broadcast_to(body_att, bstate.shape[:3]) # (B, R, Ls)
-      uni_cs = self.mematt.update_state(uni_cs, body_att, rvctx, bstate, t) # (B, R, E)
+      brvctx = np.repeat(rvctx[None, ...], bstate.shape[0], 0) # (B, R, Ls, L)
+      uni_cs = self.mematt.update_state(uni_cs, body_att, brvctx, bstate, t) # (B, R, E)
       # Assume one rule for now
       uni_cs = uni_cs[:, 0] # (B, E)
       orig_cs = self.mematt.update_state(orig_cs, orig_cands_att, vctx, ectx, t) # (B, E)
