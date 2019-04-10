@@ -56,7 +56,7 @@ def load_task(fname):
         q, a, supps= sl.split('\t')
         idxs = list(context.keys())
         supps = [idxs.index(int(s)) for s in supps.split(' ')]
-        # assert len(supps) == ITERATIONS, "Not enough iterations for supporting facts."
+        assert len(supps) <= ITERATIONS, "Not enough iterations for supporting facts."
         cctx = list(context.values())
         # cctx.reverse()
         ss.append({'context': cctx[:MAX_HIST], 'query': q,
@@ -271,8 +271,8 @@ class MemAttention(C.Chain):
       self.att_birnn = L.NStepBiGRU(1, EMBED, EMBED, self.drop)
       self.att_score = L.Linear(2*EMBED, 1)
 
-  def seq_embed(self, vxs, exs):
-    """Embed a given sequence."""
+  def seq_rnn_embed(self, vxs, exs):
+    """Embed given sequences using rnn."""
     # vxs.shape == (..., S)
     # exs.shape == (..., S, E)
     lengths = np.sum(vxs != 0, -1).flatten() # (X,)
@@ -286,6 +286,13 @@ class MemAttention(C.Chain):
     embeds = F.scatter_add(embeds, idxs, sembeds) # (X, E)
     embeds = F.reshape(embeds, vxs.shape[:-1] + (EMBED,)) # (..., E)
     return embeds
+
+  def seq_embed(self, vxs, exs):
+    """Embed a given sequence."""
+    # vxs.shape == (..., S)
+    # exs.shape == (..., S, E)
+    return pos_encode(vxs, exs)
+    # return self.seq_rnn_embed(vxs, exs)
 
   def init_state(self, vq, eq):
     """Initialise given state."""
@@ -308,7 +315,6 @@ class MemAttention(C.Chain):
     inter = self.att_linear(merged, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, E)
     inter = F.tanh(inter) # (..., Ms, E)
     inter = F.dropout(inter, self.drop) # (..., Ms, E)
-    # att = self.catt_score(inter, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, E)
     # Split into sentences
     lengths = np.sum(np.any((vmemory != 0), -1), -1) # (...,)
     mems = [s[..., :l, :] for s, l in zip(F.separate(inter, 0), lengths)] # B x [(M1, E), (M2, E), ...]
@@ -457,7 +463,8 @@ class Infer(C.Chain):
     # Compute contextual representations
     # contextual_toprove = contextual_convolve(self.xp, self.convolve_words, toprove, groundtoprove) # (R, Ps, P, E)
     # contextual_candidates = contextual_convolve(self.xp, self.convolve_words, candidates, embedded_candidates) # (B, Cs, C, E)
-    contextual_toprove = self.uni_linear(embedded_toprove, n_batch_axes=3) # (R, Ps, P, E)
+    contextual_toprove = embedded_toprove # (R, Ps, P, E)
+    # contextual_toprove = self.uni_linear(embedded_toprove, n_batch_axes=3) # (R, Ps, P, E)
     contextual_candidates = self.uni_linear(embedded_candidates, n_batch_axes=3) # (B, Cs, C, E)
     # contextual_toprove = F.normalize(contextual_toprove, axis=-1) # (B, R, Ps, P, E)
     # contextual_candidates = F.normalize(contextual_candidates, axis=-1) # (B, Cs, C, E)
@@ -487,6 +494,7 @@ class Infer(C.Chain):
     rmctx, rmq, rma = self.mrules # (R, Ls, L), (R, Q), (R, A)
     erctx, erq, era = [self.embed(v) for v in self.vrules[:-1]] # (R, Ls, L, E), (R, Q, E), (R, A, E)
     # erctx, erq, era = erctx*rmctx[..., None], erq*rmq[..., None], era*rma[..., None] # (R, Ls, L, E), (R, Q, E), (R, A, E)
+    # ---------------------------
     # Compute variable map
     vmap = self.compute_vmap()
     # vmap = np.array([[0,1,0,0,1,0,1,1,0,0,0,0,0,0,0,0,0,0,]], dtype=np.float32)
@@ -497,6 +505,7 @@ class Infer(C.Chain):
     nrules_range = np.arange(len(self.rule_stories)) # (R,)
     ctxvgates = vmap[nrules_range[:, None, None], rvctx] # (R, Ls, L)
     qvgates = vmap[nrules_range[:, None], rvq] # (R, Q)
+    # ---------------------------
     # Rule states
     rs = self.mematt.init_state(rvq, erq) # (R, E)
     # Attention masks
