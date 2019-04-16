@@ -648,7 +648,7 @@ class Classifier(C.Chain):
     uniloss = F.hstack(self.predictor.log['uniloss']) # (I+1,)
     uniloss = F.mean(uniloss) # ()
     # ---
-    C.reporter.report({'loss': mainloss, 'vmap': vmaploss, 'uatt': uattloss, 'oatt': oattloss, 'ratt': rattloss, 'rpred': rpredloss, 'opred': opredloss, 'uniloss': uniloss, 'acc': acc}, self)
+    C.reporter.report({'loss': mainloss, 'vmap': vmaploss, 'uatt': uattloss, 'oatt': oattloss, 'ratt': rattloss, 'rpred': rpredloss, 'opred': opredloss, 'uni': uniloss, 'acc': acc}, self)
     return mainloss + 0.1*vmaploss + uattloss + oattloss + rattloss + opredloss + rpredloss + uniloss # ()
 
 # ---------------------------
@@ -692,7 +692,7 @@ trainer.extend(T.extensions.Evaluator(val_iter, cmodel, converter=converter, dev
 trainer.extend(T.extensions.LogReport(log_name=ARGS.name+'_log.json'))
 # trainer.extend(T.extensions.LogReport(trigger=(1, 'iteration'), log_name=ARGS.name+'_log.json'))
 trainer.extend(T.extensions.FailOnNonNumber())
-report_keys = ['loss', 'vmap', 'uatt', 'oatt', 'ratt', 'rpred', 'opred', 'uniloss', 'acc']
+report_keys = ['loss', 'vmap', 'uatt', 'oatt', 'ratt', 'rpred', 'opred', 'uni', 'acc']
 trainer.extend(T.extensions.PrintReport(['epoch'] + ['main/'+s for s in report_keys] + ['val/main/'+s for s in report_keys] + ['elapsed_time']))
 # trainer.extend(T.extensions.ProgressBar(update_interval=10))
 # trainer.extend(T.extensions.PlotReport(['main/loss', 'validation/main/loss'], 'iteration', marker=None, file_name=ARGS.name+'_loss.pdf'))
