@@ -12,8 +12,8 @@ import chainer.functions as F
 import chainer.training as T
 # import matplotlib
 # matplotlib.use('pdf')
-# from sklearn.decomposition import PCA
-# import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
 
 
 # Disable scientific printing
@@ -747,11 +747,10 @@ if ARGS.debug:
   with C.using_config('train', False):
     answer = model(converter([val_story], None)[0])
   # Plot Embeddings
-  # pca = PCA(2)
-  # print(model.unify.words_linear.W.array.T)
-  # embds = pca.fit_transform(model.unify.words_linear.W.array.T)
-  # print("PCA VAR:", pca.explained_variance_ratio_)
-  # plt.scatter(embds[:, 0], embds[:, 1])
-  # for i in range(len(idx2word)):
-    # plt.annotate(idx2word[i], xy=(embds[i,0], embds[i,1]), xytext=(10, 10), textcoords='offset points', arrowprops={'arrowstyle': '-'})
-  # plt.show()
+  pca = PCA(2)
+  embds = pca.fit_transform(model.embed.W.array)
+  print("PCA VAR:", pca.explained_variance_ratio_)
+  plt.scatter(embds[:, 0], embds[:, 1])
+  for i in range(len(idx2word)):
+    plt.annotate(idx2word[i], xy=(embds[i,0], embds[i,1]), xytext=(10, 10), textcoords='offset points', arrowprops={'arrowstyle': '-'})
+  plt.show()
