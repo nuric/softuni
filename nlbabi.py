@@ -6,6 +6,7 @@ import signal
 import time
 from collections import OrderedDict
 import numpy as np
+from sklearn.model_selection import train_test_split
 import chainer as C
 import chainer.links as L
 import chainer.functions as F
@@ -66,9 +67,11 @@ def load_task(fname):
         context[sid] = sl
   return ss
 stories = load_task(ARGS.task)
-val_stories = load_task(ARGS.task.replace('train', 'test'))
-print("TRAIN:", len(stories), "stories")
+train_stories, val_stories = train_test_split(stories, test_size=0.1)
+test_stories = load_task(ARGS.task.replace('train', 'test'))
+print("TRAIN:", len(train_stories), "stories")
 print("VAL:", len(val_stories), "stories")
+print("TEST:", len(test_stories), "stories")
 print("SAMPLE:", stories[0])
 
 # ---------------------------
@@ -97,8 +100,10 @@ def encode_story(story):
   return es
 enc_stories = list(map(encode_story, stories))
 print("TRAIN VOCAB:", len(word2idx))
+train_enc_stories = list(map(encode_story, train_stories))
 val_enc_stories = list(map(encode_story, val_stories))
-print("VAL VOCAB:", len(word2idx))
+test_enc_stories = list(map(encode_story, test_stories))
+print("TEST VOCAB:", len(word2idx))
 print("ENC SAMPLE:", enc_stories[0])
 idx2word = {v:k for k, v in word2idx.items()}
 
@@ -154,11 +159,6 @@ def sequence_embed(seqs, embed):
   ex = embed(F.concat(seqs, axis=0))
   exs = F.split_axis(ex, x_section, 0)
   return exs
-
-def story_embed(story, embed):
-  """Given an encoded story embed its sentences using embed."""
-  encs = sequence_embed([story['answers'], story['query']] + story['context'], embed)
-  return {'answers': encs[0], 'query': encs[1], 'context': encs[2:]}
 
 def bow_encode(_, exs):
   """Given sentences compute is bag-of-words representation."""
@@ -670,7 +670,7 @@ optimiser = C.optimizers.Adam().setup(cmodel)
 optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
 # optimiser.add_hook(C.optimizer_hooks.GradientClipping(40))
 
-train_iter = C.iterators.SerialIterator(enc_stories, 64)
+train_iter = C.iterators.SerialIterator(train_enc_stories, 64)
 def converter(batch_stories, _):
   """Coverts given batch to expected format for Classifier."""
   vctx, vq, vas, supps = vectorise_stories(batch_stories, noise=False) # (B, Cs, C), (B, Q), (B, A)
@@ -682,13 +682,15 @@ trainer = T.Trainer(updater, (200, 'epoch'))
 # Trainer extensions
 val_iter = C.iterators.SerialIterator(val_enc_stories, 128, repeat=False, shuffle=False)
 trainer.extend(T.extensions.Evaluator(val_iter, cmodel, converter=converter, device=-1), name='val')
+test_iter = C.iterators.SerialIterator(test_enc_stories, 128, repeat=False, shuffle=False)
+trainer.extend(T.extensions.Evaluator(test_iter, cmodel, converter=converter, device=-1), name='test')
 # trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_best.npz'), trigger=T.triggers.MinValueTrigger('validation/main/loss'))
 # trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_latest.npz'), trigger=(1, 'epoch'))
 trainer.extend(T.extensions.LogReport(log_name=ARGS.name+'_log.json'))
 # trainer.extend(T.extensions.LogReport(trigger=(1, 'iteration'), log_name=ARGS.name+'_log.json'))
 trainer.extend(T.extensions.FailOnNonNumber())
 report_keys = ['loss', 'vmap', 'uatt', 'oatt', 'ratt', 'rpred', 'opred', 'uni', 'acc']
-trainer.extend(T.extensions.PrintReport(['epoch'] + ['main/'+s for s in report_keys] + ['val/main/'+s for s in report_keys] + ['elapsed_time']))
+trainer.extend(T.extensions.PrintReport(['epoch'] + ['main/'+s for s in report_keys] + [p+'/main/'+s for p in ('val', 'test') for s in ('loss', 'acc')] + ['elapsed_time']))
 # trainer.extend(T.extensions.ProgressBar(update_interval=10))
 # trainer.extend(T.extensions.PlotReport(['main/loss', 'validation/main/loss'], 'iteration', marker=None, file_name=ARGS.name+'_loss.pdf'))
 # trainer.extend(T.extensions.PlotReport(['main/accuracy', 'validation/main/accuracy'],'iteration', marker=None, file_name=ARGS.name+'_acc.pdf'))
@@ -716,31 +718,31 @@ except KeyboardInterrupt:
   pass
 
 # Print final rules
-answer = model(converter([val_enc_stories[0]], None)[0])[0].array
+answer = model(converter([test_enc_stories[0]], None)[0])[0].array
 print("POST ANSWER:", answer)
 print("RULE STORY:", [decode_story(rs) for rs in model.rule_stories])
 print("ENC RULE STORY:", model.vrules)
 print("RULE PARAMS:", model.log)
 # Extra inspection if we are debugging
 if ARGS.debug:
-  for val_story in val_enc_stories:
+  for test_story in test_enc_stories:
     with C.using_config('train', False):
-      answer = model(converter([val_story], None)[0])
+      answer = model(converter([test_story], None)[0])
     prediction = np.argmax(answer.array)
-    expected = val_story['answers'][0]
+    expected = test_story['answers'][0]
     if prediction != expected:
-      print(decode_story(val_story))
+      print(decode_story(test_story))
       print(f"Expected {expected} '{idx2word[expected]}' got {prediction} '{idx2word[prediction]}'.")
       print(model.log)
       import ipdb; ipdb.set_trace()
       with C.using_config('train', False):
-        answer = model(converter([val_story], None)[0])
-  print(decode_story(val_story))
+        answer = model(converter([test_story], None)[0])
+  print(decode_story(test_story))
   print(f"Expected {expected} '{idx2word[expected]}' got {prediction} '{idx2word[prediction]}'.")
   print(model.log)
   import ipdb; ipdb.set_trace()
   with C.using_config('train', False):
-    answer = model(converter([val_story], None)[0])
+    answer = model(converter([test_story], None)[0])
   # Plot Embeddings
   pca = PCA(2)
   embds = pca.fit_transform(model.embed.W.array)
