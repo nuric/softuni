@@ -278,12 +278,12 @@ class MemAttention(C.Chain):
     lengths = np.sum(vxs != 0, -1).flatten() # (X,)
     seqs = F.reshape(exs, (-1,)+exs.shape[-2:]) # (X, S, E)
     toembed = [s[..., :l, :] for s, l in zip(F.separate(seqs, 0), lengths) if l != 0] # B x [(S1, E), (S2, E), ...]
-    sembeds, _ = self.seq_birnn(None, toembed) # (2, Y, E)
-    sembeds = F.mean(sembeds, 0) # (Y, E)
+    hs, _ = self.seq_birnn(None, toembed) # (2, Y, E)
+    hs = F.mean(hs, 0) # (Y, E)
     # Add zero values back to match original shape
     embeds = self.xp.zeros((lengths.size, EMBED), dtype=self.xp.float32) # (X, E)
     idxs = np.nonzero(lengths) # (Y,)
-    embeds = F.scatter_add(embeds, idxs, sembeds) # (X, E)
+    embeds = F.scatter_add(embeds, idxs, hs) # (X, E)
     embeds = F.reshape(embeds, vxs.shape[:-1] + (EMBED,)) # (..., E)
     return embeds
 
@@ -291,8 +291,8 @@ class MemAttention(C.Chain):
     """Embed a given sequence."""
     # vxs.shape == (..., S)
     # exs.shape == (..., S, E)
-    return pos_encode(vxs, exs)
-    # return self.seq_rnn_embed(vxs, exs)
+    # return pos_encode(vxs, exs)
+    return self.seq_rnn_embed(vxs, exs)
 
   def init_state(self, vq, eq):
     """Initialise given state."""
@@ -408,11 +408,10 @@ class Infer(C.Chain):
       self.embed = L.EmbedID(len(word2idx), EMBED, ignore_label=0)
       # self.embed = Embed()
       # self.rulegen = RuleGen()
-      self.vmap_linear = L.Linear(EMBED, EMBED)
-      self.vmap_score = L.Linear(EMBED, 1)
+      self.vmap_params = C.Parameter(0.0, (len(self.rule_stories), len(word2idx)), name='vmap_params')
       self.mematt = MemAttention()
       # self.mematt = MemN2N()
-      self.uni_linear = L.Linear(EMBED, EMBED, initialW=C.initializers.Orthogonal())
+      self.uni_linear = L.Linear(EMBED, EMBED, nobias=True)
       self.rule_linear = L.Linear(8*EMBED, 4*EMBED)
       self.rule_score = L.Linear(4*EMBED, 1)
       self.answer_linear = L.Linear(EMBED, len(word2idx))
@@ -437,11 +436,7 @@ class Infer(C.Chain):
     embedded_words = self.embed(wordrange) # (V, E)
     wordrange[0] = -1 # Null padding is never a variable
     mask = np.vstack([np.isin(wordrange, rws) for rws in rwords]) # (R, V)
-    vmap = self.vmap_linear(embedded_words) # (V, E)
-    vmap = F.tanh(vmap) # (V, E)
-    vmap = self.vmap_score(vmap) # (V, 1)
-    vmap = F.squeeze(vmap, -1) # (V,)
-    vmap = F.sigmoid(vmap) # (V,)
+    vmap = F.sigmoid(self.vmap_params*10) # (R, V)
     vmap *= mask # (R, V)
     self.tolog('vmap', vmap)
     return vmap
