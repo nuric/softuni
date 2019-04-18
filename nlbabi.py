@@ -392,10 +392,8 @@ class Infer(C.Chain):
     # embedded_candidates.shape = (B, Cs, C, E)
     # ---------------------------
     # Setup masks
-    mask_toprove = (toprove == 0.0) # (R, Ps, P)
     mask_candidates = (candidates == 0.0) # (B, Cs, C)
-    sim_mask = np.logical_or(mask_toprove[None, ..., None, None], mask_candidates[:, None, None, None, ...]) # (B, R, Ps, P, Cs, C)
-    sim_mask = sim_mask.astype(np.float32) * MINUS_INF # (B, R, Ps, P, Cs, C)
+    sim_mask = mask_candidates.astype(np.float32) * MINUS_INF # (B, Cs, C)
     # ---------------------------
     # Calculate a match for every word in s1 to every word in s2
     # Compute contextual representations
@@ -412,7 +410,7 @@ class Infer(C.Chain):
     # raw_sims *= 10 # scale up for softmax
     # ---------------------------
     # Calculate attended unified word representations for toprove
-    raw_sims += sim_mask # (B, R, Ps, P, Cs, C)
+    raw_sims += sim_mask[:, None, None, None, ...] # (B, R, Ps, P, Cs, C)
     sim_weights = F.softmax(raw_sims, -1) # (B, R, Ps, P, Cs, C)
     # (B, R, Ps, P, Cs, C) x (B, Cs, C, E)
     unifications = F.einsum("ijklmn,imno->ijklmo", sim_weights, embedded_candidates) # (B, R, Ps, P, Cs, E)
