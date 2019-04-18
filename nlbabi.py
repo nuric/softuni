@@ -35,7 +35,7 @@ ARGS = parser.parse_args()
 EMBED = 32
 MAX_HIST = 250
 REPO_SIZE = 1
-ITERATIONS = 3
+ITERATIONS = 2
 MINUS_INF = -100
 
 # ---------------------------
@@ -528,6 +528,8 @@ class Infer(C.Chain):
     opred = self.answer_linear(orig_cs) # (B, V)
     opredloss = F.softmax_cross_entropy(opred, va[:,0]) # ()
     self.tolog('opredloss', opredloss)
+    oacc = F.accuracy(opred, va[:,0]) # ()
+    self.tolog('oacc', oacc)
     # prediction = cs @ self.mematt.embedAC[-1].W.T # (B, V)
     return prediction
 
@@ -567,10 +569,11 @@ class Classifier(C.Chain):
     # ---
     rpredloss = self.predictor.log['rpredloss'][0] # ()
     opredloss = self.predictor.log['opredloss'][0] # ()
+    oacc = self.predictor.log['oacc'][0] # ()
     uniloss = F.hstack(self.predictor.log['uniloss']) # (I+1,)
     uniloss = F.mean(uniloss) # ()
     # ---
-    C.reporter.report({'loss': mainloss, 'vmap': vmaploss, 'uatt': uattloss, 'oatt': oattloss, 'ratt': rattloss, 'rpred': rpredloss, 'opred': opredloss, 'uni': uniloss, 'acc': acc}, self)
+    C.reporter.report({'loss': mainloss, 'vmap': vmaploss, 'uatt': uattloss, 'oatt': oattloss, 'ratt': rattloss, 'rpred': rpredloss, 'opred': opredloss, 'uni': uniloss, 'oacc': oacc, 'acc': acc}, self)
     return mainloss + 0.1*vmaploss + uattloss + oattloss + rattloss + opredloss + rpredloss + uniloss # ()
 
 # ---------------------------
@@ -616,7 +619,7 @@ trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_latest.npz'), trigger=
 trainer.extend(T.extensions.LogReport(log_name=ARGS.name+'_log.json'))
 # trainer.extend(T.extensions.LogReport(trigger=(1, 'iteration'), log_name=ARGS.name+'_log.json'))
 trainer.extend(T.extensions.FailOnNonNumber())
-report_keys = ['loss', 'vmap', 'uatt', 'oatt', 'ratt', 'rpred', 'opred', 'uni', 'acc']
+report_keys = ['loss', 'vmap', 'uatt', 'oatt', 'ratt', 'rpred', 'opred', 'uni', 'oacc', 'acc']
 trainer.extend(T.extensions.PrintReport(['epoch'] + ['main/'+s for s in report_keys] + [p+'/main/'+s for p in ('val', 'test') for s in ('loss', 'acc')] + ['elapsed_time']))
 # trainer.extend(T.extensions.ProgressBar(update_interval=10))
 # trainer.extend(T.extensions.PlotReport(['main/loss', 'validation/main/loss'], 'iteration', marker=None, file_name=ARGS.name+'_loss.pdf'))
