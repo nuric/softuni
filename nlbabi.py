@@ -33,9 +33,9 @@ ARGS = parser.parse_args()
   # C.set_debug(True)
 
 EMBED = 32
-MAX_HIST = 120
+MAX_HIST = 250
 REPO_SIZE = 1
-ITERATIONS = 1
+ITERATIONS = 3
 MINUS_INF = -100
 
 # ---------------------------
@@ -178,11 +178,6 @@ def pos_encode(vxs, exs):
   enc = coeff * exs # (..., S, E)
   return F.sum(enc, axis=-2) # (..., E)
 
-def seq_encode(vxs, exs):
-  """Encode a sequence."""
-  # (..., S), (..., S, E)
-  return bow_encode(vxs, exs)
-
 def contextual_convolve(backend, convolution, vxs, exs):
   """Given vectorised and encoded sentences convolve over last dimension."""
   # (B, ..., S), (B, ..., S, E)
@@ -201,61 +196,6 @@ def contextual_convolve(backend, convolution, vxs, exs):
     contextual = contextual[..., :-1, :] # (B, ..., S, E)
   contextual *= mask[..., None] # (B, ..., S, E)
   return contextual
-
-# ---------------------------
-
-# Rule generating network
-class RuleGen(C.Chain):
-  """Takes an example story-> context, query, answer
-  returns a probabilistic rule"""
-  def __init__(self):
-    super().__init__()
-    with self.init_scope():
-      # self.convolve_words = L.Convolution1D(EMBED, EMBED, 3, pad=1)
-      self.isvariable_linear = L.Linear(EMBED+1, EMBED)
-      self.isvariable_score = L.Linear(EMBED, 1)
-
-  def forward(self, vectorised_rules, embedded_rules):
-    """Given a story generate a probabilistic learnable rule."""
-    # vectorised_rules = [(R, Ls, L), (R, Q), (R, A)]
-    # embedded_rules = [(R, Ls, L, E), (R, Q, E), (R, A, E)]
-    vctx, vq, va, _ = vectorised_rules
-    ectx, eq, ea = embedded_rules
-    # ---------------------------
-    # Whether each word in story is a variable, binary class -> {wordid:sigmoid}
-    num_rules = vctx.shape[0] # R
-    words = np.reshape(vctx, (num_rules, -1)) # (R, Ls*L)
-    words = np.concatenate([vq, words], -1) # (R, Q+Ls*L)
-    # Compute contextuals by convolving each sentence
-    ###
-    # contextual_q = contextual_convolve(self.xp, self.convolve_words, vq, eq) # (R, Q, E)
-    # contextual_ctx = contextual_convolve(self.xp, self.convolve_words, vctx, ectx) # (R, Ls, L, E)
-    # flat_cctx = F.reshape(contextual_ctx, (num_rules, -1, ectx.shape[-1])) # (R, Ls * L, E)
-    # cwords = F.concat([contextual_q, flat_cctx], 1) # (R, Q+Ls*L, E)
-    ###
-    flat_ctx = F.reshape(ectx, (num_rules, -1, ectx.shape[-1])) # (R, Ls * L, E)
-    cwords = F.concat([eq, flat_ctx], 1) # (R, Q+Ls*L, E)
-    # Add whether they appear in the answer as a featurec
-    # np.isin flattens second argument, so we need for loop
-    appearanswer = np.array([np.isin(ws, _va) for ws, _va in zip(words, va)]) # (R, Q+Ls*L)
-    appearanswer = appearanswer.astype(np.float32) # (R, Q+Ls*L)
-    allwords = F.concat([cwords, appearanswer[..., None]], -1) # (R, Q+Ls*L, E+1)
-    wordvars = self.isvariable_linear(allwords, n_batch_axes=2) # (R, Q+Ls*L, E)
-    wordvars = F.tanh(wordvars) # (R, Q+Ls*L, E)
-    wordvars = self.isvariable_score(wordvars, n_batch_axes=2) # (R, Q+Ls*L, 1)
-    wordvars = F.squeeze(wordvars, -1) # (R, Q+Ls*L)
-    # Merge word variable predictions
-    iswordvar = self.xp.zeros((num_rules, len(word2idx)), dtype=self.xp.float32) # (R, V)
-    iswordvar = F.scatter_add(iswordvar, (np.arange(num_rules)[:, None], words), wordvars) # (R, V)
-    iswordvar = F.sigmoid(iswordvar) # (R, V)
-    wordrange = np.arange(len(word2idx)) # (V,)
-    wordrange[0] = -1 # Null padding is never a variable
-    # np.isin flattens second argument, so we need for loop
-    mask = np.vstack([np.isin(wordrange, rws) for rws in words]) # (R, V)
-    iswordvar *= mask # (R, V)
-    # ---------------------------
-    # Tells whether a word is a variable or not
-    return iswordvar
 
 # ---------------------------
 
@@ -412,11 +352,9 @@ class Infer(C.Chain):
       self.mematt = MemAttention()
       # self.mematt = MemN2N()
       self.uni_linear = L.Linear(EMBED, EMBED, nobias=True)
-      self.rule_linear = L.Linear(8*EMBED, 4*EMBED)
-      self.rule_score = L.Linear(4*EMBED, 1)
+      self.rule_linear = L.Linear(EMBED, EMBED, nobias=True)
       self.answer_linear = L.Linear(EMBED, len(word2idx))
     # Setup rule repo
-    self.eye = self.xp.eye(len(word2idx), dtype=self.xp.float32) # (V, V)
     self.vrules = vectorise_stories(rule_stories) # (R, Ls, L), (R, Q), (R, A), (R, I)
     self.mrules = tuple([v != 0 for v in self.vrules[:-1]]) # (R, Ls, L), (R, Q), (R, A)
     self.log = None
@@ -516,9 +454,22 @@ class Infer(C.Chain):
     qstate *= rmq[..., None] # (B, R, Q, E)
     brvq = np.repeat(rvq[None, ...], qstate.shape[0], 0) # (B, R, Q)
     uni_cs = self.mematt.init_state(brvq, qstate) # (B, R, E)
-    # Assume one rule for now
-    uni_cs = uni_cs[:, 0] # (B, E)
     orig_cs = self.mematt.init_state(vq, eq) # (B, E)
+    # ---------------------------
+    # Compute rule attentions
+    num_rules = rvq.shape[0] # R
+    if num_rules > 1:
+      cs_feats = self.rule_linear(orig_cs) # (B, E)
+      ratt = cs_feats @ rs.T # (B, R)
+      ratt = F.softmax(ratt, -1) # (B, R)
+      self.tolog('ratt', ratt)
+    # ---------------------------
+    # Prepare unified state
+    if num_rules == 1:
+      uni_cs = uni_cs[:, 0] # (B, E)
+    else:
+      # (B, R) x (B, R, E)
+      uni_cs = F.einsum('ij,ijk->ik', ratt, uni_cs) # (B, E)
     uniloss = F.mean_squared_error(uni_cs, orig_cs) # ()
     self.tolog('uniloss', uniloss)
     # ---------------------------
@@ -558,9 +509,13 @@ class Infer(C.Chain):
       brvctx = np.repeat(rvctx[None, ...], bstate.shape[0], 0) # (B, R, Ls, L)
       mem_bstate = self.mematt.seq_embed(brvctx, bstate) # (B, R, Ls, E)
       uni_cs = self.mematt.update_state(uni_cs, body_att, brvctx, mem_bstate, t) # (B, R, E)
-      # Assume one rule for now
-      uni_cs = uni_cs[:, 0] # (B, E)
       orig_cs = self.mematt.update_state(orig_cs, orig_cands_att, vctx, mem_ectx, t) # (B, E)
+      # Apply rule attention
+      if num_rules == 1:
+        uni_cs = uni_cs[:, 0] # (B, E)
+      else:
+        # (B, R) x (B, R, E)
+        uni_cs = F.einsum('ij,ijk->ik', ratt, uni_cs) # (B, E)
       uniloss = F.mean_squared_error(uni_cs, orig_cs) # ()
       self.tolog('uniloss', uniloss)
     # ---------------------------
@@ -574,35 +529,7 @@ class Infer(C.Chain):
     opredloss = F.softmax_cross_entropy(opred, va[:,0]) # ()
     self.tolog('opredloss', opredloss)
     # prediction = cs @ self.mematt.embedAC[-1].W.T # (B, V)
-    # ---------------------------
-    # Compute rule attentions
-    num_rules = rvq.shape[0] # R
-    if num_rules == 1:
-      return prediction # (B, V)
-    # Rule features
-    rqfeats = seq_encode(rvq, erq) # (R, E)
-    rbfeats = seq_encode(rvctx, erctx) # (R, Ls, E)
-    rbfeats = F.sum(rbfeats, -2) # (R, E)
-    rfeats = F.concat([rqfeats, rbfeats], -1) # (R, 2*E)
-    # Story features
-    qfeats = seq_encode(vq, eq) # (B, E)
-    bfeats = seq_encode(vctx, ectx) # (B, Cs, E)
-    bfeats = F.sum(bfeats, -2) # (B, E)
-    feats = F.concat([qfeats, bfeats], -1) # (B, 2*E)
-    # Compute attention score
-    rfeats, feats = F.broadcast(rfeats[None, ...], feats[:, None, :]) # (B, R, 2*E)
-    allfeats = F.concat([rfeats, feats, rfeats*feats, rfeats+feats], -1) # (B, R, 4*2*E)
-    rule_atts = self.rule_linear(allfeats, n_batch_axes=2) # (B, R, 4*E)
-    rule_atts = F.tanh(rule_atts) # (B, R, 4*E)
-    rule_atts = self.rule_score(rule_atts, n_batch_axes=2) # (B, R, 1)
-    rule_atts = F.squeeze(rule_atts, -1) # (B, R)
-    rule_atts = F.softmax(rule_atts, -1) # (B, R)
-    # self.log['rule_atts'].append(rule_atts)
-    # ---------------------------
-    # Compute final rule attended answer
-    # (B, R) x (B, R, V)
-    final_prediction = F.einsum("ij,ijk->ik", rule_atts, prediction) # (B, V)
-    return final_prediction # (B, V)
+    return prediction
 
 # ---------------------------
 
@@ -685,7 +612,7 @@ trainer.extend(T.extensions.Evaluator(val_iter, cmodel, converter=converter, dev
 test_iter = C.iterators.SerialIterator(test_enc_stories, 128, repeat=False, shuffle=False)
 trainer.extend(T.extensions.Evaluator(test_iter, cmodel, converter=converter, device=-1), name='test')
 # trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_best.npz'), trigger=T.triggers.MinValueTrigger('validation/main/loss'))
-# trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_latest.npz'), trigger=(1, 'epoch'))
+trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_latest.npz'), trigger=(1, 'epoch'))
 trainer.extend(T.extensions.LogReport(log_name=ARGS.name+'_log.json'))
 # trainer.extend(T.extensions.LogReport(trigger=(1, 'iteration'), log_name=ARGS.name+'_log.json'))
 trainer.extend(T.extensions.FailOnNonNumber())
