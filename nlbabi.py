@@ -35,7 +35,7 @@ ARGS = parser.parse_args()
 EMBED = 32
 MAX_HIST = 250
 REPO_SIZE = 1
-ITERATIONS = 2
+ITERATIONS = None
 MINUS_INF = -100
 
 # ---------------------------
@@ -57,7 +57,6 @@ def load_task(fname):
         q, a, supps= sl.split('\t')
         idxs = list(context.keys())
         supps = [idxs.index(int(s)) for s in supps.split(' ')]
-        assert len(supps) <= ITERATIONS, "Not enough iterations for supporting facts."
         cctx = list(context.values())
         # cctx.reverse()
         ss.append({'context': cctx[:MAX_HIST], 'query': q,
@@ -67,8 +66,14 @@ def load_task(fname):
         context[sid] = sl
   return ss
 stories = load_task(ARGS.task)
+max_supps = max([len(s['supps']) for s in stories])
+if ITERATIONS is None:
+  ITERATIONS = max_supps
+else:
+  assert max_supps <= ITERATIONS, "Not enough iterations for supporting facts."
 train_stories, val_stories = train_test_split(stories, test_size=0.1)
 test_stories = load_task(ARGS.task.replace('train', 'test'))
+print("ITER:", ITERATIONS)
 print("TRAIN:", len(train_stories), "stories")
 print("VAL:", len(val_stories), "stories")
 print("TEST:", len(test_stories), "stories")
@@ -540,6 +545,7 @@ class Classifier(C.Chain):
   """Compute loss and accuracy of underlying model."""
   def __init__(self, predictor):
     super().__init__()
+    self.uniparam = 0.0
     with self.init_scope():
       self.predictor = predictor
 
@@ -574,7 +580,7 @@ class Classifier(C.Chain):
     uniloss = F.mean(uniloss) # ()
     # ---
     C.reporter.report({'loss': mainloss, 'vmap': vmaploss, 'uatt': uattloss, 'oatt': oattloss, 'ratt': rattloss, 'rpred': rpredloss, 'opred': opredloss, 'uni': uniloss, 'oacc': oacc, 'acc': acc}, self)
-    return mainloss + 0.1*vmaploss + uattloss + oattloss + rattloss + opredloss + rpredloss + uniloss # ()
+    return self.uniparam*(mainloss + 0.1*vmaploss + uattloss + uniloss) + oattloss + rattloss + opredloss + rpredloss # ()
 
 # ---------------------------
 
@@ -607,9 +613,15 @@ def converter(batch_stories, _):
   return (vctx, vq, vas, supps), vas[:, 0] # (B,)
 updater = T.StandardUpdater(train_iter, optimiser, converter=converter, device=-1)
 # trainer = T.Trainer(updater, T.triggers.EarlyStoppingTrigger())
-trainer = T.Trainer(updater, (200, 'epoch'))
+trainer = T.Trainer(updater, (300, 'epoch'))
 
 # Trainer extensions
+def enable_unification(trainer):
+  """Enable unification loss function in model."""
+  trainer.updater.get_optimizer('main').target.uniparam = 1.0
+trainer.extend(enable_unification, trigger=(20, 'epoch'))
+
+# Validation extensions
 val_iter = C.iterators.SerialIterator(val_enc_stories, 128, repeat=False, shuffle=False)
 trainer.extend(T.extensions.Evaluator(val_iter, cmodel, converter=converter, device=-1), name='val')
 test_iter = C.iterators.SerialIterator(test_enc_stories, 128, repeat=False, shuffle=False)
