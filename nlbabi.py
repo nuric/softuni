@@ -23,9 +23,10 @@ np.set_printoptions(suppress=True, precision=3, linewidth=180)
 # Arguments
 parser = argparse.ArgumentParser(description="Run NeuroLog on bAbI tasks.")
 parser.add_argument("task", help="File that contains task train.")
-parser.add_argument("--name", default="nlbabi", help="Name prefix for saving files etc.")
+parser.add_argument("name", help="Name prefix for saving files etc.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
 ARGS = parser.parse_args()
+print("TASK:", ARGS.task)
 
 # Debug
 # if ARGS.debug:
@@ -392,7 +393,8 @@ class Infer(C.Chain):
     # embedded_candidates.shape = (B, Cs, C, E)
     # ---------------------------
     # Setup masks
-    mask_candidates = (candidates == 0.0) # (B, Cs, C)
+    mask_toprove = (toprove != 0) # (R, Ps, P)
+    mask_candidates = (candidates == 0) # (B, Cs, C)
     sim_mask = mask_candidates.astype(np.float32) * MINUS_INF # (B, Cs, C)
     # ---------------------------
     # Calculate a match for every word in s1 to every word in s2
@@ -412,6 +414,7 @@ class Infer(C.Chain):
     # Calculate attended unified word representations for toprove
     raw_sims += sim_mask[:, None, None, None, ...] # (B, R, Ps, P, Cs, C)
     sim_weights = F.softmax(raw_sims, -1) # (B, R, Ps, P, Cs, C)
+    sim_weights *= mask_toprove[None, ..., None, None] # (B, R, Ps, P, Cs, C)
     # (B, R, Ps, P, Cs, C) x (B, Cs, C, E)
     unifications = F.einsum("ijklmn,imno->ijklmo", sim_weights, embedded_candidates) # (B, R, Ps, P, Cs, E)
     return unifications
