@@ -2,6 +2,7 @@
 import argparse
 import logging
 import os
+import json
 import signal
 import time
 from collections import OrderedDict
@@ -24,6 +25,8 @@ np.set_printoptions(suppress=True, precision=3, linewidth=180)
 parser = argparse.ArgumentParser(description="Run NeuroLog on bAbI tasks.")
 parser.add_argument("task", help="File that contains task train.")
 parser.add_argument("name", help="Name prefix for saving files etc.")
+parser.add_argument("-r", "--rules", default=3, type=int, help="Number of rules in repository.")
+parser.add_argument("-e", "--embed", default=32, type=int, help="Embedding size.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
 ARGS = parser.parse_args()
 print("TASK:", ARGS.task)
@@ -33,9 +36,9 @@ print("TASK:", ARGS.task)
   # logging.basicConfig(level=logging.DEBUG)
   # C.set_debug(True)
 
-EMBED = 32
+EMBED = ARGS.embed
 MAX_HIST = 250
-REPO_SIZE = 3
+REPO_SIZE = ARGS.rules
 ITERATIONS = None
 MINUS_INF = -100
 
@@ -75,7 +78,10 @@ else:
 train_stories, val_stories = train_test_split(stories, test_size=0.1)
 assert len(train_stories) > REPO_SIZE, "Not enough training stories to generate rules from."
 test_stories = load_task(ARGS.task.replace('train', 'test'))
+# Print general information
+print("EMBED:", EMBED)
 print("ITER:", ITERATIONS)
+print("REPO:", REPO_SIZE)
 print("TRAIN:", len(train_stories), "stories")
 print("VAL:", len(val_stories), "stories")
 print("TEST:", len(test_stories), "stories")
@@ -630,6 +636,14 @@ def enable_unification(trainer):
   """Enable unification loss function in model."""
   trainer.updater.get_optimizer('main').target.uniparam = 1.0
 trainer.extend(enable_unification, trigger=(20, 'epoch'))
+
+def log_vmap(trainer):
+  """Log inner properties to file."""
+  vmaplog = trainer.updater.get_optimizer('main').target.predictor.log['vmap'][0] # (V,)
+  logpath = os.path.join(trainer.out, ARGS.name + '_vmap.jsonl')
+  with open(logpath, 'a') as f:
+    f.write(str(trainer.updater.epoch) + "," + json.dumps(vmaplog.array.tolist()) + '\n')
+trainer.extend(log_vmap, trigger=(1, 'epoch'))
 
 # Validation extensions
 val_iter = C.iterators.SerialIterator(val_enc_stories, 128, repeat=False, shuffle=False)
