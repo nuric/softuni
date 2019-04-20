@@ -35,7 +35,7 @@ print("TASK:", ARGS.task)
 
 EMBED = 32
 MAX_HIST = 250
-REPO_SIZE = 1
+REPO_SIZE = 3
 ITERATIONS = None
 MINUS_INF = -100
 
@@ -73,6 +73,7 @@ if ITERATIONS is None:
 else:
   assert max_supps <= ITERATIONS, "Not enough iterations for supporting facts."
 train_stories, val_stories = train_test_split(stories, test_size=0.1)
+assert len(train_stories) > REPO_SIZE, "Not enough training stories to generate rules from."
 test_stories = load_task(ARGS.task.replace('train', 'test'))
 print("ITER:", ITERATIONS)
 print("TRAIN:", len(train_stories), "stories")
@@ -112,6 +113,7 @@ test_enc_stories = list(map(encode_story, test_stories))
 print("TEST VOCAB:", len(word2idx))
 print("ENC SAMPLE:", enc_stories[0])
 idx2word = {v:k for k, v in word2idx.items()}
+wordeye = np.eye(len(word2idx), dtype=np.float32)
 
 def decode_story(story):
   """Decode a given story back into words."""
@@ -339,9 +341,8 @@ class MemN2N(C.Chain):
 
 # ---------------------------
 class Embed:
-  W = np.eye(len(word2idx), dtype=np.float32)
   def __call__(self, x):
-    return F.embed_id(x, self.W, ignore_label=0)
+    return F.embed_id(x, wordeye, ignore_label=0)
 
 # Inference network
 class Infer(C.Chain):
@@ -586,15 +587,18 @@ class Classifier(C.Chain):
 # ---------------------------
 
 # Stories to generate rules from
-answers = set()
-rule_repo = list()
-# np.random.shuffle(enc_stories)
-for es in enc_stories:
-  if es['answers'][0] not in answers:
-    rule_repo.append(es)
-    answers.add(es['answers'][0])
-  if len(rule_repo) == REPO_SIZE:
-    break
+# Find k top dissimilar questions based on the bag of words
+qs_bow = [np.sum(wordeye[s['query']], 0) for s in train_enc_stories] # T x (V,)
+qs_bow = np.vstack(qs_bow) # (T, V)
+qs_bow /= np.linalg.norm(qs_bow, axis=-1, keepdims=True) # (T, V)
+qs_sims = qs_bow @ qs_bow.T # (T, T)
+# Start with first story
+rule_idxs = [0]
+while len(rule_idxs) < REPO_SIZE:
+  dsims = qs_sims[rule_idxs].T # (T, R)
+  dsims = np.mean(dsims, -1) # (T,)
+  rule_idxs.append(np.argmin(dsims))
+rule_repo = [train_enc_stories[i] for i in rule_idxs] # R x
 print("RULE REPO:", rule_repo)
 
 # ---------------------------
