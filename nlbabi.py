@@ -218,6 +218,7 @@ class MemAttention(C.Chain):
       self.att_linear = L.Linear(4*EMBED, EMBED)
       self.att_birnn = L.NStepBiGRU(1, EMBED, EMBED, self.drop)
       self.att_score = L.Linear(2*EMBED, 1)
+      self.state_linear = L.Linear(4*EMBED, EMBED)
 
   def seq_rnn_embed(self, vxs, exs):
     """Embed given sequences using rnn."""
@@ -281,7 +282,10 @@ class MemAttention(C.Chain):
     # vmemory.shape == (..., Ms, M)
     # ememory.shape == (..., Ms, E)
     # (..., Ms) x (..., Ms, E) -> (..., E)
-    new_state = F.einsum("...i,...ij->...j", mem_att, ememory) # (..., E)
+    mem_slot = F.einsum("...i,...ij->...j", mem_att, ememory) # (..., E)
+    merged = F.concat([oldstate, mem_slot, oldstate*mem_slot, F.squared_difference(oldstate, mem_slot)], -1) # (..., 3*E)
+    new_state = self.state_linear(merged, n_batch_axes=len(merged.shape)-1) # (..., E)
+    new_state = F.tanh(new_state) # (..., E)
     new_state = F.dropout(new_state, self.drop) # (..., E)
     return new_state
 
@@ -515,6 +519,7 @@ class Infer(C.Chain):
       body_att = F.broadcast_to(body_att, bstate.shape[:3]) # (B, R, Ls)
       brvctx = np.repeat(rvctx[None, ...], bstate.shape[0], 0) # (B, R, Ls, L)
       mem_bstate = self.mematt.seq_embed(brvctx, bstate) # (B, R, Ls, E)
+      uni_cs = F.repeat(uni_cs[:, None], num_rules, 1) # (B, R, E)
       uni_cs = self.mematt.update_state(uni_cs, body_att, brvctx, mem_bstate, t) # (B, R, E)
       orig_cs = self.mematt.update_state(orig_cs, orig_cands_att, vctx, mem_ectx, t) # (B, E)
       # Apply rule attention
