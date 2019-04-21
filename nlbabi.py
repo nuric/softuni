@@ -29,6 +29,7 @@ parser.add_argument("-r", "--rules", default=3, type=int, help="Number of rules 
 parser.add_argument("-e", "--embed", default=32, type=int, help="Embedding size.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
 parser.add_argument("-t", "--tsize", default=0, type=int, help="Training size, 0 means use everything.")
+parser.add_argument("-s", "--strong", default=1.0, type=float, help="Strong supervision ratio.")
 ARGS = parser.parse_args()
 print("TASK:", ARGS.task)
 
@@ -80,6 +81,7 @@ test_stories = load_task(ARGS.task.replace('train', 'test'))
 # Print general information
 print("EMBED:", EMBED)
 print("ITER:", ITERATIONS)
+print("STRONG:", ARGS.strong)
 print("REPO:", REPO_SIZE)
 print("TRAIN:", len(stories), "stories")
 print("TEST:", len(test_stories), "stories")
@@ -601,7 +603,7 @@ class Classifier(C.Chain):
     uniloss = F.mean(uniloss) # ()
     # ---
     C.reporter.report({'loss': mainloss, 'vmap': vmaploss, 'uatt': uattloss, 'oatt': oattloss, 'ratt': rattloss, 'rpred': rpredloss, 'opred': opredloss, 'uni': uniloss, 'oacc': oacc, 'acc': acc}, self)
-    return self.uniparam*(mainloss + 0.1*vmaploss + uattloss + uniloss) + oattloss + rattloss + opredloss + rpredloss # ()
+    return self.uniparam*(mainloss + 0.1*vmaploss + ARGS.strong*uattloss + uniloss) + ARGS.strong*oattloss + ARGS.strong*rattloss + opredloss + rpredloss # ()
 
 # ---------------------------
 
