@@ -28,6 +28,7 @@ parser.add_argument("name", help="Name prefix for saving files etc.")
 parser.add_argument("-r", "--rules", default=3, type=int, help="Number of rules in repository.")
 parser.add_argument("-e", "--embed", default=32, type=int, help="Embedding size.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
+parser.add_argument("-t", "--tsize", default=0, type=int, help="Training size, 0 means use everything.")
 ARGS = parser.parse_args()
 print("TASK:", ARGS.task)
 
@@ -75,15 +76,12 @@ if ITERATIONS is None:
   ITERATIONS = max_supps
 else:
   assert max_supps <= ITERATIONS, "Not enough iterations for supporting facts."
-train_stories, val_stories = train_test_split(stories, test_size=0.1)
-assert len(train_stories) > REPO_SIZE, "Not enough training stories to generate rules from."
 test_stories = load_task(ARGS.task.replace('train', 'test'))
 # Print general information
 print("EMBED:", EMBED)
 print("ITER:", ITERATIONS)
 print("REPO:", REPO_SIZE)
-print("TRAIN:", len(train_stories), "stories")
-print("VAL:", len(val_stories), "stories")
+print("TRAIN:", len(stories), "stories")
 print("TEST:", len(test_stories), "stories")
 print("SAMPLE:", stories[0])
 
@@ -100,7 +98,7 @@ def tokenise(text, filters='!"#$%&()*+,-./;<=>?@[\\]^_`{|}~\t\n', split=' '):
   return [i for i in seq if i]
 
 # Word indices
-word2idx = {'unk':0}
+word2idx = {'pad':0}
 
 # Encode stories
 def encode_story(story):
@@ -113,13 +111,23 @@ def encode_story(story):
   return es
 enc_stories = list(map(encode_story, stories))
 print("TRAIN VOCAB:", len(word2idx))
-train_enc_stories = list(map(encode_story, train_stories))
-val_enc_stories = list(map(encode_story, val_stories))
 test_enc_stories = list(map(encode_story, test_stories))
 print("TEST VOCAB:", len(word2idx))
 print("ENC SAMPLE:", enc_stories[0])
 idx2word = {v:k for k, v in word2idx.items()}
 wordeye = np.eye(len(word2idx), dtype=np.float32)
+
+# Prepare training validation sets
+if ARGS.tsize != 0:
+  assert ARGS.tsize < len(enc_stories), "Not enough examples for training size."
+  tratio = (len(enc_stories)-ARGS.tsize) / 1000
+  train_enc_stories, val_enc_stories = train_test_split(enc_stories, test_size=tratio)
+  while len(train_enc_stories) < 900:
+    train_enc_stories.append(np.random.choice(train_enc_stories))
+else:
+  train_enc_stories, val_enc_stories = train_test_split(enc_stories, test_size=0.1)
+assert len(train_enc_stories) > REPO_SIZE, "Not enough training stories to generate rules from."
+print("TRAIN-VAL:", len(train_enc_stories), '-', len(val_enc_stories))
 
 def decode_story(story):
   """Decode a given story back into words."""
@@ -608,7 +616,11 @@ rule_idxs = [0]
 while len(rule_idxs) < REPO_SIZE:
   dsims = qs_sims[rule_idxs].T # (T, R)
   dsims = np.mean(dsims, -1) # (T,)
-  rule_idxs.append(np.argmin(dsims))
+  sidxs = np.argsort(dsims) # (T,)
+  # Select a new dissimilar story
+  sargmax = np.argmax(np.isin(sidxs, rule_idxs, invert=True))
+  sidx = sidxs[sargmax]
+  rule_idxs.append(sidx)
 rule_repo = [train_enc_stories[i] for i in rule_idxs] # R x
 print("RULE REPO:", rule_repo)
 
