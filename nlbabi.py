@@ -42,6 +42,7 @@ EMBED = ARGS.embed
 MAX_HIST = 250
 REPO_SIZE = ARGS.rules
 ITERATIONS = None
+DROPOUT = 0.1
 MINUS_INF = -100
 
 # ---------------------------
@@ -100,7 +101,7 @@ def tokenise(text, filters='!"#$%&()*+,-./;<=>?@[\\]^_`{|}~\t\n', split=' '):
   return [i for i in seq if i]
 
 # Word indices
-word2idx = {'pad':0}
+word2idx = {'pad': 0, 'unk': 1}
 
 # Encode stories
 def encode_story(story):
@@ -150,27 +151,24 @@ def vectorise_stories(encoded_stories, noise=False):
     ctx_maxlen = max(ctx_maxlen, c_maxlen)
     q_maxlen = max(q_maxlen, len(s['query']))
     a_maxlen = max(a_maxlen, len(s['answers']))
-  max_noise = 0
-  if noise:
-    max_noise = max_ctxlen // 10 # 10 percent noise
   # Vectorise stories
-  vctx = np.zeros((len(encoded_stories), max_ctxlen+max_noise, ctx_maxlen), dtype=np.int32) # (B, Cs, C)
+  vctx = np.zeros((len(encoded_stories), max_ctxlen, ctx_maxlen), dtype=np.int32) # (B, Cs, C)
   vq = np.zeros((len(encoded_stories), q_maxlen), dtype=np.int32) # (B, Q)
   vas = np.zeros((len(encoded_stories), a_maxlen), dtype=np.int32) # (B, A)
   supps = np.zeros((len(encoded_stories), ITERATIONS), dtype=np.int32) # (B, I)
   for i, s in enumerate(encoded_stories):
-    offset = 0
     vq[i,:len(s['query'])] = s['query']
-    # who = s['query'][-1]
-    # what = [c[-1] for c in s['context'] if c[0] == who]
-    # target = [c[0] for c in s['context'] if c[-1] == what and c[0] != who]
     vas[i,:len(s['answers'])] = s['answers']
-    # vas[i,:len(s['answers'])] = what
     supps[i] = np.pad(s['supps'], (0, ITERATIONS-s['supps'].size), 'edge')
     for j, c in enumerate(s['context']):
-      if offset < max_noise and np.random.rand() < 0.1:
-        offset += 1
-      vctx[i,j+offset,:len(c)] = c
+      vctx[i,j,:len(c)] = c
+    # At random convert a symbol to unknown within a story
+    if noise and np.random.rand() < DROPOUT:
+      words = np.unique(np.concatenate((s['query'], s['answers'], *s['context'])))
+      rword = np.random.choice(words)
+      vctx[i, vctx[i] == rword] = 1
+      vq[i, vq[i] == rword] = 1
+      vas[i, vas[i] == rword] = 1
   return vctx, vq, vas, supps
 
 # ---------------------------
@@ -221,6 +219,32 @@ def contextual_convolve(backend, convolution, vxs, exs):
   contextual *= mask[..., None] # (B, ..., S, E)
   return contextual
 
+def seq_rnn_embed(vxs, exs, birnn, return_seqs=False):
+  """Embed given sequences using rnn."""
+  # vxs.shape == (..., S)
+  # exs.shape == (..., S, E)
+  lengths = np.sum(vxs != 0, -1).flatten() # (X,)
+  seqs = F.reshape(exs, (-1,)+exs.shape[-2:]) # (X, S, E)
+  toembed = [s[..., :l, :] for s, l in zip(F.separate(seqs, 0), lengths) if l != 0] # Y x [(S1, E), (S2, E), ...]
+  hs, ys = birnn(None, toembed) # (2, Y, E), Y x [(S1, 2*E), (S2, 2*E), ...]
+  if return_seqs:
+    ys = F.pad_sequence(ys) # (Y, S, 2*E)
+    ys = F.reshape(ys, ys.shape[:-1] + (2, EMBED)) # (Y, S, 2, E)
+    ys = F.mean(ys, -2) # (Y, S, E)
+    embeds = np.zeros((lengths.size, vxs.shape[-1], EMBED), dtype=np.float32) # (X, S, E)
+    idxs = np.nonzero(lengths) # (Y,)
+    embeds = F.scatter_add(embeds, idxs, ys) # (X, S, E)
+    embeds = F.reshape(embeds, exs.shape) # (..., S, E)
+    return embeds # (..., S, E)
+  else:
+    hs = F.mean(hs, 0) # (Y, E)
+    # Add zero values back to match original shape
+    embeds = np.zeros((lengths.size, EMBED), dtype=np.float32) # (X, E)
+    idxs = np.nonzero(lengths) # (Y,)
+    embeds = F.scatter_add(embeds, idxs, hs) # (X, E)
+    embeds = F.reshape(embeds, vxs.shape[:-1] + (EMBED,)) # (..., E)
+    return embeds # (..., E)
+
 # ---------------------------
 
 # Memory querying component
@@ -228,43 +252,26 @@ class MemAttention(C.Chain):
   """Computes attention over memory components given query."""
   def __init__(self):
     super().__init__()
-    self.drop = 0.1
     with self.init_scope():
-      self.seq_birnn = L.NStepBiGRU(1, EMBED, EMBED, self.drop)
+      self.seq_birnn = L.NStepBiGRU(1, EMBED, EMBED, DROPOUT)
       self.att_linear = L.Linear(4*EMBED, EMBED)
-      self.att_birnn = L.NStepBiGRU(1, EMBED, EMBED, self.drop)
+      self.att_birnn = L.NStepBiGRU(1, EMBED, EMBED, DROPOUT)
       self.att_score = L.Linear(2*EMBED, 1)
       self.state_linear = L.Linear(4*EMBED, EMBED)
-
-  def seq_rnn_embed(self, vxs, exs):
-    """Embed given sequences using rnn."""
-    # vxs.shape == (..., S)
-    # exs.shape == (..., S, E)
-    lengths = np.sum(vxs != 0, -1).flatten() # (X,)
-    seqs = F.reshape(exs, (-1,)+exs.shape[-2:]) # (X, S, E)
-    toembed = [s[..., :l, :] for s, l in zip(F.separate(seqs, 0), lengths) if l != 0] # B x [(S1, E), (S2, E), ...]
-    hs, _ = self.seq_birnn(None, toembed) # (2, Y, E)
-    hs = F.mean(hs, 0) # (Y, E)
-    # Add zero values back to match original shape
-    embeds = self.xp.zeros((lengths.size, EMBED), dtype=self.xp.float32) # (X, E)
-    idxs = np.nonzero(lengths) # (Y,)
-    embeds = F.scatter_add(embeds, idxs, hs) # (X, E)
-    embeds = F.reshape(embeds, vxs.shape[:-1] + (EMBED,)) # (..., E)
-    return embeds
 
   def seq_embed(self, vxs, exs):
     """Embed a given sequence."""
     # vxs.shape == (..., S)
     # exs.shape == (..., S, E)
     # return pos_encode(vxs, exs)
-    return self.seq_rnn_embed(vxs, exs)
+    return seq_rnn_embed(vxs, exs, self.seq_birnn)
 
   def init_state(self, vq, eq):
     """Initialise given state."""
     # vq.shape == (..., S)
     # eq.shape == (..., S, E)
     s = self.seq_embed(vq, eq) # (..., E)
-    s = F.dropout(s, self.drop) # (..., E)
+    s = F.dropout(s, DROPOUT) # (..., E)
     return s # (..., E)
 
   def forward(self, equery, vmemory, ememory, mask=None, iteration=0):
@@ -279,7 +286,7 @@ class MemAttention(C.Chain):
     merged = F.concat([eq, ememory, eq*ememory, F.squared_difference(eq, ememory)], -1) # (..., Ms, 4*E)
     inter = self.att_linear(merged, n_batch_axes=len(vmemory.shape)-1) # (..., Ms, E)
     inter = F.tanh(inter) # (..., Ms, E)
-    inter = F.dropout(inter, self.drop) # (..., Ms, E)
+    inter = F.dropout(inter, DROPOUT) # (..., Ms, E)
     # Split into sentences
     lengths = np.sum(np.any((vmemory != 0), -1), -1) # (...,)
     mems = [s[..., :l, :] for s, l in zip(F.separate(inter, 0), lengths)] # B x [(M1, E), (M2, E), ...]
@@ -302,7 +309,7 @@ class MemAttention(C.Chain):
     merged = F.concat([oldstate, mem_slot, oldstate*mem_slot, F.squared_difference(oldstate, mem_slot)], -1) # (..., 3*E)
     new_state = self.state_linear(merged, n_batch_axes=len(merged.shape)-1) # (..., E)
     new_state = F.tanh(new_state) # (..., E)
-    new_state = F.dropout(new_state, self.drop) # (..., E)
+    new_state = F.dropout(new_state, DROPOUT) # (..., E)
     return new_state
 
 # ---------------------------
@@ -378,6 +385,7 @@ class Infer(C.Chain):
       self.vmap_params = C.Parameter(0.0, (len(self.rule_stories), len(word2idx)), name='vmap_params')
       self.mematt = MemAttention()
       # self.mematt = MemN2N()
+      self.uni_birnn = L.NStepBiGRU(1, EMBED, EMBED, DROPOUT)
       self.uni_linear = L.Linear(EMBED, EMBED, nobias=True)
       self.rule_linear = L.Linear(EMBED, EMBED, nobias=True)
       self.answer_linear = L.Linear(EMBED, len(word2idx))
@@ -422,9 +430,11 @@ class Infer(C.Chain):
     # Compute contextual representations
     # contextual_toprove = contextual_convolve(self.xp, self.convolve_words, toprove, groundtoprove) # (R, Ps, P, E)
     # contextual_candidates = contextual_convolve(self.xp, self.convolve_words, candidates, embedded_candidates) # (B, Cs, C, E)
-    contextual_toprove = embedded_toprove # (R, Ps, P, E)
-    # contextual_toprove = self.uni_linear(embedded_toprove, n_batch_axes=3) # (R, Ps, P, E)
-    contextual_candidates = self.uni_linear(embedded_candidates, n_batch_axes=3) # (B, Cs, C, E)
+    # contextual_toprove = embedded_toprove # (R, Ps, P, E)
+    contextual_toprove = seq_rnn_embed(toprove, embedded_toprove, self.uni_birnn, True) # (R, Ps, P, E)
+    contextual_toprove = self.uni_linear(contextual_toprove, n_batch_axes=3) # (R, Ps, P, E)
+    contextual_candidates = seq_rnn_embed(candidates, embedded_candidates, self.uni_birnn, True) # (B, Cs, C, E)
+    contextual_candidates = self.uni_linear(contextual_candidates, n_batch_axes=3) # (B, Cs, C, E)
     # contextual_toprove = F.normalize(contextual_toprove, axis=-1) # (B, R, Ps, P, E)
     # contextual_candidates = F.normalize(contextual_candidates, axis=-1) # (B, Cs, C, E)
     # Compute similarity between every provable symbol and candidate symbol
@@ -639,7 +649,7 @@ optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
 train_iter = C.iterators.SerialIterator(train_enc_stories, 64)
 def converter(batch_stories, _):
   """Coverts given batch to expected format for Classifier."""
-  vctx, vq, vas, supps = vectorise_stories(batch_stories, noise=False) # (B, Cs, C), (B, Q), (B, A)
+  vctx, vq, vas, supps = vectorise_stories(batch_stories, noise=True) # (B, Cs, C), (B, Q), (B, A)
   return (vctx, vq, vas, supps), vas[:, 0] # (B,)
 updater = T.StandardUpdater(train_iter, optimiser, converter=converter, device=-1)
 # trainer = T.Trainer(updater, T.triggers.EarlyStoppingTrigger())
@@ -706,17 +716,19 @@ print("RULE PARAMS:", model.log)
 # Extra inspection if we are debugging
 if ARGS.debug:
   for test_story in test_enc_stories:
+    test_story_in, test_story_answer = converter([test_story], None)
     with C.using_config('train', False):
-      answer = model(converter([test_story], None)[0])
+      answer = model(test_story_in)
     prediction = np.argmax(answer.array)
-    expected = test_story['answers'][0]
+    expected = test_story_answer[0]
     if prediction != expected:
       print(decode_story(test_story))
+      print(test_story_in)
       print(f"Expected {expected} '{idx2word[expected]}' got {prediction} '{idx2word[prediction]}'.")
       print(model.log)
       import ipdb; ipdb.set_trace()
       with C.using_config('train', False):
-        answer = model(converter([test_story], None)[0])
+        answer = model(test_story_in)
   print(decode_story(test_story))
   print(f"Expected {expected} '{idx2word[expected]}' got {prediction} '{idx2word[prediction]}'.")
   print(model.log)
