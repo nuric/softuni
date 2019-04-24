@@ -258,18 +258,21 @@ def contextual_convolve(backend, convolution, vxs, exs):
   contextual *= mask[..., None] # (B, ..., S, E)
   return contextual
 
-def seq_rnn_embed(vxs, exs, birnn, return_seqs=False, init_state=None):
+def seq_rnn_embed(vxs, exs, birnn, return_seqs=False):
   """Embed given sequences using rnn."""
   # vxs.shape == (..., S)
   # exs.shape == (..., S, E)
   lengths = np.sum(vxs != 0, -1).flatten() # (X,)
   seqs = F.reshape(exs, (-1,)+exs.shape[-2:]) # (X, S, E)
   toembed = [s[..., :l, :] for s, l in zip(F.separate(seqs, 0), lengths) if l != 0] # Y x [(S1, E), (S2, E), ...]
-  hs, ys = birnn(init_state, toembed) # (2, Y, E), Y x [(S1, 2*E), (S2, 2*E), ...]
+  hs, ys = birnn(None, toembed) # (2, Y, E), Y x [(S1, 2*E), (S2, 2*E), ...]
   if return_seqs:
     ys = F.pad_sequence(ys) # (Y, S, 2*E)
     ys = F.reshape(ys, ys.shape[:-1] + (2, EMBED)) # (Y, S, 2, E)
     ys = F.mean(ys, -2) # (Y, S, E)
+    if ys.shape[0] == lengths.size:
+      ys = F.reshape(ys, exs.shape) # (..., S, E)
+      return ys
     embeds = np.zeros((lengths.size, vxs.shape[-1], EMBED), dtype=np.float32) # (X, S, E)
     idxs = np.nonzero(lengths) # (Y,)
     embeds = F.scatter_add(embeds, idxs, ys) # (X, S, E)
@@ -277,6 +280,9 @@ def seq_rnn_embed(vxs, exs, birnn, return_seqs=False, init_state=None):
     return embeds # (..., S, E)
   else:
     hs = F.mean(hs, 0) # (Y, E)
+    if hs.shape[0] == lengths.size:
+      hs = F.reshape(hs, vxs.shape[:-1] + (EMBED,)) # (..., E)
+      return hs
     # Add zero values back to match original shape
     embeds = np.zeros((lengths.size, EMBED), dtype=np.float32) # (X, E)
     idxs = np.nonzero(lengths) # (Y,)
@@ -297,6 +303,7 @@ class MemAttention(C.Chain):
       self.att_birnn = L.NStepBiGRU(1, EMBED, EMBED, DROPOUT)
       self.att_score = L.Linear(2*EMBED, 1)
       self.state_linear = L.Linear(4*EMBED, EMBED)
+      # self.state_update = L.Linear(2*EMBED, EMBED)
 
   def seq_embed(self, vxs, exs):
     """Embed a given sequence."""
@@ -348,6 +355,8 @@ class MemAttention(C.Chain):
     merged = F.concat([oldstate, mem_slot, oldstate*mem_slot, F.squared_difference(oldstate, mem_slot)], -1) # (..., 3*E)
     new_state = self.state_linear(merged, n_batch_axes=len(merged.shape)-1) # (..., E)
     new_state = F.tanh(new_state) # (..., E)
+    # new_state = self.state_update(new_state, n_batch_axes=len(new_state.shape)-1) # (..., E)
+    # new_state = F.tanh(new_state) # (..., E)
     new_state = F.dropout(new_state, DROPOUT) # (..., E)
     return new_state
 
