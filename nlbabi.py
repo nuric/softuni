@@ -30,6 +30,7 @@ parser.add_argument("-e", "--embed", default=32, type=int, help="Embedding size.
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
 parser.add_argument("-t", "--tsize", default=0, type=int, help="Training size, 0 means use everything.")
 parser.add_argument("-s", "--strong", default=1.0, type=float, help="Strong supervision ratio.")
+parser.add_argument("-i", "--iter", default=0, type=int, help="Number of iterations, default 0 for minimum required.")
 ARGS = parser.parse_args()
 print("TASK:", ARGS.task)
 
@@ -41,15 +42,17 @@ print("TASK:", ARGS.task)
 EMBED = ARGS.embed
 MAX_HIST = 250
 REPO_SIZE = ARGS.rules
-ITERATIONS = None
+ITERATIONS = ARGS.iter
 DROPOUT = 0.1
+BABI = 'qa' in ARGS.task
+DEEPLOGIC = not BABI
 MINUS_INF = -100
 
 # ---------------------------
 
-def load_task(fname):
+def load_babi_task(fname):
   """Load task stories from given file name."""
-  ss = []
+  ss = list()
   with open(fname) as f:
     context = OrderedDict()
     for line in f:
@@ -72,13 +75,43 @@ def load_task(fname):
         # Just a statement
         context[sid] = sl
   return ss
-stories = load_task(ARGS.task)
-max_supps = max([len(s['supps']) for s in stories])
-if ITERATIONS is None:
-  ITERATIONS = max_supps
-else:
-  assert max_supps <= ITERATIONS, "Not enough iterations for supporting facts."
-test_stories = load_task(ARGS.task.replace('train', 'test'))
+
+def load_deeplogic_task(fname):
+  """Load logic programs from given file name."""
+  def process_rule(r):
+    """Apply formatting to rule."""
+    return r.replace('.', '').replace('(', ' ( ').replace(')', ' )').replace(':-', ' < ').replace(';', ' ; ').replace(',', ' , ')
+  ss = list()
+  with open(fname) as f:
+    ctx, isnew_ctx = list(), False
+    for l in f:
+      l = l.strip()
+      if l and l[0] == '?':
+        _, q, t = l.split()
+        ss.append({'context': ctx.copy(), 'query': process_rule(q),
+                   'answers': [t], 'supps': np.random.choice(len(ctx), size=ITERATIONS or 4)})
+        isnew_ctx = True
+      else:
+        if isnew_ctx:
+          ctx = list()
+          isnew_ctx = False
+        ctx.append(process_rule(l))
+  return ss
+
+if BABI:
+  # We have a bAbI task
+  stories = load_babi_task(ARGS.task)
+  max_supps = max([len(s['supps']) for s in stories])
+  if not ITERATIONS:
+    ITERATIONS = max_supps
+  else:
+    assert max_supps <= ITERATIONS, "Not enough iterations for supporting facts."
+  test_stories = load_babi_task(ARGS.task.replace('train', 'test'))
+elif DEEPLOGIC:
+  # We have a deeplogic task
+  stories = load_deeplogic_task(ARGS.task)
+  ITERATIONS = ITERATIONS or 4
+  test_stories = load_deeplogic_task(ARGS.task.replace('train', 'test'))
 # Print general information
 print("EMBED:", EMBED)
 print("ITER:", ITERATIONS)
@@ -93,15 +126,19 @@ print("SAMPLE:", stories[0])
 # Tokenisation of sentences
 def tokenise(text, filters='!"#$%&()*+,-./;<=>?@[\\]^_`{|}~\t\n', split=' '):
   """Lower case naive space based tokeniser."""
-  text = text.lower()
-  translate_dict = dict((c, split) for c in filters)
-  translate_map = str.maketrans(translate_dict)
-  text = text.translate(translate_map)
+  if BABI:
+    text = text.lower()
+    translate_dict = dict((c, split) for c in filters)
+    translate_map = str.maketrans(translate_dict)
+    text = text.translate(translate_map)
   seq = text.split(split)
   return [i for i in seq if i]
 
 # Word indices
 word2idx = {'pad': 0, 'unk': 1}
+if DEEPLOGIC:
+  word2idx['0'] = 2
+  word2idx['1'] = 3
 
 # Encode stories
 def encode_story(story):
@@ -160,6 +197,8 @@ def vectorise_stories(encoded_stories, noise=False):
     vq[i,:len(s['query'])] = s['query']
     vas[i,:len(s['answers'])] = s['answers']
     supps[i] = np.pad(s['supps'], (0, ITERATIONS-s['supps'].size), 'edge')
+    if DEEPLOGIC:
+      np.random.shuffle(s['context'])
     for j, c in enumerate(s['context']):
       vctx[i,j,:len(c)] = c
     # At random convert a symbol to unknown within a story
@@ -219,14 +258,14 @@ def contextual_convolve(backend, convolution, vxs, exs):
   contextual *= mask[..., None] # (B, ..., S, E)
   return contextual
 
-def seq_rnn_embed(vxs, exs, birnn, return_seqs=False):
+def seq_rnn_embed(vxs, exs, birnn, return_seqs=False, init_state=None):
   """Embed given sequences using rnn."""
   # vxs.shape == (..., S)
   # exs.shape == (..., S, E)
   lengths = np.sum(vxs != 0, -1).flatten() # (X,)
   seqs = F.reshape(exs, (-1,)+exs.shape[-2:]) # (X, S, E)
   toembed = [s[..., :l, :] for s, l in zip(F.separate(seqs, 0), lengths) if l != 0] # Y x [(S1, E), (S2, E), ...]
-  hs, ys = birnn(None, toembed) # (2, Y, E), Y x [(S1, 2*E), (S2, 2*E), ...]
+  hs, ys = birnn(init_state, toembed) # (2, Y, E), Y x [(S1, 2*E), (S2, 2*E), ...]
   if return_seqs:
     ys = F.pad_sequence(ys) # (Y, S, 2*E)
     ys = F.reshape(ys, ys.shape[:-1] + (2, EMBED)) # (Y, S, 2, E)
@@ -612,14 +651,23 @@ class Classifier(C.Chain):
     uniloss = F.hstack(self.predictor.log['uniloss']) # (I+1,)
     uniloss = F.mean(uniloss) # ()
     # ---
-    C.reporter.report({'loss': mainloss, 'vmap': vmaploss, 'uatt': uattloss, 'oatt': oattloss, 'ratt': rattloss, 'rpred': rpredloss, 'opred': opredloss, 'uni': uniloss, 'oacc': oacc, 'acc': acc}, self)
-    return self.uniparam*(mainloss + 0.1*vmaploss + ARGS.strong*uattloss + uniloss) + ARGS.strong*oattloss + ARGS.strong*rattloss + opredloss + rpredloss # ()
+    C.report({'loss': mainloss, 'vmap': vmaploss, 'rpred': rpredloss, 'opred': opredloss, 'uni': uniloss, 'oacc': oacc, 'acc': acc}, self)
+    if BABI:
+      C.report({'uatt': uattloss, 'oatt': oattloss, 'ratt': rattloss}, self)
+    return self.uniparam*(mainloss + 0.1*vmaploss + ARGS.strong*uattloss + uniloss) + ARGS.strong*(oattloss + rattloss) + opredloss + rpredloss # ()
 
 # ---------------------------
 
 # Stories to generate rules from
 # Find k top dissimilar questions based on the bag of words
-qs_bow = [np.sum(wordeye[s['query']], 0) for s in train_enc_stories] # T x (V,)
+if BABI:
+  rule_enc_stories = train_enc_stories # All stories are possible rules
+else:
+  # We will only induce positive examples to rules following semantics of entailment
+  rule_enc_stories = [s for s in train_enc_stories if s['answers'][0] == word2idx['1'] and np.unique(s['query']).size == s['query'].size]
+  assert len(rule_enc_stories) >= REPO_SIZE, "Not enough valid rule stories to choose from."
+print("VALID RULES:", len(rule_enc_stories))
+qs_bow = [np.sum(wordeye[s['query']], 0) for s in rule_enc_stories] # T x (V,)
 qs_bow = np.vstack(qs_bow) # (T, V)
 qs_bow /= np.linalg.norm(qs_bow, axis=-1, keepdims=True) # (T, V)
 qs_sims = qs_bow @ qs_bow.T # (T, T)
@@ -633,7 +681,7 @@ while len(rule_idxs) < REPO_SIZE:
   sargmax = np.argmax(np.isin(sidxs, rule_idxs, invert=True))
   sidx = sidxs[sargmax]
   rule_idxs.append(sidx)
-rule_repo = [train_enc_stories[i] for i in rule_idxs] # R x
+rule_repo = [rule_enc_stories[i] for i in rule_idxs] # R x
 print("RULE REPO:", rule_repo)
 
 # ---------------------------
@@ -649,7 +697,7 @@ optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
 train_iter = C.iterators.SerialIterator(train_enc_stories, 64)
 def converter(batch_stories, _):
   """Coverts given batch to expected format for Classifier."""
-  vctx, vq, vas, supps = vectorise_stories(batch_stories, noise=True) # (B, Cs, C), (B, Q), (B, A)
+  vctx, vq, vas, supps = vectorise_stories(batch_stories, noise=False) # (B, Cs, C), (B, Q), (B, A)
   return (vctx, vq, vas, supps), vas[:, 0] # (B,)
 updater = T.StandardUpdater(train_iter, optimiser, converter=converter, device=-1)
 # trainer = T.Trainer(updater, T.triggers.EarlyStoppingTrigger())
