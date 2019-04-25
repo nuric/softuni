@@ -87,9 +87,13 @@ def load_deeplogic_task(fname):
     for l in f:
       l = l.strip()
       if l and l[0] == '?':
-        _, q, t = l.split()
+        _, q, t, supps = l.split(' ')
+        supps = [int(s) for s in supps.split(',')]
+        if -1 in supps:
+          # Ensure partial supervision
+          assert len(set(supps[supps.index(-1):])) == 1, "Backtracking supervision in deeplogic task."
         ss.append({'context': ctx.copy(), 'query': process_rule(q),
-                   'answers': [t], 'supps': np.random.choice(len(ctx), size=ITERATIONS or 4)})
+                   'answers': [t], 'supps': supps})
         isnew_ctx = True
       else:
         if isnew_ctx:
@@ -98,20 +102,15 @@ def load_deeplogic_task(fname):
         ctx.append(process_rule(l))
   return ss
 
-if BABI:
-  # We have a bAbI task
-  stories = load_babi_task(ARGS.task)
-  max_supps = max([len(s['supps']) for s in stories])
-  if not ITERATIONS:
-    ITERATIONS = max_supps
-  else:
-    assert max_supps <= ITERATIONS, "Not enough iterations for supporting facts."
-  test_stories = load_babi_task(ARGS.task.replace('train', 'test'))
-elif DEEPLOGIC:
-  # We have a deeplogic task
-  stories = load_deeplogic_task(ARGS.task)
-  ITERATIONS = ITERATIONS or 4
-  test_stories = load_deeplogic_task(ARGS.task.replace('train', 'test'))
+loadf = load_babi_task if BABI else load_deeplogic_task
+stories = loadf(ARGS.task)
+test_stories = loadf(ARGS.task.replace('train', 'test'))
+# Adjust iterations
+max_supps = max([len(s['supps']) for s in stories])
+if not ITERATIONS:
+  ITERATIONS = max_supps
+else:
+  assert max_supps <= ITERATIONS, "Not enough iterations for supporting facts."
 # Print general information
 print("EMBED:", EMBED)
 print("ITER:", ITERATIONS)
@@ -197,8 +196,6 @@ def vectorise_stories(encoded_stories, noise=False):
     vq[i,:len(s['query'])] = s['query']
     vas[i,:len(s['answers'])] = s['answers']
     supps[i] = np.pad(s['supps'], (0, ITERATIONS-s['supps'].size), 'edge')
-    if DEEPLOGIC:
-      np.random.shuffle(s['context'])
     for j, c in enumerate(s['context']):
       vctx[i,j,:len(c)] = c
     # At random convert a symbol to unknown within a story
@@ -208,6 +205,12 @@ def vectorise_stories(encoded_stories, noise=False):
       vctx[i, vctx[i] == rword] = 1
       vq[i, vq[i] == rword] = 1
       vas[i, vas[i] == rword] = 1
+    if DEEPLOGIC:
+      perm = np.random.permutation(len(s['context']))
+      vctx[i,:len(s['context'])] = vctx[i,perm]
+      for j, supp in enumerate(supps[i]):
+        if supp != -1:
+          supps[i,j] = np.argmax(perm==supp)
   return vctx, vq, vas, supps
 
 # ---------------------------
@@ -303,7 +306,6 @@ class MemAttention(C.Chain):
       self.att_birnn = L.NStepBiGRU(1, EMBED, EMBED, DROPOUT)
       self.att_score = L.Linear(2*EMBED, 1)
       self.state_linear = L.Linear(4*EMBED, EMBED)
-      # self.state_update = L.Linear(2*EMBED, EMBED)
 
   def seq_embed(self, vxs, exs):
     """Embed a given sequence."""
@@ -317,7 +319,6 @@ class MemAttention(C.Chain):
     # vq.shape == (..., S)
     # eq.shape == (..., S, E)
     s = self.seq_embed(vq, eq) # (..., E)
-    s = F.dropout(s, DROPOUT) # (..., E)
     return s # (..., E)
 
   def forward(self, equery, vmemory, ememory, mask=None, iteration=0):
@@ -350,14 +351,12 @@ class MemAttention(C.Chain):
     # mem_att.shape == (..., Ms)
     # vmemory.shape == (..., Ms, M)
     # ememory.shape == (..., Ms, E)
+    ostate = F.repeat(oldstate[..., None, :], vmemory.shape[-2], -2) # (..., Ms, E)
+    merged = F.concat([ostate, ememory, ostate*ememory, F.squared_difference(ostate, ememory)], -1) # (..., Ms, 4*E)
+    mem_inter = self.state_linear(merged, n_batch_axes=len(merged.shape)-1) # (..., Ms, E)
+    mem_inter = F.tanh(mem_inter) # (..., E)
     # (..., Ms) x (..., Ms, E) -> (..., E)
-    mem_slot = F.einsum("...i,...ij->...j", mem_att, ememory) # (..., E)
-    merged = F.concat([oldstate, mem_slot, oldstate*mem_slot, F.squared_difference(oldstate, mem_slot)], -1) # (..., 3*E)
-    new_state = self.state_linear(merged, n_batch_axes=len(merged.shape)-1) # (..., E)
-    new_state = F.tanh(new_state) # (..., E)
-    # new_state = self.state_update(new_state, n_batch_axes=len(new_state.shape)-1) # (..., E)
-    # new_state = F.tanh(new_state) # (..., E)
-    new_state = F.dropout(new_state, DROPOUT) # (..., E)
+    new_state = F.einsum("...i,...ij->...j", mem_att, mem_inter) # (..., E)
     return new_state
 
 # ---------------------------
@@ -660,10 +659,8 @@ class Classifier(C.Chain):
     uniloss = F.hstack(self.predictor.log['uniloss']) # (I+1,)
     uniloss = F.mean(uniloss) # ()
     # ---
-    C.report({'loss': mainloss, 'vmap': vmaploss, 'rpred': rpredloss, 'opred': opredloss, 'uni': uniloss, 'oacc': oacc, 'acc': acc}, self)
-    if BABI:
-      C.report({'uatt': uattloss, 'oatt': oattloss, 'ratt': rattloss}, self)
-    return self.uniparam*(mainloss + 0.1*vmaploss + ARGS.strong*uattloss + uniloss) + ARGS.strong*(oattloss + rattloss) + opredloss + rpredloss # ()
+    C.report({'loss': mainloss, 'vmap': vmaploss, 'uatt': uattloss, 'oatt': oattloss, 'ratt': rattloss, 'rpred': rpredloss, 'opred': opredloss, 'uni': uniloss, 'oacc': oacc, 'acc': acc}, self)
+    return self.uniparam*(mainloss + 0.1*vmaploss + ARGS.strong*(uattloss+rattloss) + rpredloss + uniloss) + ARGS.strong*oattloss + opredloss # ()
 
 # ---------------------------
 
@@ -700,7 +697,8 @@ model = Infer(rule_repo)
 cmodel = Classifier(model)
 
 optimiser = C.optimizers.Adam().setup(cmodel)
-optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
+if BABI:
+  optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
 # optimiser.add_hook(C.optimizer_hooks.GradientClipping(40))
 
 train_iter = C.iterators.SerialIterator(train_enc_stories, 64)
@@ -716,7 +714,7 @@ trainer = T.Trainer(updater, (300, 'epoch'))
 def enable_unification(trainer):
   """Enable unification loss function in model."""
   trainer.updater.get_optimizer('main').target.uniparam = 1.0
-trainer.extend(enable_unification, trigger=(20, 'epoch'))
+trainer.extend(enable_unification, trigger=(40, 'epoch'))
 
 def log_vmap(trainer):
   """Log inner properties to file."""
