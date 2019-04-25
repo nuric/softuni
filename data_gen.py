@@ -20,7 +20,7 @@ RULE_T = "{}:-{}."
 PRED_T = "{}({})"
 ARG_SEP = ','
 PRED_SEP = ';'
-TARGET_T = "? {} {}"
+TARGET_T = "? {} {} {}"
 
 def choices(symbols, k):
   """Return k many symbols with replacement. Added in v3.6."""
@@ -70,12 +70,10 @@ def write_r(preds):
 def output(context, targets):
   """Print the context and given targets."""
   # context: [[('p', ['a', 'b'])], ...]
-  # targets: [(('p', ['a', 'b']), 1), ...]
-  if ARGS.shuffle_context:
-    R.shuffle(context)
+  # targets: [(('p', ['a', 'b']), 1, [0,1,2]), ...]
   print('\n'.join([write_r(c) for c in context]))
-  for t, v in targets:
-    print(TARGET_T.format(write_r([t]), v))
+  for t, v, s in targets:
+    print(TARGET_T.format(write_r([t]), v, ','.join(map(str, s))))
 
 def gen_task(context, targets, upreds):
   """Fill context with random preds and output program."""
@@ -114,12 +112,12 @@ def gen_task1(upreds=None):
   ctx = list()
   add_pred(ctx, rule[0], preds, args, 1.0)
   # Successful case when query appears in context
-  targets = [(rule[0], 1)]
+  targets = [(rule[0], 1, [0])]
   # Fail case
   args = r_consts(R.randint(1, 2))
   fpred = (preds[1], args)
   add_pred(ctx, fpred, preds, args)
-  targets.append((fpred, 0))
+  targets.append((fpred, 0, [-1]))
   gen_task(ctx, targets, preds)
 
 def gen_task2(upreds=None):
@@ -136,9 +134,9 @@ def gen_task2(upreds=None):
     # Successful double variable grounding
     cs = r_consts(2)
     c = R.choice(cs)
-    targets.append(((preds[0], [c, c]), 1))
+    targets.append(((preds[0], [c, c]), 1, [0]))
     # Fail on non-unique variable grounding
-    targets.append(((preds[0], cs), 0))
+    targets.append(((preds[0], cs), 0, [-1]))
   else:
     # Double variable different argument
     # Single variable argument
@@ -150,9 +148,9 @@ def gen_task2(upreds=None):
     ctx.append(rule)
     # Successful unique argument grounding
     args = choices(r_consts(2), argc)
-    targets.append(((preds[0], args), 1))
+    targets.append(((preds[0], args), 1, [0]))
     # Fail on out of context predicate with same arguments
-    targets.append(((preds[1], args), 0))
+    targets.append(((preds[1], args), 0, [-1]))
   gen_task(ctx, targets, preds)
 
 def nstep_deduction(steps, negation=False, upreds=None):
@@ -161,7 +159,7 @@ def nstep_deduction(steps, negation=False, upreds=None):
   consts = r_consts(2)
   ctx, targets = list(), list()
   prefix = '-' if negation else ''
-  if R.random() < 0.5:
+  if R.random() < 0.5 and False:
     # Double variable swap deduction rules
     vs = r_vars(2)
     rule = [(preds[0], vs), (prefix+preds[1], vs[::-1])]
@@ -180,8 +178,10 @@ def nstep_deduction(steps, negation=False, upreds=None):
     args = r_consts(2)
     add_pred(ctx, (preds[steps], args), preds, consts, 1.0)
     args = args if swapc % 2 == 0 else args[::-1]
-    targets.append(((preds[0], args), 1-int(negation)))
-    targets.append(((preds[0], args[::-1]), int(negation)))
+    succ_supps = list(range(steps+1))
+    fail_supps = succ_supps[:-1] + [-1]
+    targets.append(((preds[0], args), 1-int(negation), succ_supps))
+    targets.append(((preds[0], args[::-1]), int(negation), fail_supps))
     gen_task(ctx, targets, preds)
   else:
     # Double variable non-swap deduction rules
@@ -201,7 +201,8 @@ def nstep_deduction(steps, negation=False, upreds=None):
     cctx = ctx.copy()
     spred = (preds[steps], args)
     add_pred(cctx, spred, preds, args, 1.0)
-    targets = [((preds[0], args), 1-int(negation))]
+    succ_supps = list(range(steps+1))
+    targets = [((preds[0], args), 1-int(negation), succ_supps)]
     gen_task(cctx, targets, preds)
     # Add failure case
     if R.random() < 0.5:
@@ -210,10 +211,12 @@ def nstep_deduction(steps, negation=False, upreds=None):
       preds.append(p)
       add_pred(ctx, spred, preds, args, 1.0)
       ctx[0] = [(preds[0], vs), (prefix+p, vs)]
+      supps = [0] + [-1]*steps
     else:
       # Fail on last ground case
       add_pred(ctx, spred, preds, args)
-    targets = [((preds[0], args), int(negation))]
+      supps = succ_supps[:-1] + [-1]
+    targets = [((preds[0], args), int(negation), supps)]
     gen_task(ctx, targets, preds)
 
 def gen_task3(upreds=None):
@@ -425,7 +428,6 @@ if __name__ == '__main__':
   parser.add_argument("-cl", "--constant_length", default=1, type=int, help="Length of constants.")
   parser.add_argument("-vl", "--variable_length", default=1, type=int, help="Length of variables.")
   parser.add_argument("-pl", "--predicate_length", default=1, type=int, help="Length of predicates.")
-  parser.add_argument("-sf", "--shuffle_context", action="store_true", help="Shuffle context before output.")
   # Task specific options
   parser.add_argument("--nstep", type=int, help="Generate nstep deduction programs.")
   ARGS = parser.parse_args()
