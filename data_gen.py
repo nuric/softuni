@@ -80,8 +80,10 @@ def gen_task(context, targets, upreds):
   # Fill with random rules up to certain task
   ctx = context.copy() # Don't modify the original context
   for _ in range(ARGS.noise_size):
-    task = "gen_task" + str(R.randint(1, max(1, ARGS.task)))
-    ctx.append(globals()[task](upreds))
+    rtask = R.randint(1, max(1, ARGS.task))
+    rtask = 1 if ARGS.arity != 2 and rtask == 8 else rtask
+    ntask = "gen_task" + str(rtask)
+    ctx.append(globals()[ntask](upreds))
   output(ctx, targets)
 
 def add_pred(context, pred, upreds, uconsts, psuccess=0.0):
@@ -105,7 +107,7 @@ def gen_task1(upreds=None):
   """Ground instances only: p(a).q(c,b)."""
   # One or two argument predicate
   preds = r_preds(2, upreds)
-  args = r_consts(R.randint(1, 2))
+  args = r_consts(R.randint(1, ARGS.arity))
   rule = [(preds[0], args)]
   if upreds:
     return rule
@@ -124,7 +126,7 @@ def gen_task2(upreds=None):
   """Variablised facts only: p(X).q(X,Y)."""
   preds = r_preds(2, upreds)
   ctx, targets = list(), list()
-  if R.random() < 0.5:
+  if R.random() < 0.5 and ARGS.arity > 1:
     # Double variable same argument
     v = r_vars(1)[0]
     rule = [(preds[0], [v, v])]
@@ -140,7 +142,7 @@ def gen_task2(upreds=None):
   else:
     # Double variable different argument
     # Single variable argument
-    argc = R.randint(1, 2)
+    argc = R.randint(1, ARGS.arity)
     args = r_vars(argc)
     rule = [(preds[0], args)]
     if upreds:
@@ -154,12 +156,13 @@ def gen_task2(upreds=None):
   gen_task(ctx, targets, preds)
 
 def nstep_deduction(steps, negation=False, upreds=None):
+  """Generate nstep deduction programs given number of steps."""
   assert steps >= 1, "Need at least 1 step deduction."
   preds = r_preds(2 if upreds else 3+steps, upreds)
   consts = r_consts(2)
   ctx, targets = list(), list()
   prefix = '-' if negation else ''
-  if R.random() < 0.5 and False:
+  if R.random() < 0.5 and ARGS.arity > 1:
     # Double variable swap deduction rules
     vs = r_vars(2)
     rule = [(preds[0], vs), (prefix+preds[1], vs[::-1])]
@@ -186,7 +189,7 @@ def nstep_deduction(steps, negation=False, upreds=None):
   else:
     # Double variable non-swap deduction rules
     # Single variable deduction rules
-    argc = R.randint(1, 2)
+    argc = R.randint(1, ARGS.arity)
     vs = r_vars(argc)
     rule = [(preds[0], vs), (prefix+preds[1], vs)]
     if upreds:
@@ -234,7 +237,7 @@ def gen_task5(upreds=None):
 def logical_and(negation=False, upreds=None):
   """Logical AND with optional negation: p(X):-q(X);r(X)."""
   preds = r_preds(3, upreds)
-  argc = R.randint(1, 2)
+  argc = R.randint(1, ARGS.arity)
   # Double variable AND with different vars
   # Single variable AND
   vs = r_vars(argc)
@@ -257,36 +260,40 @@ def logical_and(negation=False, upreds=None):
     # Successful case when negation fails
     cctx = ctx.copy()
     add_pred(cctx, prems[ridx], preds, args)
+    supps = [0, -1, -1] if ridx == 0 else [0, len(cctx), -1]
     cctx.append([prems[1-ridx]])
-    targets = [((preds[0], args), 1)]
+    targets = [((preds[0], args), 1, supps)]
     gen_task(cctx, targets, preds)
     # Fail one premise randomly
     fidx = R.randrange(2)
     if ridx == fidx:
       # To fail negation add ground instance
+      supps = [0, len(ctx), -1]
       ctx.append([prems[ridx]])
       # Succeed other with some probability
       add_pred(ctx, prems[1-ridx], preds, args, 0.8)
     else:
       # Fail non-negated premise
+      supps = [0, -1, -1]
       add_pred(ctx, prems[1-ridx], preds, args)
       # Still succeed negation
       add_pred(ctx, prems[ridx], preds, args)
-    targets = [((preds[0], args), 0)]
+    targets = [((preds[0], args), 0, supps)]
     gen_task(ctx, targets, preds)
   else:
     # Create successful context
     cctx = ctx.copy()
     add_pred(cctx, prems[0], preds, args, 1.0)
+    supps = [0, 1, len(cctx)]
     add_pred(cctx, prems[1], preds, args, 1.0)
-    targets = [((preds[0], args), 1)]
+    targets = [((preds[0], args), 1, supps)]
     gen_task(cctx, targets, preds)
     # Fail one premise randomly
     fidx = R.randrange(2)
     add_pred(ctx, prems[fidx], preds, args)
     # Succeed the other with some probability
     add_pred(ctx, prems[1-fidx], preds, args, 0.8)
-    targets = [((preds[0], args), 0)]
+    targets = [((preds[0], args), 0, [0, -1, -1])]
     gen_task(ctx, targets, preds)
 
 def gen_task6(upreds=None):
@@ -297,7 +304,7 @@ def logical_or(negation=False, upreds=None):
   """Logical OR with optional negation: p(X):-q(X).p(X):-r(X)."""
   preds = r_preds(3, upreds)
   # Double or single variable OR
-  argc = R.randint(1, 2)
+  argc = R.randint(1, ARGS.arity)
   vs = r_vars(argc)
   swap = R.random() < 0.5
   prefix = '-' if negation else ''
@@ -314,15 +321,15 @@ def logical_or(negation=False, upreds=None):
     args = r_consts(argc, args)
     add_pred(ctx, (preds[1], args), preds, args, 1.0)
     args = args[::-1] if swap else args
-    targets = [((preds[0], args), 1-int(negation)),
-               ((preds[0], args[::-1]), int(negation))]
+    targets = [((preds[0], args), 1-int(negation), [0, 3]),
+               ((preds[0], args[::-1]), int(negation), [0, -1])]
     gen_task(ctx, targets, preds)
   elif not negation and R.random() < 0.2:
     # Sneaky shorcut case
-    targets = [((preds[0], args), 1)]
+    targets = [((preds[0], args), 1, [2, -1])]
     gen_task(ctx, targets, preds)
     del ctx[-1]
-    targets = [((preds[0], args), 0)]
+    targets = [((preds[0], args), 0, [-1, -1])]
     gen_task(ctx, targets, preds)
   else:
     # Succeed either from them
@@ -331,20 +338,22 @@ def logical_or(negation=False, upreds=None):
     cctx = ctx.copy()
     if negation and sidx == 0:
       # Succeed by failing negation
+      supps = [0, -1]
       add_pred(cctx, prems[0], preds, prems[0][1])
       # Possibly succeed other prem
       add_pred(cctx, prems[1], preds, prems[1][1], 0.2)
     else:
       # Succeed by adding ground case
+      supps = [sidx, len(cctx)]
       add_pred(cctx, prems[sidx], preds, prems[sidx][1], 1.0)
       # Possibly succeed other prem
       add_pred(cctx, prems[1-sidx], preds, prems[1-sidx][1], 0.2)
-    targets = [((preds[0], prems[sidx][1]), 1)]
+    targets = [((preds[0], prems[sidx][1]), 1, supps)]
     gen_task(cctx, targets, preds)
     # Fail both
     add_pred(ctx, prems[0], preds, prems[0][1], int(negation))
     add_pred(ctx, prems[1], preds, prems[1][1])
-    targets = [((preds[0], prems[sidx][1]), 0)]
+    targets = [((preds[0], prems[sidx][1]), 0, [-1, -1])]
     gen_task(ctx, targets, preds)
 
 
@@ -354,6 +363,7 @@ def gen_task7(upreds=None):
 
 def gen_task8(upreds=None):
   """Transitive case: p(X,Y):-q(X,Z);r(Z,Y)."""
+  assert ARGS.arity == 2, "Transitive task arity must be 2."
   preds = r_preds(3, upreds)
   # Existential variable with single choice
   vs = r_vars(3)
@@ -366,6 +376,7 @@ def gen_task8(upreds=None):
   # Add matching ground cases
   args = r_consts(3)
   add_pred(ctx, (preds[1], args[:2]), preds, args, 1.0)
+  succ_supps = [0, 1, len(ctx), -1]
   add_pred(ctx, (preds[2], args[1:]), preds, args, 1.0)
   # Add non-matching ground cases
   argso = r_consts(3)
@@ -374,8 +385,8 @@ def gen_task8(upreds=None):
   add_pred(ctx, (preds[2], argso[2:]), preds, argso, 1.0)
   # Successful case
   # Fail on half-matching existential
-  targets = [((preds[0], [args[0], args[2]]), 1),
-             ((preds[0], [argso[0], argso[3]]), 0)]
+  targets = [((preds[0], [args[0], args[2]]), 1, succ_supps),
+             ((preds[0], [argso[0], argso[3]]), 0, [0, -1, -1, -1])]
   gen_task(ctx, targets, preds)
 
 def gen_task9(upreds=None):
@@ -397,7 +408,7 @@ def gen_task12(upreds=None):
 def gen_task0():
   """Generate an ILP task example."""
   argc = 1
-  goal= 'f'
+  goal = 'f'
   premise = 'b'
   ctx, targets = list(), list()
   # Generate according to goal <- premise
@@ -428,6 +439,7 @@ if __name__ == '__main__':
   parser.add_argument("-cl", "--constant_length", default=1, type=int, help="Length of constants.")
   parser.add_argument("-vl", "--variable_length", default=1, type=int, help="Length of variables.")
   parser.add_argument("-pl", "--predicate_length", default=1, type=int, help="Length of predicates.")
+  parser.add_argument("-ar", "--arity", default=2, type=int, help="Arity.")
   # Task specific options
   parser.add_argument("--nstep", type=int, help="Generate nstep deduction programs.")
   ARGS = parser.parse_args()
