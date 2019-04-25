@@ -423,7 +423,7 @@ class Infer(C.Chain):
   """Takes a story, a set of rules and predicts answers."""
   def __init__(self, rule_stories):
     super().__init__()
-    self.rule_stories = rule_stories
+    self.add_persistent('rule_stories', rule_stories)
     # Create model parameters
     with self.init_scope():
       self.embed = L.EmbedID(len(word2idx), EMBED, ignore_label=0)
@@ -436,10 +436,13 @@ class Infer(C.Chain):
       self.uni_linear = L.Linear(EMBED, EMBED, nobias=True)
       self.rule_linear = L.Linear(EMBED, EMBED, nobias=True)
       self.answer_linear = L.Linear(EMBED, len(word2idx))
-    # Setup rule repo
-    self.vrules = vectorise_stories(rule_stories) # (R, Ls, L), (R, Q), (R, A), (R, I)
-    self.mrules = tuple([v != 0 for v in self.vrules[:-1]]) # (R, Ls, L), (R, Q), (R, A)
+    # Setup empty rule repo
+    self.vrules = None
     self.log = None
+
+  def init_rules(self):
+    """Initialise rule repo."""
+    self.vrules = vectorise_stories(self.rule_stories) # (R, Ls, L), (R, Q), (R, A), (R, I)
 
   def tolog(self, key, value):
     """Append to log dictionary given key value pair."""
@@ -449,7 +452,6 @@ class Infer(C.Chain):
   def compute_vmap(self):
     """Compute the variable map for rules."""
     rvctx, rvq, rva, rsupps = self.vrules # (R, Ls, L), (R, Q), (R, A), (R, I)
-    # vmap = self.rulegen(self.vrules, [erctx, erq, era]) # (R, V)
     rwords = np.reshape(rvctx, (rvctx.shape[0], -1)) # (R, Ls*L)
     rwords = np.concatenate([rvq, rwords], -1) # (R, Q+Ls*L)
     wordrange = np.arange(len(word2idx)) # (V,)
@@ -508,9 +510,7 @@ class Infer(C.Chain):
     # ---------------------------
     # Prepare rules and variable states
     rvctx, rvq, rva, rsupps = self.vrules # (R, Ls, L), (R, Q), (R, A), (R, I)
-    rmctx, rmq, rma = self.mrules # (R, Ls, L), (R, Q), (R, A)
     erctx, erq, era = [self.embed(v) for v in self.vrules[:-1]] # (R, Ls, L, E), (R, Q, E), (R, A, E)
-    # erctx, erq, era = erctx*rmctx[..., None], erq*rmq[..., None], era*rma[..., None] # (R, Ls, L, E), (R, Q, E), (R, A, E)
     # ---------------------------
     # Compute variable map
     vmap = self.compute_vmap()
@@ -535,7 +535,6 @@ class Infer(C.Chain):
     # ---------------------------
     # Get initial candidate state
     qstate = qvgates[..., None]*qunis + (1-qvgates[..., None])*erq # (B, R, Q, E)
-    qstate *= rmq[..., None] # (B, R, Q, E)
     brvq = np.repeat(rvq[None, ...], qstate.shape[0], 0) # (B, R, Q)
     uni_cs = self.mematt.init_state(brvq, qstate) # (B, R, E)
     orig_cs = self.mematt.init_state(vq, eq) # (B, E)
@@ -625,7 +624,7 @@ class Classifier(C.Chain):
   """Compute loss and accuracy of underlying model."""
   def __init__(self, predictor):
     super().__init__()
-    self.uniparam = 0.0
+    self.add_persistent('uniparam', 0.0)
     with self.init_scope():
       self.predictor = predictor
 
@@ -649,9 +648,9 @@ class Classifier(C.Chain):
     oattloss = F.hstack([F.softmax_cross_entropy(oattloss[:,i,:], supps[:,i]) for i in range(ITERATIONS)]) # (I,)
     oattloss = F.mean(oattloss) # ()
     # ---
-    rattloss = F.stack(self.predictor.log['raw_body_att'], 1) # (R, I, Ls)
-    rattloss = F.hstack([F.softmax_cross_entropy(rattloss[:,i,:], rsupps[:,i]) for i in range(ITERATIONS)]) # (I,)
-    rattloss = F.mean(rattloss) # ()
+    battloss = F.stack(self.predictor.log['raw_body_att'], 1) # (R, I, Ls)
+    battloss = F.hstack([F.softmax_cross_entropy(battloss[:,i,:], rsupps[:,i]) for i in range(ITERATIONS)]) # (I,)
+    battloss = F.mean(battloss) # ()
     # ---
     rpredloss = self.predictor.log['rpredloss'][0] # ()
     opredloss = self.predictor.log['opredloss'][0] # ()
@@ -659,8 +658,8 @@ class Classifier(C.Chain):
     uniloss = F.hstack(self.predictor.log['uniloss']) # (I+1,)
     uniloss = F.mean(uniloss) # ()
     # ---
-    C.report({'loss': mainloss, 'vmap': vmaploss, 'uatt': uattloss, 'oatt': oattloss, 'ratt': rattloss, 'rpred': rpredloss, 'opred': opredloss, 'uni': uniloss, 'oacc': oacc, 'acc': acc}, self)
-    return self.uniparam*(mainloss + 0.1*vmaploss + ARGS.strong*(uattloss+rattloss) + rpredloss + uniloss) + ARGS.strong*oattloss + opredloss # ()
+    C.report({'loss': mainloss, 'vmap': vmaploss, 'uatt': uattloss, 'oatt': oattloss, 'batt': battloss, 'rpred': rpredloss, 'opred': opredloss, 'uni': uniloss, 'oacc': oacc, 'acc': acc}, self)
+    return self.uniparam*(mainloss + 0.1*vmaploss + ARGS.strong*(uattloss+battloss) + rpredloss + uniloss) + ARGS.strong*oattloss + opredloss # ()
 
 # ---------------------------
 
@@ -694,6 +693,7 @@ print("RULE REPO:", rule_repo)
 
 # Setup model
 model = Infer(rule_repo)
+model.init_rules()
 cmodel = Classifier(model)
 
 optimiser = C.optimizers.Adam().setup(cmodel)
@@ -718,9 +718,15 @@ trainer.extend(enable_unification, trigger=(40, 'epoch'))
 
 def log_vmap(trainer):
   """Log inner properties to file."""
-  vmaplog = trainer.updater.get_optimizer('main').target.predictor.log['vmap'][0] # (V,)
+  pmodel = trainer.updater.get_optimizer('main').target.predictor
+  vmaplog = pmodel.log['vmap'][0] # (V,)
   logpath = os.path.join(trainer.out, ARGS.name + '_vmap.jsonl')
   with open(logpath, 'a') as f:
+    if trainer.updater.epoch == 1:
+      # Log the rule as well
+      f.write("---ENC RULE REPO---\n")
+      f.write(str(pmodel.vrules) + '\n')
+      f.write("-------------------\n")
     f.write(str(trainer.updater.epoch) + "," + json.dumps(vmaplog.array.tolist()) + '\n')
 trainer.extend(log_vmap, trigger=(1, 'epoch'))
 
@@ -734,7 +740,7 @@ trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_latest.npz'), trigger=
 trainer.extend(T.extensions.LogReport(log_name=ARGS.name+'_log.json'))
 # trainer.extend(T.extensions.LogReport(trigger=(1, 'iteration'), log_name=ARGS.name+'_log.json'))
 trainer.extend(T.extensions.FailOnNonNumber())
-report_keys = ['loss', 'vmap', 'uatt', 'oatt', 'ratt', 'rpred', 'opred', 'uni', 'oacc', 'acc']
+report_keys = ['loss', 'vmap', 'uatt', 'oatt', 'batt', 'rpred', 'opred', 'uni', 'oacc', 'acc']
 trainer.extend(T.extensions.PrintReport(['epoch'] + ['main/'+s for s in report_keys] + [p+'/main/'+s for p in ('val', 'test') for s in ('loss', 'acc')] + ['elapsed_time']))
 # trainer.extend(T.extensions.ProgressBar(update_interval=10))
 # trainer.extend(T.extensions.PlotReport(['main/loss', 'validation/main/loss'], 'iteration', marker=None, file_name=ARGS.name+'_loss.pdf'))
@@ -752,7 +758,10 @@ signal.signal(signal.SIGTERM, interrupt)
 # Check previously saved trainer
 if os.path.isfile(trainer_statef):
   C.serializers.load_npz(trainer_statef, trainer)
+  trainer.updater.get_optimizer('main').target.predictor.init_rules()
   print("Loaded trainer state from:", trainer_statef)
+  print("UNI:", trainer.updater.get_optimizer('main').target.uniparam)
+  print("RULES:", trainer.updater.get_optimizer('main').target.predictor.vrules)
 
 # answer = model(converter([val_enc_stories[0]], None)[0])[0].array
 # print("INIT ANSWER:", answer)
