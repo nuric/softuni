@@ -80,7 +80,7 @@ def load_deeplogic_task(fname):
   """Load logic programs from given file name."""
   def process_rule(r):
     """Apply formatting to rule."""
-    return r.replace('.', '').replace('(', ' ( ').replace(')', ' )').replace(':-', ' < ').replace(';', ' ; ').replace(',', ' , ')
+    return r.replace('.', '').replace('(', ' ( ').replace(')', ' )').replace(':-', ' < ').replace(';', ' ; ').replace(',', ' , ').replace('-', '- ')
   ss = list()
   with open(fname) as f:
     ctx, isnew_ctx = list(), False
@@ -159,7 +159,7 @@ wordeye = np.eye(len(word2idx), dtype=np.float32)
 # Prepare training validation sets
 if ARGS.tsize != 0:
   assert ARGS.tsize < len(enc_stories), "Not enough examples for training size."
-  tratio = (len(enc_stories)-ARGS.tsize) / 1000
+  tratio = (len(enc_stories)-ARGS.tsize) / len(enc_stories)
   train_enc_stories, val_enc_stories = train_test_split(enc_stories, test_size=tratio)
   while len(train_enc_stories) < 900:
     train_enc_stories.append(np.random.choice(train_enc_stories))
