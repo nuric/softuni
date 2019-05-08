@@ -4,7 +4,6 @@ import logging
 import os
 import json
 import signal
-import time
 from collections import OrderedDict
 import numpy as np
 from sklearn.model_selection import train_test_split
@@ -12,10 +11,6 @@ import chainer as C
 import chainer.links as L
 import chainer.functions as F
 import chainer.training as T
-# import matplotlib
-# matplotlib.use('pdf')
-from sklearn.decomposition import PCA
-import matplotlib.pyplot as plt
 
 
 # Disable scientific printing
@@ -30,19 +25,22 @@ parser.add_argument("-e", "--embed", default=32, type=int, help="Embedding size.
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
 parser.add_argument("-t", "--tsize", default=0, type=int, help="Training size, 0 means use everything.")
 parser.add_argument("-s", "--strong", default=1.0, type=float, help="Strong supervision ratio.")
-parser.add_argument("-i", "--iter", default=0, type=int, help="Number of iterations, default 0 for minimum required.")
 ARGS = parser.parse_args()
 print("TASK:", ARGS.task)
 
 # Debug
-# if ARGS.debug:
+if ARGS.debug:
   # logging.basicConfig(level=logging.DEBUG)
   # C.set_debug(True)
+  import matplotlib
+  matplotlib.use('pdf')
+  from sklearn.decomposition import PCA
+  import matplotlib.pyplot as plt
+  import seaborn as sns
 
 EMBED = ARGS.embed
 MAX_HIST = 250
 REPO_SIZE = ARGS.rules
-ITERATIONS = ARGS.iter
 DROPOUT = 0.1
 BABI = 'qa' in ARGS.task
 DEEPLOGIC = not BABI
@@ -70,7 +68,7 @@ def load_babi_task(fname):
         cctx = list(context.values())
         # cctx.reverse()
         ss.append({'context': cctx[:MAX_HIST], 'query': q,
-                   'answers': a.split(','), 'supps': supps})
+                   'answers': [a], 'supps': supps})
       else:
         # Just a statement
         context[sid] = sl
@@ -105,15 +103,8 @@ def load_deeplogic_task(fname):
 loadf = load_babi_task if BABI else load_deeplogic_task
 stories = loadf(ARGS.task)
 test_stories = loadf(ARGS.task.replace('train', 'test'))
-# Adjust iterations
-max_supps = max([len(s['supps']) for s in stories])
-if not ITERATIONS:
-  ITERATIONS = max_supps
-else:
-  assert max_supps <= ITERATIONS, "Not enough iterations for supporting facts."
 # Print general information
 print("EMBED:", EMBED)
-print("ITER:", ITERATIONS)
 print("STRONG:", ARGS.strong)
 print("REPO:", REPO_SIZE)
 print("TRAIN:", len(stories), "stories")
@@ -180,22 +171,23 @@ def decode_story(story):
 def vectorise_stories(encoded_stories, noise=False):
   """Given a list of encoded stories, vectorise them with padding."""
   # Find maximum length of batch to pad
-  max_ctxlen, ctx_maxlen, q_maxlen, a_maxlen = 0, 0, 0, 0
+  max_ctxlen, ctx_maxlen, q_maxlen, a_maxlen, s_maxlen = 0, 0, 0, 0, 0
   for s in encoded_stories:
     max_ctxlen = max(max_ctxlen, len(s['context']))
     c_maxlen = max([len(c) for c in s['context']])
     ctx_maxlen = max(ctx_maxlen, c_maxlen)
     q_maxlen = max(q_maxlen, len(s['query']))
     a_maxlen = max(a_maxlen, len(s['answers']))
+    s_maxlen = max(s_maxlen, len(s['supps']))
   # Vectorise stories
   vctx = np.zeros((len(encoded_stories), max_ctxlen, ctx_maxlen), dtype=np.int32) # (B, Cs, C)
   vq = np.zeros((len(encoded_stories), q_maxlen), dtype=np.int32) # (B, Q)
   vas = np.zeros((len(encoded_stories), a_maxlen), dtype=np.int32) # (B, A)
-  supps = np.zeros((len(encoded_stories), ITERATIONS), dtype=np.int32) # (B, I)
+  supps = np.zeros((len(encoded_stories), s_maxlen), dtype=np.int32) # (B, I)
   for i, s in enumerate(encoded_stories):
     vq[i,:len(s['query'])] = s['query']
     vas[i,:len(s['answers'])] = s['answers']
-    supps[i] = np.pad(s['supps'], (0, ITERATIONS-s['supps'].size), 'edge')
+    supps[i] = np.pad(s['supps'], (0, s_maxlen-s['supps'].size), 'constant', constant_values=-1)
     for j, c in enumerate(s['context']):
       vctx[i,j,:len(c)] = c
     # At random convert a symbol to unknown within a story
@@ -514,10 +506,6 @@ class Infer(C.Chain):
     # ---------------------------
     # Compute variable map
     vmap = self.compute_vmap()
-    # vmap = np.array([[0,1,0,0,1,0,1,1,0,0,0,0,0,0,0,0,0,0,]], dtype=np.float32)
-    # vmap = np.array([[0,1,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0]], dtype=np.float32)
-    # vmap = np.array([[0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]], dtype=np.float32)
-    # self.tolog('vmap', vmap)
     # Setup variable maps and states
     nrules_range = np.arange(len(self.rule_stories)) # (R,)
     ctxvgates = vmap[nrules_range[:, None, None], rvctx] # (R, Ls, L)
@@ -563,7 +551,7 @@ class Infer(C.Chain):
     mem_erctx = self.mematt.seq_embed(rvctx, erctx) # (R, Ls, E)
     mem_ectx = self.mematt.seq_embed(vctx, ectx) # (B, Cs, E)
     # Compute iterative updates on variables
-    for t in range(ITERATIONS):
+    for t in range(supps.shape[-1]):
       # ---------------------------
       # Compute which body literal to prove using rule state
       raw_body_att = self.mematt(rs, rvctx, mem_erctx, bodyattmask, t) # (R, Ls)
@@ -641,15 +629,15 @@ class Classifier(C.Chain):
     # Compute aux losses
     vmaploss = F.sum(self.predictor.log['vmap'][0]) # ()
     uattloss = F.stack(self.predictor.log['raw_uni_cands_att'], 1) # (B, I, Cs)
-    uattloss = F.hstack([F.softmax_cross_entropy(uattloss[:,i,:], supps[:,i]) for i in range(ITERATIONS)]) # (I,)
+    uattloss = F.hstack([F.softmax_cross_entropy(uattloss[:,i,:], supps[:,i]) for i in range(supps.shape[-1])]) # (I,)
     uattloss = F.mean(uattloss) # ()
     # ---
     oattloss = F.stack(self.predictor.log['raw_orig_cands_att'], 1) # (B, I, Cs)
-    oattloss = F.hstack([F.softmax_cross_entropy(oattloss[:,i,:], supps[:,i]) for i in range(ITERATIONS)]) # (I,)
+    oattloss = F.hstack([F.softmax_cross_entropy(oattloss[:,i,:], supps[:,i]) for i in range(supps.shape[-1])]) # (I,)
     oattloss = F.mean(oattloss) # ()
     # ---
     battloss = F.stack(self.predictor.log['raw_body_att'], 1) # (R, I, Ls)
-    battloss = F.hstack([F.softmax_cross_entropy(battloss[:,i,:], rsupps[:,i]) for i in range(ITERATIONS)]) # (I,)
+    battloss = F.hstack([F.softmax_cross_entropy(battloss[:,i,:], rsupps[:,i]) for i in range(rsupps.shape[-1])]) # (I,)
     battloss = F.mean(battloss) # ()
     # ---
     rpredloss = self.predictor.log['rpredloss'][0] # ()
