@@ -1,6 +1,10 @@
 # Dependencies
 numpy
-ply
+chainer
+sklearn
 # Tools
 pylint
 doit
+# Plotting
+matplotlib
+seaborn
