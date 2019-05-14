@@ -1,6 +1,5 @@
 """bAbI run on neurolog."""
 import argparse
-import logging
 import os
 import json
 import signal
@@ -15,6 +14,7 @@ import chainer.training as T
 
 # Disable scientific printing
 np.set_printoptions(suppress=True, precision=3, linewidth=180)
+# pylint: disable=line-too-long
 
 # Arguments
 parser = argparse.ArgumentParser(description="Run NeuroLog on bAbI tasks.")
@@ -63,7 +63,7 @@ def load_babi_task(fname):
         context = OrderedDict()
       # Check for question or not
       if '\t' in sl:
-        q, a, supps= sl.split('\t')
+        q, a, supps = sl.split('\t')
         idxs = list(context.keys())
         supps = [idxs.index(int(s)) for s in supps.split(' ')]
         cctx = list(context.values())
@@ -77,9 +77,9 @@ def load_babi_task(fname):
 
 def load_deeplogic_task(fname):
   """Load logic programs from given file name."""
-  def process_rule(r):
+  def process_rule(rule):
     """Apply formatting to rule."""
-    return r.replace('.', '').replace('(', ' ( ').replace(')', ' )').replace(':-', ' < ').replace(';', ' ; ').replace(',', ' , ').replace('-', '- ')
+    return rule.replace('.', '').replace('(', ' ( ').replace(')', ' )').replace(':-', ' < ').replace(';', ' ; ').replace(',', ' , ').replace('-', '- ')
   ss = list()
   with open(fname) as f:
     ctx, isnew_ctx = list(), False
@@ -314,17 +314,16 @@ def seq_rnn_embed(vxs, exs, birnn, return_seqs=False):
     embeds = F.scatter_add(embeds, idxs, ys) # (X, S, E)
     embeds = F.reshape(embeds, exs.shape) # (..., S, E)
     return embeds # (..., S, E)
-  else:
-    hs = F.mean(hs, 0) # (Y, E)
-    if hs.shape[0] == lengths.size:
-      hs = F.reshape(hs, vxs.shape[:-1] + (EMBED,)) # (..., E)
-      return hs
-    # Add zero values back to match original shape
-    embeds = np.zeros((lengths.size, EMBED), dtype=np.float32) # (X, E)
-    idxs = np.nonzero(lengths) # (Y,)
-    embeds = F.scatter_add(embeds, idxs, hs) # (X, E)
-    embeds = F.reshape(embeds, vxs.shape[:-1] + (EMBED,)) # (..., E)
-    return embeds # (..., E)
+  hs = F.mean(hs, 0) # (Y, E)
+  if hs.shape[0] == lengths.size:
+    hs = F.reshape(hs, vxs.shape[:-1] + (EMBED,)) # (..., E)
+    return hs
+  # Add zero values back to match original shape
+  embeds = np.zeros((lengths.size, EMBED), dtype=np.float32) # (X, E)
+  idxs = np.nonzero(lengths) # (Y,)
+  embeds = F.scatter_add(embeds, idxs, hs) # (X, E)
+  embeds = F.reshape(embeds, vxs.shape[:-1] + (EMBED,)) # (..., E)
+  return embeds # (..., E)
 
 # ---------------------------
 
@@ -448,6 +447,7 @@ class MemN2N(C.Chain):
 
 # ---------------------------
 class Embed:
+  """One-hot embedding layer."""
   def __call__(self, x):
     return F.embed_id(x, wordeye, ignore_label=0)
 
@@ -488,7 +488,6 @@ class Infer(C.Chain):
     rwords = np.reshape(rvctx, (rvctx.shape[0], -1)) # (R, Ls*L)
     rwords = np.concatenate([rvq, rwords], -1) # (R, Q+Ls*L)
     wordrange = np.arange(len(word2idx)) # (V,)
-    embedded_words = self.embed(wordrange) # (V, E)
     wordrange[0] = -1 # Null padding is never a variable
     mask = np.vstack([np.isin(wordrange, rws) for rws in rwords]) # (R, V)
     vmap = F.sigmoid(self.vmap_params*10) # (R, V)
@@ -834,6 +833,6 @@ if ARGS.debug:
   embds = pca.fit_transform(model.embed.W.array)
   print("PCA VAR:", pca.explained_variance_ratio_)
   plt.scatter(embds[:, 0], embds[:, 1])
-  for i in range(len(idx2word)):
-    plt.annotate(idx2word[i], xy=(embds[i,0], embds[i,1]), xytext=(10, 10), textcoords='offset points', arrowprops={'arrowstyle': '-'})
+  for idx, word in idx2word.items():
+    plt.annotate(word, xy=(embds[idx,0], embds[idx,1]), xytext=(10, 10), textcoords='offset points', arrowprops={'arrowstyle': '-'})
   plt.show()
