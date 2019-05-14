@@ -32,11 +32,12 @@ print("TASK:", ARGS.task)
 if ARGS.debug:
   # logging.basicConfig(level=logging.DEBUG)
   # C.set_debug(True)
-  import matplotlib
-  matplotlib.use('pdf')
+  # import matplotlib
+  # matplotlib.use('pdf')
   from sklearn.decomposition import PCA
   import matplotlib.pyplot as plt
-  import seaborn as sns
+  import seaborn as sns; sns.set()
+  import pickle
 
 EMBED = ARGS.embed
 MAX_HIST = 250
@@ -204,6 +205,46 @@ def vectorise_stories(encoded_stories, noise=False):
         if supp != -1:
           supps[i,j] = np.argmax(perm==supp)
   return vctx, vq, vas, supps
+
+# ---------------------------
+
+# Utility functions for visualisation
+def plot_att_matrix(symbols, att, idxij, outf=None):
+  """Plot the unification attention matrix."""
+  # Assume one rule, bath_size of 1
+  # att.shape == (1, 1, Ps, P, Cs, C)
+  isymbols, jsymbols = symbols # (1, Ps, P), (1, Cs, C)
+  i, j = idxij
+  att = F.swapaxes(att, 3, 4) # (1, 1, Ps, Cs, P, C)
+  psyms, csyms, att = isymbols[0,i], jsymbols[0,j], att.array[0,0,i,j] # (P,), (C,), (P, C)
+  ylabels = [idx2word[y] for y in psyms if y != 0] # M x ['token', ...]
+  xlabels = [idx2word[x] for x in csyms if x != 0] # N x ['token', ...]
+  att = att[:len(ylabels), :len(xlabels)] # (M, N)
+  # ---------------------------
+  # att = np.array([[0.972, 0.011, 0.002, 0.003, 0.012],
+                  # [0.003, 0.988, 0.009, 0.   , 0.   ],
+                  # [0.08 , 0.465, 0.316, 0.11 , 0.028],
+                  # [0.   , 0.   , 0.   , 0.005, 0.995]])
+  # ylabels = ['john', 'left', 'the', 'football']
+  # xlabels = ['mary', 'got', 'the', 'milk', 'there']
+  # ---------------------------
+  plt.figure(figsize=(3.2, 2.4))
+  ax = sns.heatmap(att, vmin=0, vmax=1, annot=False,
+                   linewidths=0.5,
+                   cmap='Blues', cbar=False, square=True,
+                   xticklabels=xlabels, yticklabels=ylabels,
+                   mask=None)
+  ax.xaxis.set_ticks_position('top')
+  ax.yaxis.set_ticks_position('left')
+  plt.xticks(rotation='vertical')
+  plt.yticks(rotation='horizontal')
+  if outf:
+    plt.savefig(outf, bbox_inches='tight')
+    with open(outf+'.pkl', 'wb') as f:
+      pickle.dump((xlabels, ylabels, att), f)
+  else:
+    plt.tight_layout()
+    plt.show()
 
 # ---------------------------
 
