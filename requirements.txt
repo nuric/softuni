@@ -4,7 +4,6 @@ chainer
 sklearn
 # Tools
 pylint
-doit
 # Plotting
 matplotlib
 seaborn
