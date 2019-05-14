@@ -637,7 +637,8 @@ class Classifier(C.Chain):
     oattloss = F.mean(oattloss) # ()
     # ---
     battloss = F.stack(self.predictor.log['raw_body_att'], 1) # (R, I, Ls)
-    battloss = F.hstack([F.softmax_cross_entropy(battloss[:,i,:], rsupps[:,i]) for i in range(rsupps.shape[-1])]) # (I,)
+    riters = min(rsupps.shape[-1], supps.shape[-1])
+    battloss = F.hstack([F.softmax_cross_entropy(battloss[:,i,:], rsupps[:,i]) for i in range(riters)]) # (I,)
     battloss = F.mean(battloss) # ()
     # ---
     rpredloss = self.predictor.log['rpredloss'][0] # ()
