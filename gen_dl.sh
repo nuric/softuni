@@ -5,10 +5,12 @@ DDIR='data/deeplogic/'
 DCMD='python3 data_gen.py'
 shift
 SIZE=$1
-TSIZE=$((SIZE / 10))
+#TSIZE=$((SIZE / 10))
+TSIZE=1000
 shift
-ARITY=2
+ARITY=$1
 ARGS="-pl 1 -cl 1 -ns 2 -ar $ARITY"
+shift
 
 all() {
   echo "Generating all tasks..."
@@ -16,11 +18,8 @@ all() {
     if [ $ARITY != 2 ] && [ $i == 8 ]; then
       continue
     fi
-    #F=$DDIR'train_ar'$ARITY'_10k_task'$i.txt
-    #TF=$DDIR'test_ar'$ARITY'_10k_task'$i.txt
-    F=$DDIR'train_ar'$ARITY'_task'$i.txt
-    TF=$DDIR'test_ar'$ARITY'_task'$i.txt
-    echo Writing to $F $TF
+    F=$DDIR'train_ar'$ARITY'_'${SIZE::-3}'k_task'$i.txt
+    TF=$DDIR'test_ar'$ARITY'_'${SIZE::-3}'k_task'$i.txt
     rm -f $F $TF
     $DCMD $ARGS -t $i -s $SIZE >> $F
     $DCMD $ARGS -t $i -s $TSIZE >> $TF
