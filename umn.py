@@ -1,4 +1,4 @@
-"""bAbI run on neurolog."""
+"""Unification Memory Networks"""
 import argparse
 import os
 import json
@@ -17,7 +17,7 @@ np.set_printoptions(suppress=True, precision=3, linewidth=180)
 # pylint: disable=line-too-long
 
 # Arguments
-parser = argparse.ArgumentParser(description="Run NeuroLog on bAbI tasks.")
+parser = argparse.ArgumentParser(description="Run UMN on given tasks.")
 parser.add_argument("task", help="File that contains task train.")
 parser.add_argument("name", help="Name prefix for saving files etc.")
 parser.add_argument("-r", "--rules", default=3, type=int, help="Number of rules in repository.")
