@@ -20,6 +20,7 @@ all() {
     fi
     F=$DDIR'train_ar'$ARITY'_'${SIZE::-3}'k_task'$i.txt
     TF=$DDIR'test_ar'$ARITY'_'${SIZE::-3}'k_task'$i.txt
+    echo Writing to $F - $TF
     rm -f $F $TF
     $DCMD $ARGS -t $i -s $SIZE >> $F
     $DCMD $ARGS -t $i -s $TSIZE >> $TF

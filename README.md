@@ -38,6 +38,7 @@ optional arguments:
 or use the provided wrapper script:
 
 ```bash
+mkdir -p data/deeplogic
 ./gen_dl.sh all [SIZE:1000|10000] [ARITY:1|2]
 ```
 
@@ -50,7 +51,7 @@ All the code for training and debugging including plotting is contained in `umn.
 pip3 install --no-cache-dir --upgrade -r requirements.txt
 ```
 
-Then after the data downloaded / generated:
+Then after the data is downloaded / generated:
 
 ```bash
 python3 umn.py -h
