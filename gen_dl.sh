@@ -2,7 +2,7 @@
 # This script wraps to generate programs with varying parameters
 FUNC=$1
 DDIR='data/deeplogic/'
-DCMD='python3 data_gen.py'
+DCMD='python3 gen_logic.py'
 shift
 SIZE=$1
 #TSIZE=$((SIZE / 10))

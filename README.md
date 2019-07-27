@@ -10,9 +10,9 @@ The experiments are held on two datasets:
 To generate the logical reasoning tasks individually with different parameters:
 
 ```bash
-python3 data_gen.py
+python3 gen_logic.py
 
-usage: data_gen.py [-h] [-t TASK] [-s SIZE] [-ns NOISE_SIZE]
+usage: gen_logic.py [-h] [-t TASK] [-s SIZE] [-ns NOISE_SIZE]
                    [-cl CONSTANT_LENGTH] [-vl VARIABLE_LENGTH]
                    [-pl PREDICATE_LENGTH] [-ar ARITY] [--nstep NSTEP]
 
