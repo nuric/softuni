@@ -393,59 +393,6 @@ class MemAttention(C.Chain):
 
 # ---------------------------
 
-# End-to-End Memory Network
-class MemN2N(C.Chain):
-  """Compute iterations over memory using end-to-end mem approach."""
-  def __init__(self):
-    super().__init__()
-    initW = C.initializers.Normal(0.1)
-    with self.init_scope():
-      self.embedAC = C.ChainList(*[L.EmbedID(len(word2idx), EMBED, initialW=initW) for _ in range(ITERATIONS+1)])
-      self.temporal = C.ChainList(*[L.EmbedID(MAX_HIST, EMBED, initialW=initW) for _ in range(ITERATIONS+1)])
-
-  def seq_embed(self, vxs, iteration=0):
-    """Embed a given sequence."""
-    # vxs.shape == (..., S)
-    exs = self.embedAC[iteration](vxs) # (..., S, E)
-    mask = (vxs != 0)[..., None] # (..., S, 1)
-    exs *= mask # (..., S, E)
-    return pos_encode(vxs, exs) # (..., E)
-
-  def init_state(self, vq, vctx):
-    """Initialise given state."""
-    # vq.shape == (..., S)
-    # vctx.shape == (..., Cs, C)
-    s = self.seq_embed(vq) # (..., E)
-    return s # (..., E)
-
-  def forward(self, equery, vmemory, mask=None, iteration=0):
-    """Compute an attention over memory given the query."""
-    # equery.shape == (..., E)
-    # vmemory.shape == (..., Ms, M)
-    # mask.shape == (..., Ms)
-    ememory = self.seq_embed(vmemory, iteration) # (..., Ms, E)
-    tidxs = self.xp.arange(vmemory.shape[-2], dtype=self.xp.int32) # (Ms,)
-    temps = self.temporal[iteration](tidxs) # (Ms, E)
-    em = ememory + temps # (..., Ms, E)
-    att = F.einsum("...j,...ij->...i", equery, em) # (..., Ms)
-    if mask is not None:
-      att += mask * MINUS_INF # (..., Ms)
-    return att
-
-  def update_state(self, oldstate, mem_att, vmemory, iteration=0):
-    """Update state given old, attention and new possible states."""
-    # oldstate.shape == (..., E)
-    # mem_att.shape == (..., Ms)
-    # vmemory.shape == (..., Ms, M)
-    # Setup memory output embedding
-    ememory = self.seq_embed(vmemory, iteration+1) # (..., Ms, E)
-    tidxs = self.xp.arange(vmemory.shape[-2], dtype=self.xp.int32) # (Ms,)
-    temps = self.temporal[iteration+1](tidxs) # (Ms, E)
-    em = ememory + temps # (..., Ms, E)
-    select_mem = F.einsum("...i,...ij->...j", mem_att, em) # (..., E)
-    return select_mem
-
-# ---------------------------
 class Embed:
   """One-hot embedding layer."""
   def __call__(self, x):
@@ -464,7 +411,6 @@ class Infer(C.Chain):
       # self.rulegen = RuleGen()
       self.vmap_params = C.Parameter(0.0, (len(self.rule_stories), len(word2idx)), name='vmap_params')
       self.mematt = MemAttention()
-      # self.mematt = MemN2N()
       self.uni_birnn = L.NStepBiGRU(1, EMBED, EMBED, DROPOUT)
       self.uni_linear = L.Linear(EMBED, EMBED, nobias=True)
       self.rule_linear = L.Linear(EMBED, EMBED, nobias=True)
