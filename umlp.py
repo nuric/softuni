@@ -23,6 +23,10 @@ parser.add_argument("-d", "--debug", action="store_true", help="Enable debug out
 parser.add_argument("-t", "--tsize", default=100, type=int, help="Random data generations per task.")
 ARGS = parser.parse_args()
 
+EMBED = ARGS.embed
+# We'll add 2, reserve 0 for padding, 1 for no answer,
+VOCAB = ARGS.symbols + 2
+
 # ---------------------------
 
 def rand_syms(symbols: int = None, length: int = None, replace: bool = False):
@@ -36,23 +40,23 @@ def rand_syms(symbols: int = None, length: int = None, replace: bool = False):
 def gen_task1() -> np.ndarray:
   """Task 1: head of random sequence."""
   seq = rand_syms()
-  return np.concatenate((seq, [1], [seq[0]])) # (L+2,)
+  return np.concatenate(([1], seq, [seq[0]])) # (1+L+1,)
 
 def gen_task2() -> np.ndarray:
   """Task 2: tail of random sequence."""
   seq = rand_syms()
-  return np.concatenate((seq, [2], [seq[-1]])) # (L+2,)
+  return np.concatenate(([2], seq, [seq[-1]])) # (1+L+1,)
 
 def gen_task3() -> np.ndarray:
   """Task 3: item that is repeated twice."""
   seq = rand_syms()
   # Fail case
   if np.random.rand() < 0.5:
-    return np.concatenate((seq, [3], [1]))
+    return np.concatenate(([3], seq, [1]))
   # select two random locations and make them equal
   x, y = np.random.choice(len(seq), size=2, replace=False)
   seq[x] = seq[y] # item is repeated
-  return np.concatenate((seq, [3], [seq[x]])) # (L+2,)
+  return np.concatenate(([3], seq, [seq[x]])) # (1+L+1,)
 
 def gen_task4() -> np.ndarray:
   """Task 4: all items equal."""
@@ -61,10 +65,10 @@ def gen_task4() -> np.ndarray:
   if np.random.rand() < 0.5:
     while len(np.unique(seq)) == 1:
       seq = rand_syms(replace=True)
-    return np.concatenate((seq, [4], [1])) # (L+2,)
+    return np.concatenate(([4], seq, [1])) # (1+L+1,)
   # all items equal
   seq[:] = seq[0]
-  return np.concatenate((seq, [4], [seq[0]])) # (L+2,)
+  return np.concatenate(([4], seq, [seq[0]])) # (1+L+1,)
 
 def gen_all(tsize: int = None, unique: bool = True) -> np.ndarray:
   """Generate all tasks."""
@@ -73,9 +77,9 @@ def gen_all(tsize: int = None, unique: bool = True) -> np.ndarray:
     f = globals()['gen_task'+str(i)]
     for _ in range(tsize or ARGS.tsize):
       data.append(f())
-  return np.unique(np.stack(data), axis=0) # (tasks*S, L+2)
+  return np.unique(np.stack(data), axis=0) # (tasks*S, 1+L+1)
 
-data = gen_all() # (S, L+2)
+data = gen_all() # (S, 1+L+1)
 nfolds = C.datasets.get_cross_validation_datasets_random(data, 5) # 5 folds, list of 5 tuples train/test
 
 print("Data:", data.shape)
