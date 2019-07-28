@@ -8,7 +8,7 @@ import chainer.functions as F
 import chainer.training as T
 
 # Disable scientific printing
-np.set_printoptions(suppress=True, precision=3, linewidth=180)
+np.set_printoptions(suppress=True, precision=5, linewidth=180)
 # pylint: disable=line-too-long
 
 # Arguments
@@ -73,10 +73,12 @@ def gen_task4() -> np.ndarray:
   seq[:] = seq[0]
   return np.concatenate(([4], seq, [seq[0]])) # (1+L+1,)
 
+TASKS = 4
+
 def gen_all(tsize: int = None, unique: bool = True) -> np.ndarray:
   """Generate all tasks."""
   data = list()
-  for i in range(1, 5):
+  for i in range(1, TASKS+1):
     f = globals()['gen_task'+str(i)]
     for _ in range(tsize or ARGS.tsize):
       data.append(f())
@@ -103,24 +105,81 @@ class UMLP(C.Chain):
     with self.init_scope():
       self.embed = L.EmbedID(VOCAB, EMBED, ignore_label=0)
       self.vmap_params = C.Parameter(0.0, (inv_examples.shape[:2]) + (VOCAB,), name='vmap_params')
-      self.l1 = L.Linear(LENGTH*EMBED, EMBED*2)
+      self.l1 = L.Linear(LENGTH*EMBED+TASKS, EMBED*2)
       self.l2 = L.Linear(EMBED*2, EMBED)
       self.l3 = L.Linear(EMBED, VOCAB)
+    self.log = None
 
-  def predict(self, example):
+  def tolog(self, key, value):
+    """Append to log dictionary given key value pair."""
+    loglist = self.log.setdefault(key, [])
+    loglist.append(value)
+
+  def predict(self, combined_x):
+    """Forward pass for combined input."""
+    # combined_x (..., L*E+T)
+    nbaxes = len(combined_x.shape)-1
+    out = F.tanh(self.l1(combined_x, n_batch_axes=nbaxes)) # (..., E*2)
+    out = F.tanh(self.l2(out, n_batch_axes=nbaxes)) # (..., E)
+    return self.l3(out, n_batch_axes=nbaxes) # (..., V)
+
+  def embed_predict(self, examples):
     """Just a forward prediction of given example."""
-    # example (B, ..., L)
-    ex = self.embed(example) # (B, ..., L, E)
-    flat_ex = F.reshape(ex.shape[:-2] + (-1,)) # (B, ..., L*E)
-    nbaxes = len(example.shape)-1
-    out = F.tanh(self.l1(flat_ex, n_batch_axes=nbaxes)) # (B, ..., E*2)
-    out = F.tanh(self.l2(out, n_batch_axes=nbaxes)) # (B, ..., E)
-    return self.l3(out, n_batch_axes=nbaxes) # (B, ..., V)
+    # examples (..., 1+L)
+    ex = self.embed(examples[..., 1:]) # (..., L, E)
+    task_id = F.embed_id(examples[..., 0]-1, np.eye(TASKS, dtype=np.float32)) # (..., T)
+    flat_ex = F.reshape(ex, ex.shape[:-2] + (-1,)) # (..., L*E)
+    combined_ex = F.concat((flat_ex, task_id), axis=-1) # (..., L*E+T)
+    return self.predict(combined_ex) # (..., V)
+
+  def compute_ground_loss(self, examples, log_prefix=''):
+    """Compute loss and accuracy on ground examples."""
+    # examples (..., 1+L+1)
+    preds = self.embed_predict(examples[..., :-1]) # (..., V)
+    preds = F.reshape(preds, (-1, VOCAB)) # (..., V)
+    targets = F.flatten(examples[..., -1]) # (...,)
+    loss = F.softmax_cross_entropy(preds, targets) # ()
+    acc = F.accuracy(preds, targets) # ()
+    self.tolog(log_prefix+'loss', loss)
+    self.tolog(log_prefix+'acc', acc)
+    return preds # (..., V)
 
   def forward(self, ground_examples):
     """Compute the forward inference pass for given stories."""
     # ground_examples (B, 1+L+1)
-    pass
+    self.log = dict()
+    # ---------------------------
+    # Invariant ground prediction
+    self.compute_ground_loss(self.inv_examples, log_prefix='ig')
+    # Ground example prediction
+    self.compute_ground_loss(ground_examples, log_prefix='o')
+    # ---------------------------
+    # Unification case
+    task_ids = ground_examples[:, 0] # (B,)
+    ground_inputs = ground_examples[:, 1:-1] # (B, L)
+
+    invariant_inputs = self.inv_examples[..., 1:-1] # (T, I, L)
+    invs_inputs = invariant_inputs[task_ids-1] # (B, I, L)
+
+    vmap = F.sigmoid(self.vmap_params*10) # (T, I, V)
+    self.tolog('vmap', vmap)
+    vmap = vmap[task_ids-1] # (B, I, V)
+    vmap = vmap[np.arange(vmap.shape[0])[:, None, None], np.arange(vmap.shape[1])[None, :, None], invs_inputs] # (B, I, L)
+
+    eg = self.embed(ground_inputs) # (B, L, E)
+    ei = self.embed(invs_inputs) # (B, I, L, E)
+    uni_embed = vmap[..., None]*eg[:, None] + (1-vmap)[..., None]*ei # (B, I, L, E)
+    uni_embed = F.reshape(uni_embed, uni_embed.shape[:-2] + (-1,)) # (B, I, L*E)
+
+    ets = F.embed_id(task_ids-1, np.eye(TASKS, dtype=np.float32)) # (B, T)
+    ets = F.tile(ets[:, None], (1, uni_embed.shape[1], 1)) # (B, I, T)
+
+    uni_inputs = F.concat((uni_embed, ets), axis=-1) # (B, I, L*E+T)
+    uni_preds = self.predict(uni_inputs) # (B, I, V)
+    # Aggregate
+    final_uni_preds = F.max(uni_preds, axis=1) # (B, V)
+    # ---------------------------
+    return final_uni_preds # (B, V)
 
 # Wrapper chain for training
 class Classifier(C.Chain):
@@ -134,9 +193,26 @@ class Classifier(C.Chain):
   def forward(self, ground_examples):
     """Compute total loss to train."""
     # ground_examples (B, 1+L+1)
-    import ipdb; ipdb.set_trace()
-    print("HERE")
-    pass
+    report = dict()
+    # Compute main loss
+    predictions = self.predictor(ground_examples) # (B, V)
+    targets = ground_examples[:, -1] # (B,)
+    uloss = F.softmax_cross_entropy(predictions, targets) # ()
+    uacc = F.accuracy(predictions, targets) # ()
+    report['uloss'] = uloss
+    report['uacc'] = uacc
+    # ---------------------------
+    # Aux lossess
+    keys = ['ig', 'o']
+    for k in ['ig', 'o']:
+      report[k+'loss'] = self.predictor.log[k+'loss'][0]
+      report[k+'acc'] = self.predictor.log[k+'acc'][0]
+
+    vloss = F.sum(self.predictor.log['vmap'][0]) # ()
+    report['vloss'] = vloss
+    # ---------------------------
+    C.report(report, self)
+    return self.uniparam*(uloss + 0.1*vloss + report['igloss']) + report['oloss']
 
 # ---------------------------
 
@@ -176,7 +252,7 @@ def train(train_data, test_data, idx: int = 0):
   optimiser = C.optimizers.Adam().setup(cmodel)
   train_iter = C.iterators.SerialIterator(train_data, ARGS.batch_size)
   updater = T.StandardUpdater(train_iter, optimiser, device=-1)
-  trainer = T.Trainer(updater, (100, 'epoch'))
+  trainer = T.Trainer(updater, (300, 'epoch'))
   # ---------------------------
   # Setup trainer extensions
   trainer.extend(enable_unification, trigger=(40, 'epoch'))
@@ -185,8 +261,8 @@ def train(train_data, test_data, idx: int = 0):
   trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_latest.npz'), trigger=(1, 'epoch'))
   trainer.extend(T.extensions.LogReport(log_name=ARGS.name+'_log.json'))
   trainer.extend(T.extensions.FailOnNonNumber())
-  # report_keys = ['loss', 'vmap', 'uatt', 'oatt', 'batt', 'rpred', 'opred', 'uni', 'oacc', 'acc']
-  # trainer.extend(T.extensions.PrintReport(['epoch'] + ['main/'+s for s in report_keys] + [p+'/main/'+s for p in ('val', 'test') for s in ('loss', 'acc')] + ['elapsed_time']))
+  report_keys = ['uloss', 'igloss', 'oloss', 'oacc', 'igacc', 'uacc', 'vloss']
+  trainer.extend(T.extensions.PrintReport(['epoch'] + ['main/'+s for s in report_keys] + ['test/main/'+s for s in ('uloss', 'uacc')] + ['elapsed_time']))
   # ---------------------------
   trainer.run()
 
