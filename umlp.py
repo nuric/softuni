@@ -18,9 +18,9 @@ parser.add_argument("name", help="Name prefix for saving files etc.")
 parser.add_argument("-l", "--length", default=4, type=int, help="Fixed length of symbol sequences.")
 parser.add_argument("-s", "--symbols", default=4, type=int, help="Number of symbols.")
 parser.add_argument("-i", "--invariants", default=3, type=int, help="Number of invariants per task.")
-parser.add_argument("-e", "--embed", default=32, type=int, help="Embedding size.")
+parser.add_argument("-e", "--embed", default=16, type=int, help="Embedding size.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
-parser.add_argument("-t", "--tsize", default=100, type=int, help="Random data generations per task.")
+parser.add_argument("-t", "--tsize", default=1000, type=int, help="Random data tries per task.")
 parser.add_argument("-bs", "--batch_size", default=64, type=int, help="Training batch size.")
 ARGS = parser.parse_args()
 
@@ -82,7 +82,9 @@ def gen_all(tsize: int = None, unique: bool = True) -> np.ndarray:
     f = globals()['gen_task'+str(i)]
     for _ in range(tsize or ARGS.tsize):
       data.append(f())
-  return np.unique(np.stack(data), axis=0) # (tasks*S, 1+L+1)
+  data = np.unique(np.stack(data), axis=0) # (tasks*S, 1+L+1)
+  np.random.shuffle(data)
+  return data
 
 data = gen_all() # (S, 1+L+1)
 nfolds = C.datasets.get_cross_validation_datasets_random(data, FOLDS) # 5 folds, list of 5 tuples train/test
@@ -250,6 +252,7 @@ def train(train_data, test_data, idx: int = 0):
   model = UMLP(invariants)
   cmodel = Classifier(model)
   optimiser = C.optimizers.Adam().setup(cmodel)
+  optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
   train_iter = C.iterators.SerialIterator(train_data, ARGS.batch_size)
   updater = T.StandardUpdater(train_iter, optimiser, device=-1)
   trainer = T.Trainer(updater, (300, 'epoch'))
@@ -261,16 +264,23 @@ def train(train_data, test_data, idx: int = 0):
   trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_latest.npz'), trigger=(1, 'epoch'))
   trainer.extend(T.extensions.LogReport(log_name=ARGS.name+'_log.json'))
   trainer.extend(T.extensions.FailOnNonNumber())
-  report_keys = ['uloss', 'igloss', 'oloss', 'oacc', 'igacc', 'uacc', 'vloss']
-  trainer.extend(T.extensions.PrintReport(['epoch'] + ['main/'+s for s in report_keys] + ['test/main/'+s for s in ('uloss', 'uacc')] + ['elapsed_time']))
+  train_keys = ['uloss', 'igloss', 'oloss', 'uacc', 'igacc', 'oacc', 'vloss']
+  test_keys = ['uloss', 'oloss', 'uacc', 'oacc']
+  trainer.extend(T.extensions.PrintReport(['epoch'] + ['main/'+k for k in train_keys] + ['test/main/'+k for k in test_keys] + ['elapsed_time']))
   # ---------------------------
   trainer.run()
+  import ipdb; ipdb.set_trace()
+  print("HERE")
 
 # ---------------------------
 
 # Training loop
 try:
   for i, (traind, testd) in enumerate(nfolds):
+    # We'll ensure the model sees every symbol at least once in training
+    # at test time symbols might appear in different unseen sequences
+    train_syms = np.stack(traind)[:, 1:-1]
+    assert len(np.unique(train_syms)) == VOCAB-2, "All symbols missing from training."
     train(traind, testd, i)
 except KeyboardInterrupt:
   if ARGS.debug:
