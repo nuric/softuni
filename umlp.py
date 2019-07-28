@@ -23,6 +23,7 @@ parser.add_argument("-d", "--debug", action="store_true", help="Enable debug out
 parser.add_argument("-t", "--tsize", default=100, type=int, help="Random data generations per task.")
 ARGS = parser.parse_args()
 
+LENGTH = ARGS.length
 EMBED = ARGS.embed
 # We'll add 2, reserve 0 for padding, 1 for no answer,
 VOCAB = ARGS.symbols + 2
@@ -88,3 +89,50 @@ print("# Train:", len(nfolds[0][0]))
 print("# Test:", len(nfolds[0][1]))
 
 # ---------------------------
+
+# Unification Network
+class UMLP(C.Chain):
+  """Unification feed-forward network."""
+  def __init__(self, inv_examples):
+    super().__init__()
+    self.add_persistent('inv_examples', inv_examples) # (T, I, 1+L+1)
+    # Create model parameters
+    with self.init_scope():
+      self.embed = L.EmbedID(VOCAB, EMBED, ignore_label=0)
+      self.vmap_params = C.Parameter(0.0, (len(inv_examples), VOCAB), name='vmap_params')
+      self.l1 = L.Linear(LENGTH*EMBED, EMBED*2)
+      self.l2 = L.Linear(EMBED*2, EMBED)
+      self.l3 = L.Linear(EMBED, VOCAB)
+
+  def predict(self, example):
+    """Just a forward prediction of given example."""
+    # example (B, L)
+    ex = self.embed(example) # (B, L, E)
+    flat_ex = F.reshape((ex.shape[0], -1)) # (B, L*E)
+    out = F.tanh(self.l1(flat_ex)) # (B, E*2)
+    out = F.tanh(self.l2(out)) # (B, E)
+    out = self.l3(out) # (B, V)
+    return out
+
+  def forward(self, ground_examples):
+    """Compute the forward inference pass for given stories."""
+    # ground_examples (B, 1+L+1)
+    pass
+
+# Wrapper chain for training
+class Classifier(C.Chain):
+  """Compute loss and accuracy of underlying model."""
+  def __init__(self, predictor):
+    super().__init__()
+    self.add_persistent('uniparam', 0.0)
+    with self.init_scope():
+      self.predictor = predictor
+
+  def forward(self, ground_examples):
+    """Compute total loss to train."""
+    # ground_examples (B, 1+L+1)
+    pass
+
+# ---------------------------
+
+# Setup rule repositories
