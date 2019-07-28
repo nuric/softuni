@@ -20,7 +20,7 @@ parser.add_argument("-s", "--symbols", default=4, type=int, help="Number of symb
 parser.add_argument("-r", "--rules", default=3, type=int, help="Number of rules in repository.")
 parser.add_argument("-e", "--embed", default=32, type=int, help="Embedding size.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
-parser.add_argument("-t", "--tsize", default=100, type=int, help="Per task training size.")
+parser.add_argument("-t", "--tsize", default=100, type=int, help="Random data generations per task.")
 ARGS = parser.parse_args()
 
 # ---------------------------
@@ -66,17 +66,21 @@ def gen_task4() -> np.ndarray:
   seq[:] = seq[0]
   return np.concatenate((seq, [4], [seq[0]])) # (L+2,)
 
-def gen_all(tsize: int = None) -> np.ndarray:
+def gen_all(tsize: int = None, unique: bool = True) -> np.ndarray:
   """Generate all tasks."""
   data = list()
   for i in range(1, 5):
     f = globals()['gen_task'+str(i)]
     for _ in range(tsize or ARGS.tsize):
       data.append(f())
-  return np.stack(data) # (tasks*S, L+2)
+  return np.unique(np.stack(data), axis=0) # (tasks*S, L+2)
 
-train_data = gen_all() # (S, L+2)
-val_data = gen_all(50) # (T*50, L+2)
-test_data = gen_all(50) # (T*50, L+2)
+data = gen_all() # (S, L+2)
+nfolds = C.datasets.get_cross_validation_datasets_random(data, 5) # 5 folds, list of 5 tuples train/test
+
+print("Data:", data.shape)
+print("# Folds:", len(nfolds))
+print("# Train:", len(nfolds[0][0]))
+print("# Test:", len(nfolds[0][1]))
 
 # ---------------------------
