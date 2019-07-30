@@ -96,6 +96,19 @@ print(metadata)
 
 # ---------------------------
 
+def seq_rnn_embed(vxs, exs, birnn):
+  """Embed given sequences using rnn."""
+  # vxs.shape == (..., S)
+  # exs.shape == (..., S, E)
+  seqs = F.reshape(exs, (-1,)+exs.shape[-2:]) # (X, S, E)
+  toembed = F.separate(seqs, 0) # X x [(S1, E), (S2, E), ...]
+  hs, ys = birnn(None, toembed) # (2, X, E), X x [(S1, 2*E), (S2, 2*E), ...]
+  ys = F.stack(ys) # (X, S, 2*E)
+  # ys = F.reshape(ys, ys.shape[:-1] + (2, EMBED)) # (Y, S, 2, E)
+  # ys = F.mean(ys, -2) # (Y, S, E)
+  ys = F.reshape(ys, exs.shape[:-1] + (-1,)) # (..., S, 2*E)
+  return ys
+
 # Unification Network
 class UMLP(C.Chain):
   """Unification feed-forward network."""
@@ -106,6 +119,8 @@ class UMLP(C.Chain):
     with self.init_scope():
       self.embed = L.EmbedID(VOCAB, EMBED, ignore_label=0)
       self.vmap_params = C.Parameter(0.0, (inv_examples.shape[:2]) + (VOCAB,), name='vmap_params')
+      self.uni_birnn = L.NStepBiGRU(1, EMBED, EMBED, 0)
+      self.uni_linear = L.Linear(EMBED*2, EMBED, nobias=True)
       self.l1 = L.Linear(LENGTH*EMBED+TASKS, EMBED*2)
       self.l2 = L.Linear(EMBED*2, EMBED)
       self.l3 = L.Linear(EMBED, VOCAB)
@@ -169,7 +184,21 @@ class UMLP(C.Chain):
 
     eg = self.embed(ground_inputs) # (B, L, E)
     ei = self.embed(invs_inputs) # (B, I, L, E)
-    uni_embed = vmap[..., None]*eg[:, None] + (1-vmap)[..., None]*ei # (B, I, L, E)
+
+    ground_rnn = seq_rnn_embed(ground_inputs, eg, self.uni_birnn) # (B, L, 2*E)
+    invs_rnn = seq_rnn_embed(invs_inputs, ei, self.uni_birnn) # (B, I, L, 2*E)
+    ground_rnn = self.uni_linear(ground_rnn, n_batch_axes=2) # (B, L, E)
+    invs_rnn = self.uni_linear(invs_rnn, n_batch_axes=3) # (B, I, L, E)
+    # (B, I, L, 2*E) x (B, L, 2*E) -> (B, I, L, L)
+    uni_att = F.einsum("ijke,ile->ijkl", invs_rnn, ground_rnn) # (B, I, L, L)
+    uni_att = F.softmax(uni_att, axis=-1) # (B, I, L, L)
+    self.tolog('uniatt', uni_att)
+
+    # (B, I, L, L) x (B, L, E) -> (B, I, L, E)
+    eu = F.einsum("ijkl,ile->ijke", uni_att, eg) # (B, I, L, E)
+
+    # uni_embed = vmap[..., None]*eg[:, None] + (1-vmap)[..., None]*ei # (B, I, L, E)
+    uni_embed = vmap[..., None]*eu + (1-vmap)[..., None]*ei # (B, I, L, E)
     uni_embed = F.reshape(uni_embed, uni_embed.shape[:-2] + (-1,)) # (B, I, L*E)
 
     ets = F.embed_id(task_ids-1, np.eye(TASKS, dtype=np.float32)) # (B, T)
@@ -274,6 +303,17 @@ def train(train_data, test_data, foldid: int = 0):
   with open(trainer.out + '/' + fname + '.out', 'w') as f:
     f.write("---- META ----\n")
     f.write(str(metadata))
+    # Sample run through, we'll pick task 3
+    f.write("\n---- SAMPLE ----\n")
+    test_data = np.stack(test_data) # (S, 1+L+1)
+    batch = test_data[test_data[:, 0] == 3][:1] # (1, 1+L+1)
+    f.write("\nInput:\n")
+    f.write(str(batch))
+    out = model(batch) # (1, V)
+    f.write("\nOutput:\n")
+    f.write(str(out.array))
+    f.write("\nAtt:\n")
+    f.write(str(model.log['uniatt'][0].array))
     f.write("\n---- INVS ----\n")
     f.write(str(model.inv_examples))
     f.write("\n--------\n")
