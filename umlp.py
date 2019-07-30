@@ -319,18 +319,16 @@ def train(train_data, test_data, foldid: int = 0):
     f.write("\n--------\n")
     f.write(str(model.log['vmap'][0].array))
     f.write("\n---- END ----\n")
+  if ARGS.debug:
+    import ipdb; ipdb.set_trace()
 
 # ---------------------------
 
 # Training loop
-try:
-  for i, (traind, testd) in enumerate(nfolds):
-    # We'll ensure the model sees every symbol at least once in training
-    # at test time symbols might appear in different unseen sequences
-    train_syms = np.stack(traind)[:, 1:-1]
-    assert len(np.unique(train_syms)) == VOCAB-2, "Some symbols missing from training."
-    train(traind, testd, i)
-    # exit()
-except KeyboardInterrupt:
-  if ARGS.debug:
-    import ipdb; ipdb.set_trace()
+for i, (traind, testd) in enumerate(nfolds):
+  # We'll ensure the model sees every symbol at least once in training
+  # at test time symbols might appear in different unseen sequences
+  train_syms = np.stack(traind)[:, 1:-1]
+  assert len(np.unique(train_syms)) == VOCAB-2, "Some symbols missing from training."
+  train(traind, testd, i)
+  # exit()
