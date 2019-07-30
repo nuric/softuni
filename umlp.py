@@ -22,6 +22,7 @@ parser.add_argument("-e", "--embed", default=16, type=int, help="Embedding size.
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
 parser.add_argument("-t", "--tsize", default=1000, type=int, help="Random data tries per task.")
 parser.add_argument("-bs", "--batch_size", default=64, type=int, help="Training batch size.")
+parser.add_argument("-o", "--outf", default="{name}_l{length}_s{symbols}_i{invariants}_e{embed}_f{foldid}")
 ARGS = parser.parse_args()
 
 LENGTH = ARGS.length
@@ -89,11 +90,9 @@ def gen_all(tsize: int = None, unique: bool = True) -> np.ndarray:
 data = gen_all() # (S, 1+L+1)
 nfolds = C.datasets.get_cross_validation_datasets_random(data, FOLDS) # 5 folds, list of 5 tuples train/test
 
-print("Data:", data.shape)
-print("Tasks:", np.unique(data[:,0], return_counts=True))
-print("# Folds:", len(nfolds))
-print("# Train:", len(nfolds[0][0]))
-print("# Test:", len(nfolds[0][1]))
+metadata = {'data': data.shape, 'tasks': np.unique(data[:,0], return_counts=True),
+            'folds': len(nfolds), 'train': len(nfolds[0][0]), 'test': len(nfolds[0][1])}
+print(metadata)
 
 # ---------------------------
 
@@ -241,7 +240,7 @@ def enable_unification(trainer):
 # ---------------------------
 
 # Training on single fold
-def train(train_data, test_data, idx: int = 0):
+def train(train_data, test_data, foldid: int = 0):
   """Train new UMLP on given data."""
   # Setup invariant repositories
   # we'll take I many examples for each task with different answers for each fold
@@ -255,22 +254,31 @@ def train(train_data, test_data, idx: int = 0):
   optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
   train_iter = C.iterators.SerialIterator(train_data, ARGS.batch_size)
   updater = T.StandardUpdater(train_iter, optimiser, device=-1)
-  trainer = T.Trainer(updater, (300, 'epoch'))
+  trainer = T.Trainer(updater, (300, 'epoch'), out='umlp_result')
   # ---------------------------
+  fname = ARGS.outf.format(**vars(ARGS), foldid=foldid)
   # Setup trainer extensions
   trainer.extend(enable_unification, trigger=(40, 'epoch'))
   test_iter = C.iterators.SerialIterator(test_data, 128, repeat=False, shuffle=False)
   trainer.extend(T.extensions.Evaluator(test_iter, cmodel, device=-1), name='test')
-  trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_latest.npz'), trigger=(1, 'epoch'))
-  trainer.extend(T.extensions.LogReport(log_name=ARGS.name+'_log.json'))
+  trainer.extend(T.extensions.snapshot(filename=fname+'_latest.npz'), trigger=(1, 'epoch'))
+  trainer.extend(T.extensions.LogReport(log_name=fname+'_log.json'))
   trainer.extend(T.extensions.FailOnNonNumber())
   train_keys = ['uloss', 'igloss', 'oloss', 'uacc', 'igacc', 'oacc', 'vloss']
   test_keys = ['uloss', 'oloss', 'uacc', 'oacc']
   trainer.extend(T.extensions.PrintReport(['epoch'] + ['main/'+k for k in train_keys] + ['test/main/'+k for k in test_keys] + ['elapsed_time']))
   # ---------------------------
+  print(f"---- FOLD {foldid} ----")
   trainer.run()
-  import ipdb; ipdb.set_trace()
-  print("HERE")
+  # Save learned invariants
+  with open(trainer.out + '/' + fname + '.out', 'w') as f:
+    f.write("---- META ----\n")
+    f.write(str(metadata))
+    f.write("\n---- INVS ----\n")
+    f.write(str(model.inv_examples))
+    f.write("\n--------\n")
+    f.write(str(model.log['vmap'][0].array))
+    f.write("\n---- END ----\n")
 
 # ---------------------------
 
@@ -280,8 +288,9 @@ try:
     # We'll ensure the model sees every symbol at least once in training
     # at test time symbols might appear in different unseen sequences
     train_syms = np.stack(traind)[:, 1:-1]
-    assert len(np.unique(train_syms)) == VOCAB-2, "All symbols missing from training."
+    assert len(np.unique(train_syms)) == VOCAB-2, "Some symbols missing from training."
     train(traind, testd, i)
+    # exit()
 except KeyboardInterrupt:
   if ARGS.debug:
     import ipdb; ipdb.set_trace()
