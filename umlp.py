@@ -243,18 +243,9 @@ class Classifier(C.Chain):
 # Training tools
 def select_invariants(data: list, taskid: int):
   """Select I many examples with different answers."""
-  invariants = list()
-  answers = set()
-  # This is shuffled initially
-  for d in data:
-    if d[0] == taskid and d[-1] not in answers and len(invariants) < ARGS.invariants:
-      invariants.append(d)
-      answers.add(d[-1])
-    if len(invariants) == ARGS.invariants:
-      break
-  if len(invariants) < ARGS.invariants:
-    raise ValueError("Not enough symbols to generate multiple invariants.")
-  return invariants
+  data = np.stack(data) # (S, 1+L+1)
+  np.random.shuffle(data)
+  return data[data[:, 0] == taskid][:ARGS.invariants]
 
 def enable_unification(trainer):
   """Enable unification loss function in model."""
@@ -267,7 +258,7 @@ def train(train_data, test_data, foldid: int = 0):
   """Train new UMLP on given data."""
   # Setup invariant repositories
   # we'll take I many examples for each task with different answers for each fold
-  invariants = [np.stack(select_invariants(train_data, i)) for i in range(1, 5)] # T x (I, 1+L+1)
+  invariants = [select_invariants(train_data, i) for i in range(1, 5)] # T x (I, 1+L+1)
   invariants = np.stack(invariants) # (T, I, 1+L+1)
   # ---------------------------
   # Setup model
