@@ -33,7 +33,7 @@ FOLDS = 5
 
 # ---------------------------
 
-def rand_syms(symbols: int = None, length: int = None, replace: bool = False):
+def rand_syms(symbols: int = None, length: int = None, replace: bool = True):
   """Return unique random symbols."""
   symbols = symbols or ARGS.symbols
   length = length or ARGS.length
@@ -42,37 +42,30 @@ def rand_syms(symbols: int = None, length: int = None, replace: bool = False):
 
 # Generate random data for tasks
 def gen_task1() -> np.ndarray:
-  """Task 1: head of random sequence."""
+  """Task 1: return constant symbol."""
   seq = rand_syms()
-  return np.concatenate(([1], seq, [seq[0]])) # (1+L+1,)
+  return np.concatenate(([1], seq, [2])) # (1+L+1,)
 
 def gen_task2() -> np.ndarray:
-  """Task 2: tail of random sequence."""
+  """Task 2: head of random sequence."""
   seq = rand_syms()
-  return np.concatenate(([2], seq, [seq[-1]])) # (1+L+1,)
+  return np.concatenate(([2], seq, [seq[0]])) # (1+L+1,)
 
 def gen_task3() -> np.ndarray:
-  """Task 3: item that is repeated twice."""
+  """Task 3: tail of random sequence."""
   seq = rand_syms()
+  return np.concatenate(([3], seq, [seq[-1]])) # (1+L+1,)
+
+def gen_task4() -> np.ndarray:
+  """Task 4: item that is repeated twice."""
+  seq = rand_syms(replace=False)
   # Fail case
   if np.random.rand() < 0.5:
-    return np.concatenate(([3], seq, [1]))
+    return np.concatenate(([4], seq, [1]))
   # select two random locations and make them equal
   x, y = np.random.choice(len(seq), size=2, replace=False)
   seq[x] = seq[y] # item is repeated
-  return np.concatenate(([3], seq, [seq[x]])) # (1+L+1,)
-
-def gen_task4() -> np.ndarray:
-  """Task 4: all items equal."""
-  seq = rand_syms(replace=True)
-  # Fail case
-  if np.random.rand() < 0.5:
-    while len(np.unique(seq)) == 1:
-      seq = rand_syms(replace=True)
-    return np.concatenate(([4], seq, [1])) # (1+L+1,)
-  # all items equal
-  seq[:] = seq[0]
-  return np.concatenate(([4], seq, [seq[0]])) # (1+L+1,)
+  return np.concatenate(([4], seq, [seq[x]])) # (1+L+1,)
 
 TASKS = 4
 
