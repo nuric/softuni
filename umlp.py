@@ -20,6 +20,7 @@ parser.add_argument("-s", "--symbols", default=4, type=int, help="Number of symb
 parser.add_argument("-i", "--invariants", default=3, type=int, help="Number of invariants per task.")
 parser.add_argument("-e", "--embed", default=16, type=int, help="Embedding size.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
+parser.add_argument("-nu", "--nouni", action="store_true", help="Disable unification.")
 parser.add_argument("-t", "--tsize", default=1000, type=int, help="Random data tries per task.")
 parser.add_argument("-bs", "--batch_size", default=64, type=int, help="Training batch size.")
 parser.add_argument("-o", "--outf", default="{name}_l{length}_s{symbols}_i{invariants}_e{embed}_f{foldid}")
@@ -272,7 +273,8 @@ def train(train_data, test_data, foldid: int = 0):
   # ---------------------------
   fname = ARGS.outf.format(**vars(ARGS), foldid=foldid)
   # Setup trainer extensions
-  trainer.extend(enable_unification, trigger=(40, 'epoch'))
+  if not ARGS.nouni:
+    trainer.extend(enable_unification, trigger=(40, 'epoch'))
   test_iter = C.iterators.SerialIterator(test_data, 128, repeat=False, shuffle=False)
   trainer.extend(T.extensions.Evaluator(test_iter, cmodel, device=-1), name='test')
   trainer.extend(T.extensions.snapshot(filename=fname+'_latest.npz'), trigger=(1, 'epoch'))
