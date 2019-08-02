@@ -89,18 +89,19 @@ print(metadata)
 
 # ---------------------------
 
-def seq_rnn_embed(vxs, exs, birnn):
+def seq_rnn_embed(exs, birnn, return_sequences: bool = False):
   """Embed given sequences using rnn."""
-  # vxs.shape == (..., S)
   # exs.shape == (..., S, E)
   seqs = F.reshape(exs, (-1,)+exs.shape[-2:]) # (X, S, E)
   toembed = F.separate(seqs, 0) # X x [(S1, E), (S2, E), ...]
   hs, ys = birnn(None, toembed) # (2, X, E), X x [(S1, 2*E), (S2, 2*E), ...]
-  ys = F.stack(ys) # (X, S, 2*E)
-  # ys = F.reshape(ys, ys.shape[:-1] + (2, EMBED)) # (Y, S, 2, E)
-  # ys = F.mean(ys, -2) # (Y, S, E)
-  ys = F.reshape(ys, exs.shape[:-1] + (-1,)) # (..., S, 2*E)
-  return ys
+  if return_sequences:
+    ys = F.stack(ys) # (X, S, 2*E)
+    ys = F.reshape(ys, exs.shape[:-1] + (-1,)) # (..., S, 2*E)
+    return ys
+  hs = F.moveaxis(hs, 0, -2) # (X, 2, E)
+  hs = F.reshape(hs, exs.shape[:-2] + (-1,)) # (..., 2*E)
+  return hs
 
 # Unification Network
 class UMLP(C.Chain):
