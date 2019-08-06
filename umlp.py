@@ -21,7 +21,8 @@ parser.add_argument("-i", "--invariants", default=3, type=int, help="Number of i
 parser.add_argument("-e", "--embed", default=16, type=int, help="Embedding size.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
 parser.add_argument("-nu", "--nouni", action="store_true", help="Disable unification.")
-parser.add_argument("-t", "--tsize", default=1000, type=int, help="Random data tries per task.")
+parser.add_argument("-t", "--tsize", default=0, type=int, help="Training size per task, 0 to use everything.")
+parser.add_argument("-g", "--gsize", default=1000, type=int, help="Random data tries per task.")
 parser.add_argument("-bs", "--batch_size", default=64, type=int, help="Training batch size.")
 parser.add_argument("-o", "--outf", default="{name}_l{length}_s{symbols}_i{invariants}_e{embed}_f{foldid}")
 ARGS = parser.parse_args()
@@ -70,12 +71,12 @@ def gen_task4() -> np.ndarray:
 
 TASKS = 4
 
-def gen_all(tsize: int = None, unique: bool = True) -> np.ndarray:
+def gen_all(unique: bool = True) -> np.ndarray:
   """Generate all tasks."""
   data = list()
   for i in range(1, TASKS+1):
     f = globals()['gen_task'+str(i)]
-    for _ in range(tsize or ARGS.tsize):
+    for _ in range(ARGS.gsize):
       data.append(f())
   data = np.unique(np.stack(data), axis=0) # (tasks*S, 1+L+1)
   np.random.shuffle(data)
@@ -248,9 +249,10 @@ def select_invariants(data: list, taskid: int):
   np.random.shuffle(data)
   return data[data[:, 0] == taskid][:ARGS.invariants]
 
-def enable_unification(trainer):
+def print_vmap(trainer):
   """Enable unification loss function in model."""
-  trainer.updater.get_optimizer('main').target.uniparam = 1.0
+  print(trainer.updater.get_optimizer('main').target.predictor.inv_examples)
+  print(F.sigmoid(trainer.updater.get_optimizer('main').target.predictor.vmap_params*10))
 
 # ---------------------------
 
@@ -266,15 +268,14 @@ def train(train_data, test_data, foldid: int = 0):
   model = UMLP(invariants)
   cmodel = Classifier(model)
   optimiser = C.optimizers.Adam().setup(cmodel)
-  optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
   train_iter = C.iterators.SerialIterator(train_data, ARGS.batch_size)
   updater = T.StandardUpdater(train_iter, optimiser, device=-1)
   trainer = T.Trainer(updater, (300, 'epoch'), out='umlp_result')
   # ---------------------------
   fname = ARGS.outf.format(**vars(ARGS), foldid=foldid)
   # Setup trainer extensions
-  if not ARGS.nouni:
-    trainer.extend(enable_unification, trigger=(40, 'epoch'))
+  if ARGS.debug:
+    trainer.extend(print_vmap, trigger=(40, 'epoch'))
   test_iter = C.iterators.SerialIterator(test_data, 128, repeat=False, shuffle=False)
   trainer.extend(T.extensions.Evaluator(test_iter, cmodel, device=-1), name='test')
   trainer.extend(T.extensions.snapshot(filename=fname+'_latest.npz'), trigger=(1, 'epoch'))
@@ -285,11 +286,20 @@ def train(train_data, test_data, foldid: int = 0):
   trainer.extend(T.extensions.PrintReport(['epoch'] + ['main/'+k for k in train_keys] + ['test/main/'+k for k in test_keys] + ['elapsed_time']))
   # ---------------------------
   print(f"---- FOLD {foldid} ----")
-  trainer.run()
+  try:
+    trainer.run()
+  except KeyboardInterrupt:
+    if not ARGS.debug:
+      return
   # Save learned invariants
   with open(trainer.out + '/' + fname + '.out', 'w') as f:
     f.write("---- META ----\n")
-    f.write(str(metadata))
+    train_data = np.stack(train_data)
+    test_data = np.stack(test_data)
+    meta = {'train': train_data.shape, 'train_tasks': np.unique(train_data[:,0], return_counts=True),
+            'test': test_data.shape, 'test_tasks': np.unique(test_data[:,0], return_counts=True),
+            'foldid': foldid}
+    f.write(str(meta))
     f.write("\n---- INVS ----\n")
     f.write(str(model.inv_examples))
     f.write("\n--------\n")
@@ -305,11 +315,12 @@ def train(train_data, test_data, foldid: int = 0):
       f.write("\nOutput:\n")
       f.write(str(out.array))
       f.write("\nAtt:\n")
-      # f.write(str(model.log['uniatt'][0].array))
-      f.write(str(model.log['invatt'][0].array))
+      f.write(str(model.log['uniatt'][0].array))
     f.write("\n---- END ----\n")
   if ARGS.debug:
+    print(batch)
     import ipdb; ipdb.set_trace()
+    out = model(batch)
 
 # ---------------------------
 
@@ -317,7 +328,8 @@ def train(train_data, test_data, foldid: int = 0):
 for i, (traind, testd) in enumerate(nfolds):
   # We'll ensure the model sees every symbol at least once in training
   # at test time symbols might appear in different unseen sequences
+  if ARGS.tsize > 0:
+    traind = traind[:ARGS.tsize*TASKS]
   train_syms = np.stack(traind)[:, 1:-1]
   assert len(np.unique(train_syms)) == VOCAB-2, "Some symbols missing from training."
   train(traind, testd, i)
-  # exit()
