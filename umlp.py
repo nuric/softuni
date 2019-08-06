@@ -280,20 +280,20 @@ def train(train_data, test_data, foldid: int = 0):
   optimiser = C.optimizers.Adam().setup(cmodel)
   train_iter = C.iterators.SerialIterator(train_data, ARGS.batch_size)
   updater = T.StandardUpdater(train_iter, optimiser, device=-1)
-  trainer = T.Trainer(updater, (300, 'epoch'), out='umlp_result')
+  trainer = T.Trainer(updater, (2000, 'iteration'), out='umlp_result')
   # ---------------------------
   fname = ARGS.outf.format(**vars(ARGS), foldid=foldid)
   # Setup trainer extensions
   if ARGS.debug:
-    trainer.extend(print_vmap, trigger=(40, 'epoch'))
+    trainer.extend(print_vmap, trigger=(200, 'iteration'))
   test_iter = C.iterators.SerialIterator(test_data, 128, repeat=False, shuffle=False)
-  trainer.extend(T.extensions.Evaluator(test_iter, cmodel, device=-1), name='test')
-  trainer.extend(T.extensions.snapshot(filename=fname+'_latest.npz'), trigger=(1, 'epoch'))
-  trainer.extend(T.extensions.LogReport(log_name=fname+'_log.json'))
+  trainer.extend(T.extensions.Evaluator(test_iter, cmodel, device=-1), name='test', trigger=(10, 'iteration'))
+  # trainer.extend(T.extensions.snapshot(filename=fname+'_latest.npz'), trigger=(100, 'iteration'))
+  trainer.extend(T.extensions.LogReport(log_name=fname+'_log.json', trigger=(10, 'iteration')))
   trainer.extend(T.extensions.FailOnNonNumber())
   train_keys = ['uloss', 'igloss', 'oloss', 'uacc', 'igacc', 'oacc', 'vloss']
   test_keys = ['uloss', 'oloss', 'uacc', 'oacc']
-  trainer.extend(T.extensions.PrintReport(['epoch'] + ['main/'+k for k in train_keys] + ['test/main/'+k for k in test_keys] + ['elapsed_time']))
+  trainer.extend(T.extensions.PrintReport(['iteration'] + ['main/'+k for k in train_keys] + ['test/main/'+k for k in test_keys] + ['elapsed_time']))
   # ---------------------------
   print(f"---- FOLD {foldid} ----")
   try:
@@ -341,5 +341,5 @@ for i, (traind, testd) in enumerate(nfolds):
   if ARGS.tsize > 0:
     traind = traind[:ARGS.tsize*TASKS]
   train_syms = np.stack(traind)[:, 1:-1]
-  assert len(np.unique(train_syms)) == VOCAB-2, "Some symbols missing from training."
+  assert len(np.unique(train_syms)) == VOCAB-2, "Some symbols are missing from training."
   train(traind, testd, i)
