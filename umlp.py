@@ -91,12 +91,12 @@ print(metadata)
 
 # ---------------------------
 
-def seq_rnn_embed(exs, birnn, return_sequences: bool = False):
+def seq_rnn_embed(exs, birnn, init_state=None, return_sequences: bool = False):
   """Embed given sequences using rnn."""
   # exs.shape == (..., S, E)
   seqs = F.reshape(exs, (-1,)+exs.shape[-2:]) # (X, S, E)
   toembed = F.separate(seqs, 0) # X x [(S1, E), (S2, E), ...]
-  hs, ys = birnn(None, toembed) # (2, X, E), X x [(S1, 2*E), (S2, 2*E), ...]
+  hs, ys = birnn(init_state, toembed) # (2, X, E), X x [(S1, 2*E), (S2, 2*E), ...]
   if return_sequences:
     ys = F.stack(ys) # (X, S, 2*E)
     ys = F.reshape(ys, exs.shape[:-1] + (-1,)) # (..., S, 2*E)
@@ -114,6 +114,7 @@ class UMLP(C.Chain):
     # Create model parameters
     with self.init_scope():
       self.embed = L.EmbedID(VOCAB, EMBED, ignore_label=0)
+      self.task_embed = L.EmbedID(TASKS, EMBED)
       self.vmap_params = C.Parameter(0.0, (inv_examples.shape[:2]) + (VOCAB,), name='vmap_params')
       self.uni_birnn = L.NStepBiGRU(1, EMBED, EMBED, 0)
       self.uni_linear = L.Linear(EMBED*2, EMBED, nobias=True)
@@ -173,19 +174,27 @@ class UMLP(C.Chain):
     invariant_inputs = self.inv_examples[..., 1:-1] # (T, I, L)
     invs_inputs = invariant_inputs[task_ids-1] # (B, I, L)
 
+    # Compute variable map
     vmap = F.sigmoid(self.vmap_params*10) # (T, I, V)
     self.tolog('vmap', vmap)
     vmap = vmap[task_ids-1] # (B, I, V)
     vmap = vmap[np.arange(vmap.shape[0])[:, None, None], np.arange(vmap.shape[1])[None, :, None], invs_inputs] # (B, I, L)
 
+    # Embed ground examples
     eg = self.embed(ground_inputs) # (B, L, E)
     ei = self.embed(invs_inputs) # (B, I, L, E)
 
-    ground_rnn = seq_rnn_embed(ground_inputs, eg, self.uni_birnn) # (B, L, 2*E)
-    invs_rnn = seq_rnn_embed(invs_inputs, ei, self.uni_birnn) # (B, I, L, 2*E)
+    # Embed tasks for RNN init states
+    embed_tasks = self.task_embed(task_ids-1) # (B, E)
+    embed_tasks = F.repeat(embed_tasks[None, ...], 2, axis=0) # (2, B, E)
+
+    # Extract unification features
+    ground_rnn = seq_rnn_embed(eg, self.uni_birnn, init_state=embed_tasks, return_sequences=True) # (B, L, 2*E)
+    embed_tasks = F.repeat(embed_tasks, invs_inputs.shape[1], axis=1) # (2, B*I, E)
+    invs_rnn = seq_rnn_embed(ei, self.uni_birnn, init_state=embed_tasks, return_sequences=True) # (B, I, L, 2*E)
     ground_rnn = self.uni_linear(ground_rnn, n_batch_axes=2) # (B, L, E)
     invs_rnn = self.uni_linear(invs_rnn, n_batch_axes=3) # (B, I, L, E)
-    # (B, I, L, 2*E) x (B, L, 2*E) -> (B, I, L, L)
+    # (B, I, L, E) x (B, L, E) -> (B, I, L, L)
     uni_att = F.einsum("ijke,ile->ijkl", invs_rnn, ground_rnn) # (B, I, L, L)
     uni_att = F.softmax(uni_att, axis=-1) # (B, I, L, L)
     self.tolog('uniatt', uni_att)
@@ -197,13 +206,14 @@ class UMLP(C.Chain):
     uni_embed = vmap[..., None]*eu + (1-vmap)[..., None]*ei # (B, I, L, E)
     uni_embed = F.reshape(uni_embed, uni_embed.shape[:-2] + (-1,)) # (B, I, L*E)
 
+    # Make the prediction on the unification
     ets = F.embed_id(task_ids-1, np.eye(TASKS, dtype=np.float32)) # (B, T)
-    ets = F.tile(ets[:, None], (1, uni_embed.shape[1], 1)) # (B, I, T)
-
-    uni_inputs = F.concat((uni_embed, ets), axis=-1) # (B, I, L*E+T)
+    ets = F.repeat(ets[:, None], vmap.shape[1], axis=1) # (B, I, T)
+    uni_inputs = F.concat((uni_embed, iets), axis=-1) # (B, I, L*E+T)
     uni_preds = self.predict(uni_inputs) # (B, I, V)
-    # Aggregate
-    final_uni_preds = F.max(uni_preds, axis=1) # (B, V)
+
+    # Aggregate results from each invariant
+    final_uni_preds = F.sum(uni_preds, -2) # (B, V)
     # ---------------------------
     return final_uni_preds # (B, V)
 
