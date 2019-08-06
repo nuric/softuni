@@ -61,7 +61,7 @@ def gen_task4() -> np.ndarray:
   """Task 4: item that is repeated twice."""
   seq = rand_syms(replace=False)
   # Fail case
-  if np.random.rand() < 0.5:
+  if np.random.rand() < (1/ARGS.symbols):
     return np.concatenate(([4], seq, [1]))
   # select two random locations and make them equal
   x, y = np.random.choice(len(seq), size=2, replace=False)
