@@ -24,7 +24,7 @@ parser.add_argument("-nu", "--nouni", action="store_true", help="Disable unifica
 parser.add_argument("-t", "--tsize", default=0, type=int, help="Training size per task, 0 to use everything.")
 parser.add_argument("-g", "--gsize", default=1000, type=int, help="Random data tries per task.")
 parser.add_argument("-bs", "--batch_size", default=64, type=int, help="Training batch size.")
-parser.add_argument("-o", "--outf", default="{name}_l{length}_s{symbols}_i{invariants}_e{embed}_f{foldid}")
+parser.add_argument("-o", "--outf", default="{name}_l{length}_s{symbols}_i{invariants}_e{embed}_t{tsize}_f{foldid}")
 ARGS = parser.parse_args()
 
 LENGTH = ARGS.length
@@ -209,7 +209,7 @@ class UMLP(C.Chain):
     # Make the prediction on the unification
     ets = F.embed_id(task_ids-1, np.eye(TASKS, dtype=np.float32)) # (B, T)
     ets = F.repeat(ets[:, None], vmap.shape[1], axis=1) # (B, I, T)
-    uni_inputs = F.concat((uni_embed, iets), axis=-1) # (B, I, L*E+T)
+    uni_inputs = F.concat((uni_embed, ets), axis=-1) # (B, I, L*E+T)
     uni_preds = self.predict(uni_inputs) # (B, I, V)
 
     # Aggregate results from each invariant
@@ -222,7 +222,7 @@ class Classifier(C.Chain):
   """Compute loss and accuracy of underlying model."""
   def __init__(self, predictor):
     super().__init__()
-    self.add_persistent('uniparam', 0.0)
+    self.add_persistent('uniparam', not ARGS.nouni)
     with self.init_scope():
       self.predictor = predictor
 
@@ -244,11 +244,11 @@ class Classifier(C.Chain):
       report[k+'loss'] = self.predictor.log[k+'loss'][0]
       report[k+'acc'] = self.predictor.log[k+'acc'][0]
 
-    vloss = F.sum(self.predictor.log['vmap'][0]) # ()
+    vloss = F.sum(self.predictor.vmap_params) # ()
     report['vloss'] = vloss
     # ---------------------------
     C.report(report, self)
-    return self.uniparam*(uloss + 0.1*vloss + report['igloss']) + report['oloss']
+    return self.uniparam*(uloss + 0.1*vloss + report['igloss']) + (1-self.uniparam)*report['oloss']
 
 # ---------------------------
 
