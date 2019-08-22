@@ -1,6 +1,5 @@
 """Unification MLP."""
 import argparse
-import json
 import numpy as np
 import chainer as C
 import chainer.links as L
@@ -16,8 +15,8 @@ parser = argparse.ArgumentParser(description="Run UMLP on randomly generated tas
 # parser.add_argument("task", help="Task name to solve.")
 parser.add_argument("name", help="Name prefix for saving files etc.")
 parser.add_argument("-l", "--length", default=4, type=int, help="Fixed length of symbol sequences.")
-parser.add_argument("-s", "--symbols", default=4, type=int, help="Number of symbols.")
-parser.add_argument("-i", "--invariants", default=3, type=int, help="Number of invariants per task.")
+parser.add_argument("-s", "--symbols", default=8, type=int, help="Number of symbols.")
+parser.add_argument("-i", "--invariants", default=1, type=int, help="Number of invariants per task.")
 parser.add_argument("-e", "--embed", default=16, type=int, help="Embedding size.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
 parser.add_argument("-nu", "--nouni", action="store_true", help="Disable unification.")
@@ -71,21 +70,21 @@ def gen_task4() -> np.ndarray:
 
 TASKS = 4
 
-def gen_all(unique: bool = True) -> np.ndarray:
+def gen_all() -> np.ndarray:
   """Generate all tasks."""
-  data = list()
+  gdata = list()
   for i in range(1, TASKS+1):
     f = globals()['gen_task'+str(i)]
     for _ in range(ARGS.gsize):
-      data.append(f())
-  data = np.unique(np.stack(data), axis=0) # (tasks*S, 1+L+1)
-  np.random.shuffle(data)
-  return data
+      gdata.append(f())
+  gdata = np.unique(np.stack(gdata), axis=0) # (tasks*S, 1+L+1)
+  np.random.shuffle(gdata)
+  return gdata
 
 data = gen_all() # (S, 1+L+1)
 nfolds = C.datasets.get_cross_validation_datasets_random(data, FOLDS) # 5 folds, list of 5 tuples train/test
 
-metadata = {'data': data.shape, 'tasks': np.unique(data[:,0], return_counts=True),
+metadata = {'data': data.shape, 'tasks': np.unique(data[:, 0], return_counts=True),
             'folds': len(nfolds), 'train': len(nfolds[0][0]), 'test': len(nfolds[0][1])}
 print(metadata)
 
@@ -239,7 +238,6 @@ class Classifier(C.Chain):
     report['uacc'] = uacc
     # ---------------------------
     # Aux lossess
-    keys = ['ig', 'o']
     for k in ['ig', 'o']:
       report[k+'loss'] = self.predictor.log[k+'loss'][0]
       report[k+'acc'] = self.predictor.log[k+'acc'][0]
