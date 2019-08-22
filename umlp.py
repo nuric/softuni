@@ -28,8 +28,8 @@ ARGS = parser.parse_args()
 
 LENGTH = ARGS.length
 EMBED = ARGS.embed
-# We'll add 2, reserve 0 for padding, 1 for no answer,
-VOCAB = ARGS.symbols + 2
+# We'll add 1, reserve 0 for padding
+VOCAB = ARGS.symbols + 1
 FOLDS = 5
 
 # ---------------------------
@@ -38,8 +38,8 @@ def rand_syms(symbols: int = None, length: int = None, replace: bool = True):
   """Return unique random symbols."""
   symbols = symbols or ARGS.symbols
   length = length or ARGS.length
-  # We'll add 2, reserve 0 for padding, 1 for no answer,
-  return np.random.choice(symbols, size=length, replace=replace) + 2
+  # We'll add 1, reserve 0 for padding
+  return np.random.choice(symbols, size=length, replace=replace) + 1
 
 # Generate random data for tasks
 def gen_task1() -> np.ndarray:
@@ -60,9 +60,6 @@ def gen_task3() -> np.ndarray:
 def gen_task4() -> np.ndarray:
   """Task 4: item that is repeated twice."""
   seq = rand_syms(replace=False)
-  # Fail case
-  if np.random.rand() < (1/ARGS.symbols):
-    return np.concatenate(([4], seq, [1]))
   # select two random locations and make them equal
   x, y = np.random.choice(len(seq), size=2, replace=False)
   seq[x] = seq[y] # item is repeated
@@ -339,5 +336,5 @@ for i, (traind, testd) in enumerate(nfolds):
   if ARGS.tsize > 0:
     traind = traind[:ARGS.tsize*TASKS]
   train_syms = np.stack(traind)[:, 1:-1]
-  assert len(np.unique(train_syms)) == VOCAB-2, "Some symbols are missing from training."
+  assert len(np.unique(train_syms)) == VOCAB-1, "Some symbols are missing from training."
   train(traind, testd, i)
