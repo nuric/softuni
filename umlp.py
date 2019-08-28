@@ -116,7 +116,7 @@ class UMLP(C.Chain):
       self.uni_linear = L.Linear(EMBED*2, EMBED, nobias=True)
       self.l1 = L.Linear(LENGTH*EMBED+TASKS, EMBED*2)
       self.l2 = L.Linear(EMBED*2, EMBED)
-      self.l3 = L.Linear(EMBED, VOCAB)
+      self.l3 = L.Linear(EMBED, EMBED)
     self.log = None
 
   def tolog(self, key, value):
@@ -130,7 +130,9 @@ class UMLP(C.Chain):
     nbaxes = len(combined_x.shape)-1
     out = F.tanh(self.l1(combined_x, n_batch_axes=nbaxes)) # (..., E*2)
     out = F.tanh(self.l2(out, n_batch_axes=nbaxes)) # (..., E)
-    return self.l3(out, n_batch_axes=nbaxes) # (..., V)
+    out = self.l3(out, n_batch_axes=nbaxes) # (..., E)
+    out = out @ self.embed.W.T # (..., V)
+    return out
 
   def embed_predict(self, examples):
     """Just a forward prediction of given example."""
