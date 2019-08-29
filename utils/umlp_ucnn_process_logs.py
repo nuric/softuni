@@ -8,7 +8,13 @@ parser.add_argument("fpath", nargs='+', help="Log file path.")
 parser.add_argument("-hd", "--header", action="store_true", help="Just print the header.")
 ARGS = parser.parse_args()
 
-pkeys = ['name', 'length', 'symbols', 'invariants', 'embed', 'fold']
+if 'ucnn' in ARGS.fpath[0]:
+  pkeys = ['name', 'symbols', 'invariants', 'embed', 'tsize', 'fold']
+elif 'umlp' in ARGS.fpath[0]:
+  pkeys = ['name', 'length', 'symbols', 'invariants', 'embed', 'tsize', 'fold']
+else:
+  raise ValueError("Unknown log file type.")
+
 keys = [
   "main/uloss",
   "main/uacc",
@@ -45,8 +51,7 @@ for file_path in ARGS.fpath:
     log = json.load(f)
 
   pvals = [params[0]] + num_params
-  # for l in log:
-  for l in log[-1:]:
+  for l in log:
     try:
       vals = [l[k] for k in keys]
       print(*(pvals+vals), sep=',')
