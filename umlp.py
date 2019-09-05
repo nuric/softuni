@@ -332,11 +332,13 @@ def train(train_data, test_data, foldid: int = 0):
 # ---------------------------
 
 # Training loop
-for i, (traind, testd) in enumerate(nfolds):
+for foldidx, (traind, testd) in enumerate(nfolds):
   # We'll ensure the model sees every symbol at least once in training
   # at test time symbols might appear in different unseen sequences
+  vtraind = np.stack(traind)
   if ARGS.tsize > 0:
-    traind = traind[:ARGS.tsize*TASKS]
-  train_syms = np.stack(traind)[:, 1:-1]
+    # For each task select at most tsize many examples
+    vtraind = np.concatenate([vtraind[vtraind[:, 0] == tid][:ARGS.tsize] for tid in range(1, TASKS+1)]) # (<=tsize, 1+L+1)
+  train_syms = vtraind[:, 1:-1]
   assert len(np.unique(train_syms)) == VOCAB-1, "Some symbols are missing from training."
-  train(traind, testd, i)
+  train(vtraind, testd, foldidx)
