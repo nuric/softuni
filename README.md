@@ -57,8 +57,6 @@ The training for unification feed-forward networks and unification convolutional
 
 ```bash
 PYTHON=python3
-SCRIPT=umlp.py
-CMD="$PYTHON $SCRIPT"
 
 for type in mlp cnn; do
   echo "Running $type baseline"
@@ -73,14 +71,7 @@ for type in mlp cnn; do
 done
 ```
 
-To aggregate the log files into a csv file, you can use the utils provided:
-
-```bash
-for type in umlp ucnn; do
-  python3 utils/umlp_ucnn_process_logs.py -hd $type_result/*_log.json > $type_results.csv
-  python3 utils/umlp_ucnn_process_logs.py $type_result/*_log.json >> $type_results.csv
-done
-```
+You can then aggregate and analyse the results using the provided notebook: `analyse_umlp_ucnn.ipynb`
 
 ### Unification Memory Networks
 All the code for training and debugging including plotting is contained in `umn.py`. After the data is downloaded / generated:
@@ -116,3 +107,16 @@ python3 umn.py data/tasks_1-20_v1-2/en/qa1_single-supporting-fact_train.txt qa01
 ```
 
 The `debug` flag drops into `ipdb` after the training with a test story that produced the wrong answer or the last test story for inspection.
+
+## FAQ
+
+ - **Why in some parts of the source code are invariants referred to as rules?** We initially referred to invariants as rules in how humans abstract away common patterns as rule. However, a rule relates to logic and logical constructs. Since our motivation stems from a cognitive perspective, to avoid confusion we refrained from using rules, ground rules etc. and call them invariants.
+
+## Built With
+
+  - [Chainer](https://chainer.org) - deep learning framework
+  - [Matplotlib](https://matplotlib.org/) - main plotting library
+  - [seaborn](https://seaborn.pydata.org/) - helper plotting library for some charts
+  - [NumPy](http://www.numpy.org/) - main numerical library for data vectorisation
+  - [Pandas](https://pandas.pydata.org/) - helper data manipulation library
+  - [jupyter](https://jupyter.org) - interactive environment to analyse data / results
