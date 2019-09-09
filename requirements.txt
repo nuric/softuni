@@ -2,8 +2,9 @@
 numpy
 chainer
 sklearn
+pandas
 # Tools
-pylint
+jupyter
 # Plotting
 matplotlib
 seaborn
