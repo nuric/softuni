@@ -110,7 +110,7 @@ The `debug` flag drops into `ipdb` after the training with a test story that pro
 
 ## FAQ
 
- - **Why in some parts of the source code are invariants referred to as rules?** We initially referred to invariants as rules in how humans abstract away common patterns as rule. However, a rule relates to logic and logical constructs. Since our motivation stems from a cognitive perspective, to avoid confusion we refrained from using rules, ground rules etc. and call them invariants.
+ - **Why in some parts of the source code are invariants referred to as rules?** We initially referred to invariants as rules in how humans abstract away common patterns as a rule. However, a rule relates to logic and logical constructs. Since neither the invariant structure needs to be rule-like nor the variables carry logical semantics, we decided to call them invariants.
 
 ## Built With
 
