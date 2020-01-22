@@ -79,7 +79,7 @@ def data_stats(dset):
 word2idx = dict()
 def encode_sent(encode: bool, sent: str):
   """Encode given sentence."""
-  s = sent.translate(str.maketrans('', '', string.punctuation))
+  s = sent.translate(str.maketrans(string.punctuation, ' '*len(string.punctuation)))
   s = s.strip().lower()
   s = re.sub(' +', ' ', s)
   ws = s.split(' ')
@@ -98,31 +98,25 @@ df['enc_phrase'] = df['phrase'].apply(partial(encode_sent, True))
 df['proc_phrase'] = df['phrase'].apply(partial(encode_sent, False))
 df['length'] = df['enc_phrase'].apply(len)
 # Remove short phrases
-df = df[(df.length > 3) & (df.length < ARGS.length)]
+df = df[(df.length > 3) & (df.length <= ARGS.length)]
 print(df)
 data = C.datasets.TupleDataset(df['enc_phrase'].to_numpy(), df['label'].to_numpy())
-
-# Load IMDB data
-# Using https://github.com/keras-team/keras/blob/master/keras/datasets/imdb.py
-# Download from https://s3.amazonaws.com/text-datasets/imdb.npz
-# And https://s3.amazonaws.com/text-datasets/imdb_word_index.json
-# with np.load('data/imdb/imdb.npz', allow_pickle=True) as f:
-  # traind = C.datasets.TupleDataset(f['x_train'], f['y_train'])
-  # testd = C.datasets.TupleDataset(f['x_test'], f['y_test'])
-  # traind = prep_dataset(traind)
-  # testd = prep_dataset(testd)
-  # testd = filter_per_label(testd, ARGS.test_size)
-
-# with open('data/imdb/imdb_word_index.json') as f:
-  # word2idx = json.load(f)
-  # # +3 for start, end and oov tokens
-  # # the indexing starts from 1
-  # word2idx = {k: v+3 for k, v in word2idx.items()}
-  # word2idx['PAD'] = 0
-  # word2idx['START'] = 1
-  # word2idx['END'] = 2
-  # word2idx['OOV'] = 3
 idx2word = {v:k for k, v in word2idx.items()}
+
+# Load word embeddings
+print("Loading word embeddings.")
+wordembeds = np.zeros((len(word2idx)+1, 300), dtype=np.float32)
+word_count = 0
+with open('data/numberbatch-en-19.08.txt') as f:
+  for i, l in enumerate(f):
+    if i == 0:
+      continue  # skip first line
+    word, *enc = l.split(' ')
+    if word in word2idx:
+      word_count += 1
+      wordembeds[word2idx[word]] = np.array(enc)
+print(f"Loaded {word_count} many vectors out of {len(word2idx)}.")
+
 
 def print_tasks(in_data, file=sys.stdout):
   """Print task."""
@@ -144,16 +138,6 @@ print(metadata)
 
 # ---------------------------
 
-def sequence_embed(embed, xs):
-  """Embed sequences of integers."""
-  # xt [(L1,), (L2,), ...]
-  xs = list(xs)  # Chainer quirk expects lists
-  x_len = [len(x) for x in xs]
-  x_section = np.cumsum(x_len[:-1])
-  ex = embed(F.concat(xs, axis=0))
-  exs = F.split_axis(ex, x_section, 0)
-  return exs
-
 # ---------------------------
 
 # Unification Network
@@ -168,16 +152,21 @@ class URNN(C.Chain):
     self.add_persistent('inv_labels', inv_labels) # (I,)
     # Create model parameters
     with self.init_scope():
-      self.embed = L.EmbedID(len(word2idx)+1, 32, ignore_label=0)
-      self.vmap_params = C.Parameter(0.0, (len(inv_texts), maxilen), name='vmap_params')
-      self.bilstm = L.NStepBiLSTM(1, 32, 32, 0)
-      self.uni_linear = L.Linear(32*2, 32)
-      self.fc1 = L.Linear(32*2, 1)
+      # self.embed = L.EmbedID(len(word2idx)+1, 32, ignore_label=0)
+      # self.uni_embed = L.EmbedID(len(word2idx)+1, 32, ignore_label=0)
+      self.uni_embed = L.Linear(300, 32)
+      self.var_linear = L.Linear(300, 1)
+      self.bigru_state = C.Parameter(0.0, (1, 1, 32), name='bigru_state')
+      self.bigru = L.NStepGRU(1, 300, 32, 0)
+      # self.uni_bigru = L.NStepBiGRU(1, 32, 32, 0)
+      # self.uni_linear = L.Linear(32*2, 32)
+      self.fc1 = L.Linear(32*1, 1)
 
   def predict(self, embed_seqs):
     """Predict class on embeeded seqs."""
     # embed_seqs B x [(L1, E), (L2, E), ...]
-    hy, _, ys = self.bilstm(None, None, embed_seqs)  # (2, B, E), _, B x [(L1, E), ...]
+    init_state = F.tile(self.bigru_state, (1, len(embed_seqs), 1))  # (2, B, E)
+    hy, ys = self.bigru(init_state, embed_seqs)  # (2, B, E), B x [(L1, E), ...]
     hy = F.transpose(hy, [1, 0, 2])  # (B, 2, E)
     hy = F.reshape(hy, [hy.shape[0], -1])  # (B, 2*E)
     hy = F.dropout(hy, 0.5)  # (B, 2*E)
@@ -189,54 +178,68 @@ class URNN(C.Chain):
     # texts [(L1,), (L2,), (L3,)]
     report = dict()
     # ---------------------------
+    def sequence_embed(xs):
+      """Embed sequences of integers."""
+      # xt [(L1,), (L2,), ...]
+      xs = list(xs)  # Chainer quirk expects lists
+      x_len = [len(x) for x in xs]
+      x_section = np.cumsum(x_len[:-1])
+      x_concat = F.concat(xs, axis=0)  # (L1+L2...,)
+      # ex = self.embed(x_concat) # (..., E)
+      ex = F.embed_id(x_concat, wordembeds, ignore_label=0)
+      uex = self.uni_embed(ex)  # (..., E)
+      uvx = self.var_linear(ex)  # (..., 1)
+      uvx = F.sigmoid(F.squeeze(uvx, -1))  # (..., )
+      evx = F.concat([ex, uvx[:, None]], -1)  # (..., E+1)
+      evxs = F.split_axis(evx, x_section, 0)
+      uexs = F.split_axis(uex, x_section, 0)
+      uvs = F.split_axis(uvx, x_section, 0)
+      return evxs, uexs, uvs
     # Ground example prediction
-    oe = sequence_embed(self.embed, texts)  # B x [(L1, E), (L2, E), ...]
-    oys, opred = self.predict(oe)  # B x [(L1, E), ...], (B, 1)
+    ove, ue, uv = sequence_embed(texts)  # B x [(L1, E+1), (L2, E+1), ...], Bx[(L1, E), ...], B x [(L1,), (L2,), ...]
+    oys, opred = self.predict(ove)  # B x [(L1, E), ...], (B, 1)
     report['opred'] = opred
-    # Invariant ground prediction
-    ie = sequence_embed(self.embed, self.inv_texts)  # I x ([L1, E), ...]
-    iys, ipred = self.predict(ie)  # I x [(L1, E), ..], (I, 1)
-    report['igpred'] = ipred
     # ---------------------------
-    # Extract unification features
-    iufeats = F.pad_sequence(iys)  # (I, LI, E)
-    oufeats = F.pad_sequence(oys)  # (B, LB, E)
-    iufeats = self.uni_linear(iufeats, n_batch_axes=2)  # (I, LI, E)
-    oufeats = self.uni_linear(oufeats, n_batch_axes=2)  # (B, LB, E)
-    # ---------------------------
-    # Unification attention
-    # (B, LB, E) x (I, LI, E) -> (B, I, LI, LB)
-    uniatt = F.einsum('ble,ife->bifl', oufeats, iufeats)
-    # Mask to stop attention to padding
+    # Compute padding mask
     padded_texts = F.pad_sequence(list(texts)).array  # (B, LB)
     mask = -100*(padded_texts == 0)  # (B, LB)
-    # Compute attention
-    uniatt += mask[:, None, None]  # (B, I, LI, LB)
-    uniatt = F.softmax(uniatt, -1)  # (B, I, LI, LB)
+    # ---------------------------
+    # Extract unification features
+    oufeats = F.pad_sequence(ue)  # (B, LB, E)
+    ouvar = F.pad_sequence(uv)  # (B, LB)
+    report['vmap'] = ouvar
+    # ---------------------------
+    # Pick a random example to unify with
+    uidxs = np.random.permutation(len(texts))  # (B,)
+    while np.any(uidxs == np.arange(len(texts))):
+      uidxs = np.random.permutation(len(texts))  # (B,)
+    report['uidxs'] = uidxs
+    # ---------------------------
+    # Unification attention
+    # (I, LB, E) x (B, LB, E) -> (I, LB, LB)
+    uniatt = F.einsum('ile,ife->ilf', oufeats[uidxs], oufeats)
+    # Mask to stop attention to padding
+    uniatt += mask[:, None]  # (I, LB, LB)
+    uniatt = F.softmax(uniatt, -1)  # (I, LB, LB)
+    uniatt *= (padded_texts != 0)[uidxs, ..., None]  # (I, LB, LB)
     report['uniatt'] = uniatt
     # ---------------------------
-    # Compute variable map
-    vmap = F.sigmoid(self.vmap_params*10) # (I, LI)
-    # Mask out padding
-    padded_invs = F.pad_sequence(list(self.inv_texts)).array  # (I, LI)
-    mask = (padded_invs != 0)  # (I, LI)
-    # Mask out vmap
-    vmap *= mask
-    report['vmap'] = vmap
-    # ---------------------------
     # Compute unified representation
-    padded_oe = F.pad_sequence(oe)  # (B, LB, E)
-    padded_ie = F.pad_sequence(ie)  # (I, LI, E)
-    # (B, I, LI, LB) x (B, LB, E) -> (B, I, LI, E)
-    ue = F.einsum('bilf,bfe->bile', uniatt, padded_oe)
-    ue = vmap[..., None]*ue + (1-vmap[..., None])*padded_ie  # (B, I, LI, E)
-    ue = F.reshape(ue, (-1,) + ue.shape[2:])  # (B*I, LI, E)
-    ue = F.separate(ue, 0)  # B*I x [(LI, E), ...]
+    padded_ove = F.pad_sequence(ove)  # (B, LB, E+1)
+    padded_ive = padded_ove[uidxs]  # (I, LI, E+1)
+    ouvar = ouvar[uidxs]  # (I, LI)
+    # (I, LB, LB) x (B, LB, E+1) -> (I, LB, E+1)
+    uve = F.einsum('ilf,ife->ile', uniatt, padded_ove)
+    # ---
+    uve = ouvar[..., None] * uve + (1-ouvar[..., None]) * padded_ive  # (I, LB, E+1)
+    # Variableness of a rule does not get unified
+    uve = F.concat([uve[..., :-1], padded_ive[..., -1:]], -1)  # (I, LB, E+1)
+    uve = F.separate(uve, 0)  # I x [(LB, E+1), ...]
+    ulens = np.array([len(t) for t in texts])[uidxs]  # (I,)
+    uve = [seq[:l] for seq, l in zip(uve, ulens)]  # I x [(L1, E+1), (L2, E+1), ..]
     # ---------------------------
     # Compute unification predictions
-    _, upred = self.predict(ue)  # (B*I, 1)
-    upred = F.reshape(upred, uniatt.shape[:2] + (1,))  # (B, I, 1)
-    upred = F.sum(upred, 1)  # (B, 1)
+    _, upred = self.predict(uve)  # (I, 1)
     report['upred'] = upred
     # ---------------------------
     return report
@@ -246,8 +249,8 @@ class Classifier(C.Chain):
   """Compute loss and accuracy of underlying model."""
   def __init__(self, predictor):
     super().__init__()
-    # self.add_persistent('uniparam', not ARGS.nouni)
-    self.add_persistent('uniparam', 0.5)
+    self.add_persistent('uniparam', not ARGS.nouni)
+    # self.add_persistent('uniparam', 0.5)
     with self.init_scope():
       self.predictor = predictor
 
@@ -260,24 +263,18 @@ class Classifier(C.Chain):
     # ---------------------------
     # Compute loss and accs
     labels = labels[:, None]  # (B, 1)
-    inv_labels = self.predictor.inv_labels[:, None]  # (I, 1)
-    for k, t in [('o', labels), ('ig', inv_labels), ('u', labels)]:
+    for k, t in [('o', labels), ('u', labels)]:
       report[k + 'loss'] = F.sigmoid_cross_entropy(r[k + 'pred'], t)
       report[k + 'acc'] = F.binary_accuracy(r[k + 'pred'], t)
     # ---------------------------
     # Aux lossess
-    vloss = F.sum(self.predictor.vmap_params) # ()
+    vloss = F.sum(r['vmap']) # ()
     report['vloss'] = vloss
     # ---------------------------
     C.report(report, self)
-    return self.uniparam*(report['uloss'] + 0.1*report['vloss'] + report['igloss']) + (1-self.uniparam)*report['oloss']
+    return self.uniparam*(report['uloss'] + 0.001*report['vloss']) + (1-self.uniparam)*report['oloss']
 
 # ---------------------------
-
-def print_vmap(trainer):
-  """Enable unification loss function in model."""
-  print_tasks(trainer.updater.get_optimizer('main').target.predictor.inv_examples)
-  print(F.sigmoid(trainer.updater.get_optimizer('main').target.predictor.vmap_params*10))
 
 def converter(batch, _):
   """Curate a batch of samples."""
@@ -301,14 +298,23 @@ def train(train_data, test_data, foldid: int = 0):
   cmodel = Classifier(model)
   optimiser = C.optimizers.Adam().setup(cmodel)
   train_iter = C.iterators.SerialIterator(train_data, ARGS.batch_size)
+  test_iter = C.iterators.SerialIterator(test_data, ARGS.batch_size, repeat=False, shuffle=False)
   updater = T.StandardUpdater(train_iter, optimiser, converter=converter, device=-1)
   trainer = T.Trainer(updater, (2000, 'iteration'), out='urnn_result')
+  # ---------------------------
+  # Setup debug output
+  test_iter.reset()
+  debug_texts, debug_labels = converter(next(test_iter), None)
+  debug_texts, debug_labels = debug_texts[:4], debug_labels[:4]
+  def print_vmap(trainer):
+    """Enable unification loss function in model."""
+    print_tasks((debug_texts, debug_labels))
+    print(model(debug_texts))
   # ---------------------------
   fname = ARGS.outf.format(**vars(ARGS), foldid=foldid)
   # Setup trainer extensions
   if ARGS.debug:
     trainer.extend(print_vmap, trigger=(200, 'iteration'))
-  test_iter = C.iterators.SerialIterator(test_data, ARGS.batch_size, repeat=False, shuffle=False)
   trainer.extend(T.extensions.Evaluator(test_iter, cmodel, converter=converter, device=-1), name='test', trigger=(10, 'iteration'))
   # trainer.extend(T.extensions.snapshot(filename=fname+'_latest.npz'), trigger=(100, 'iteration'))
   trainer.extend(T.extensions.LogReport(log_name=fname+'_log.json', trigger=(10, 'iteration')))
@@ -325,33 +331,22 @@ def train(train_data, test_data, foldid: int = 0):
       return
   # ---------------------------
   # Save learned invariants
-  test_iter.reset()
-  test_texts, test_labels = converter(next(test_iter), None)
-  test_texts, test_labels = test_texts[:4], test_labels[:4]
-  out = {k: v.array for k, v in model(test_texts).items()}
+  out = {k: v if isinstance(v, np.ndarray) else v.array for k, v in model(debug_texts).items()}
   with open(trainer.out + '/' + fname + '.out', 'w') as f:
     f.write("---- META ----\n")
     metadata['foldid'] = foldid
     f.write(str(metadata))
-    f.write("\n---- INVS ----\n")
-    print_tasks(model.inv_examples, file=f)
-    f.write("\n--------\n")
-    f.write(np.array_str(out['vmap']))
     f.write("\n---- SAMPLE ----\n")
     f.write("Input:\n")
-    print_tasks((test_texts, test_labels), file=f)
-    f.write("\nOutput:\n")
-    f.write(np.array_str(out['upred']))
-    f.write("\nAtt:\n")
-    idxs = np.argsort(out['uniatt'], -1)[..., ::-1]
-    idxs = idxs[..., :3]
-    f.write(np.array_str(idxs))
-    f.write(np.array_str(np.take_along_axis(out['uniatt'], idxs, axis=-1)))
+    print_tasks((debug_texts, debug_labels), file=f)
+    for k, v in out.items():
+      f.write(f"\n{k}:\n")
+      f.write(np.array_str(v))
     f.write("\n---- END ----\n")
   if ARGS.debug:
-    print_tasks((test_texts, test_labels))
+    print_tasks((debug_texts, debug_labels))
     import ipdb; ipdb.set_trace()
-    out = model(test_texts)
+    out = model(debug_texts)
 
 # ---------------------------
 
