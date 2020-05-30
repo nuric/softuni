@@ -21,7 +21,7 @@ parser = argparse.ArgumentParser(description="Run URNN on reviews.")
 parser.add_argument("name", help="Name prefix for saving files etc.")
 parser.add_argument("-l", "--length", default=20, type=int, help="Max length of reviews.")
 parser.add_argument("-i", "--invariants", default=1, type=int, help="Number of invariants per task.")
-parser.add_argument("-e", "--embed", default=32, type=int, help="Embedding size.")
+parser.add_argument("-e", "--embed", default=16, type=int, help="Embedding size.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
 parser.add_argument("-nu", "--nouni", action="store_true", help="Disable unification.")
 parser.add_argument("--train_size", default=0, type=int, help="Training size per label, 0 to use everything.")
@@ -30,6 +30,7 @@ parser.add_argument("-bs", "--batch_size", default=64, type=int, help="Training 
 parser.add_argument("-o", "--outf", default="{name}_l{length}_i{invariants}_e{embed}_t{train_size}_f{foldid}")
 ARGS = parser.parse_args()
 
+LABEL_T = 0.1 # Lower bound below which is set to 0 
 EMBED = ARGS.embed
 FOLDS = 5
 
@@ -90,8 +91,8 @@ word2idx['PAD'] = 0
 
 # Load Sentiment Reviews
 sent_labels = pd.read_csv('data/stanfordSentimentTreebank/sentiment_labels.txt', sep='|', header=0, names=['label'], index_col=0)
-sent_labels = sent_labels[((sent_labels.label > 0.9) | (sent_labels.label < 0.1))]
-sent_labels['label'] = np.where(sent_labels.label < 0.1, 0, 1)
+sent_labels = sent_labels[((sent_labels.label > (0.5-LABEL_T)+0.5) | (sent_labels.label < LABEL_T))]
+sent_labels['label'] = np.where(sent_labels.label < LABEL_T, 0, 1)
 phrases = pd.read_csv('data/stanfordSentimentTreebank/dictionary.txt', sep='|', header=None, names=['phrase'], index_col=1)
 df = sent_labels.join(phrases)
 df['enc_phrase'] = df['phrase'].apply(partial(encode_sent, True))
@@ -138,25 +139,24 @@ print(metadata)
 
 # ---------------------------
 
-# ---------------------------
-
 # Unification Network
 class URNN(C.Chain):
   """Unification RNN network for classification."""
-  def __init__(self):
+  def __init__(self, inv_examples):
     super().__init__()
+    self.inv_examples = inv_examples
     # Create model parameters
     with self.init_scope():
       # self.embed = L.EmbedID(len(word2idx)+1, 32, ignore_label=0)
       # self.uni_embed = L.EmbedID(len(word2idx)+1, 32, ignore_label=0)
-      self.embed = L.Linear(300, 16)
-      self.uni_embed = L.Linear(16, 16)
-      self.var_linear = L.Linear(16, 1)
-      self.bigru_state = C.Parameter(0.0, (1, 1, 16), name='bigru_state')
-      self.bigru = L.NStepGRU(1, 16, 16, 0)
+      self.embed = L.Linear(300, EMBED)
+      self.uni_embed = L.Linear(EMBED, EMBED)
+      self.var_linear = L.Linear(EMBED, 1)
+      self.bigru_state = C.Parameter(0.0, (1, 1, EMBED), name='bigru_state')
+      self.bigru = L.NStepGRU(1, EMBED, EMBED, 0)
       # self.uni_bigru = L.NStepBiGRU(1, 32, 32, 0)
       # self.uni_linear = L.Linear(32*2, 32)
-      self.fc1 = L.Linear(16*1, 1)
+      self.fc1 = L.Linear(EMBED*1, 1)
 
   def predict(self, embed_seqs):
     """Predict class on embeeded seqs."""
@@ -196,47 +196,47 @@ class URNN(C.Chain):
     ove, ue, uv = sequence_embed(texts)  # B x [(L1, E), (L2, E), ...], Bx[(L1, E), ...], B x [(L1,), (L2,), ...]
     oys, opred = self.predict(ove)  # B x [(L1, E), ...], (B, 1)
     report['opred'] = opred
+    # Invariant example prediction
+    ive, iue, iuv = sequence_embed(self.inv_examples[0]) # I x [(L1, E), ...] ...
+    iys, ipred = self.predict(ive) # I x [(L1, E), ...], (I, 1)
+    report['igpred'] = ipred
     # ---------------------------
     # Compute padding mask
     padded_texts = F.pad_sequence(list(texts)).array  # (B, LB)
     mask = -100*(padded_texts == 0)  # (B, LB)
+    padded_itexts = F.pad_sequence(list(self.inv_examples[0])).array # (I, LI)
     # ---------------------------
     # Extract unification features
     oufeats = F.pad_sequence(ue)  # (B, LB, E)
-    ouvar = F.pad_sequence(uv)  # (B, LB)
-    report['vmap'] = ouvar
-    # ---------------------------
-    # Pick a random example to unify with
-    uidxs = np.random.permutation(len(texts))  # (B,)
-    while np.any(uidxs == np.arange(len(texts))):
-      uidxs = np.random.permutation(len(texts))  # (B,)
-    report['uidxs'] = uidxs
+    iufeats = F.pad_sequence(iue) # (I, LI, E)
+    iuvar = F.pad_sequence(iuv)  # (I, LI)
+    report['vmap'] = iuvar
     # ---------------------------
     # Unification attention
-    # (I, LB, E) x (B, LB, E) -> (I, LB, LB)
-    uniatt = F.einsum('ile,ife->ilf', oufeats[uidxs], oufeats)
+    # (I, LI, E) x (B, LB, E) -> (B, I, LI, LB)
+    uniatt = F.einsum('ile,bfe->bilf', iufeats, oufeats)
     # Mask to stop attention to padding
-    uniatt += mask[:, None]  # (I, LB, LB)
-    uniatt = F.softmax(uniatt, -1)  # (I, LB, LB)
-    uniatt *= (padded_texts != 0)[uidxs, ..., None]  # (I, LB, LB)
+    uniatt += mask[:, None, None]  # (B, I, LI, LB)
+    uniatt = F.softmax(uniatt, -1)  # (B, I, LI, LB)
+    uniatt *= (padded_itexts != 0)[..., None] # (B, I, LI, LB)
     report['uniatt'] = uniatt
     # ---------------------------
     # Compute unified representation
     padded_ove = F.pad_sequence(ove)  # (B, LB, E)
-    padded_ive = padded_ove[uidxs]  # (I, LI, E)
-    ouvar = ouvar[uidxs]  # (I, LI)
-    # (I, LB, LB) x (B, LB, E) -> (I, LB, E)
-    uve = F.einsum('ilf,ife->ile', uniatt, padded_ove)
+    padded_ive = F.pad_sequence(ive)  # (I, LI, E)
+    # (B, I, LI, LB) x (B, LB, E) -> (B, I, LI, E)
+    uve = F.einsum('bilf,bfe->bile', uniatt, padded_ove)
     # ---
-    uve = ouvar[..., None] * uve + (1-ouvar[..., None]) * padded_ive  # (I, LB, E)
-    # Variableness of a rule does not get unified
-    # uve = F.concat([uve[..., :-1], padded_ive[..., -1:]], -1)  # (I, LB, E+1)
-    uve = F.separate(uve, 0)  # I x [(LB, E), ...]
-    ulens = np.array([len(t) for t in texts])[uidxs]  # (I,)
+    uve = iuvar[..., None] * uve + (1-iuvar[..., None]) * padded_ive  # (B, I, LI, E)
+    uve = F.reshape(uve, (-1,) + uve.shape[2:]) # (B*I, LI, E)
+    uve = F.separate(uve, 0)  # B*I x [(LI, E), ...]
+    ulens = np.array([len(t) for t in self.inv_examples[0]] * texts.shape[0]) # (I,)
     uve = [seq[:l] for seq, l in zip(uve, ulens)]  # I x [(L1, E), (L2, E), ..]
     # ---------------------------
     # Compute unification predictions
-    _, upred = self.predict(uve)  # (I, 1)
+    _, upred = self.predict(uve)  # (B*I, 1)
+    upred = F.reshape(upred, (texts.shape[0], self.inv_examples[0].shape[0], 1)) # (B, I, 1)
+    upred = F.sum(upred, 1) # (B, 1)
     report['upred'] = upred
     # ---------------------------
     return report
@@ -260,7 +260,8 @@ class Classifier(C.Chain):
     # ---------------------------
     # Compute loss and accs
     labels = labels[:, None]  # (B, 1)
-    for k, t in [('o', labels), ('u', labels)]:
+    ilabels = self.predictor.inv_examples[1][:, None] # (I, 1)
+    for k, t in [('o', labels), ('u', labels), ('ig', ilabels)]:
       report[k + 'loss'] = F.sigmoid_cross_entropy(r[k + 'pred'], t)
       report[k + 'acc'] = F.binary_accuracy(r[k + 'pred'], t)
     # ---------------------------
@@ -269,8 +270,7 @@ class Classifier(C.Chain):
     report['vloss'] = vloss
     # ---------------------------
     C.report(report, self)
-    # return self.uniparam*(report['uloss'] + 0.001*report['vloss']) + (1-self.uniparam)*report['oloss']
-    return (report['uloss'] + 0*report['vloss']) + report['oloss']
+    return self.uniparam*(report['uloss'] + 0.1*report['vloss']) + report['oloss']
 
 # ---------------------------
 
@@ -287,8 +287,12 @@ def converter(batch, _):
 def train(train_data, test_data, foldid: int = 0):
   """Train new UMLP on given data."""
   # ---------------------------
+  # Setup invariant repositories
+  idxs = np.random.choice(len(train_data), size=ARGS.invariants, replace=False)
+  invariants = train_data[idxs]
+  # ---------------------------
   # Setup model
-  model = URNN()
+  model = URNN(invariants)
   cmodel = Classifier(model)
   optimiser = C.optimizers.Adam().setup(cmodel)
   train_iter = C.iterators.SerialIterator(train_data, ARGS.batch_size)
@@ -303,6 +307,8 @@ def train(train_data, test_data, foldid: int = 0):
   def print_vmap(trainer):
     """Enable unification loss function in model."""
     print_tasks((debug_texts, debug_labels))
+    print("INVS:")
+    print_tasks(model.inv_examples)
     print(model(debug_texts))
   # ---------------------------
   fname = ARGS.outf.format(**vars(ARGS), foldid=foldid)
@@ -333,6 +339,9 @@ def train(train_data, test_data, foldid: int = 0):
     f.write("\n---- SAMPLE ----\n")
     f.write("Input:\n")
     print_tasks((debug_texts, debug_labels), file=f)
+    f.write("Inv:\n")
+    print_tasks(model.inv_examples, file=f)
+    f.write("Out:\n")
     for k, v in out.items():
       f.write(f"\n{k}:\n")
       f.write(np.array_str(v))
@@ -346,8 +355,4 @@ def train(train_data, test_data, foldid: int = 0):
 
 # Training loop
 for foldidx, (trainfold, testfold) in enumerate(nfolds):
-  ARGS.nouni = False
   train(trainfold, testfold, foldidx)
-  ARGS.nouni = True
-  train(trainfold, testfold, foldidx)
-  break
