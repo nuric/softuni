@@ -143,24 +143,20 @@ print(metadata)
 # Unification Network
 class URNN(C.Chain):
   """Unification RNN network for classification."""
-  def __init__(self, inv_examples):
+  def __init__(self):
     super().__init__()
-    self.inv_examples = inv_examples
-    inv_texts, inv_labels = inv_examples
-    maxilen = max([len(t) for t in inv_texts])
-    self.add_persistent('inv_texts', inv_texts) # (I,)
-    self.add_persistent('inv_labels', inv_labels) # (I,)
     # Create model parameters
     with self.init_scope():
       # self.embed = L.EmbedID(len(word2idx)+1, 32, ignore_label=0)
       # self.uni_embed = L.EmbedID(len(word2idx)+1, 32, ignore_label=0)
-      self.uni_embed = L.Linear(300, 32)
-      self.var_linear = L.Linear(300, 1)
-      self.bigru_state = C.Parameter(0.0, (1, 1, 32), name='bigru_state')
-      self.bigru = L.NStepGRU(1, 300, 32, 0)
+      self.embed = L.Linear(300, 16)
+      self.uni_embed = L.Linear(16, 16)
+      self.var_linear = L.Linear(16, 1)
+      self.bigru_state = C.Parameter(0.0, (1, 1, 16), name='bigru_state')
+      self.bigru = L.NStepGRU(1, 16, 16, 0)
       # self.uni_bigru = L.NStepBiGRU(1, 32, 32, 0)
       # self.uni_linear = L.Linear(32*2, 32)
-      self.fc1 = L.Linear(32*1, 1)
+      self.fc1 = L.Linear(16*1, 1)
 
   def predict(self, embed_seqs):
     """Predict class on embeeded seqs."""
@@ -187,16 +183,17 @@ class URNN(C.Chain):
       x_concat = F.concat(xs, axis=0)  # (L1+L2...,)
       # ex = self.embed(x_concat) # (..., E)
       ex = F.embed_id(x_concat, wordembeds, ignore_label=0)
+      ex = F.tanh(self.embed(ex)) # (..., E)
       uex = self.uni_embed(ex)  # (..., E)
       uvx = self.var_linear(ex)  # (..., 1)
       uvx = F.sigmoid(F.squeeze(uvx, -1))  # (..., )
-      evx = F.concat([ex, uvx[:, None]], -1)  # (..., E+1)
-      evxs = F.split_axis(evx, x_section, 0)
+      # evx = F.concat([ex, uvx[:, None]], -1)  # (..., E+1)
+      evxs = F.split_axis(ex, x_section, 0)
       uexs = F.split_axis(uex, x_section, 0)
       uvs = F.split_axis(uvx, x_section, 0)
       return evxs, uexs, uvs
     # Ground example prediction
-    ove, ue, uv = sequence_embed(texts)  # B x [(L1, E+1), (L2, E+1), ...], Bx[(L1, E), ...], B x [(L1,), (L2,), ...]
+    ove, ue, uv = sequence_embed(texts)  # B x [(L1, E), (L2, E), ...], Bx[(L1, E), ...], B x [(L1,), (L2,), ...]
     oys, opred = self.predict(ove)  # B x [(L1, E), ...], (B, 1)
     report['opred'] = opred
     # ---------------------------
@@ -225,18 +222,18 @@ class URNN(C.Chain):
     report['uniatt'] = uniatt
     # ---------------------------
     # Compute unified representation
-    padded_ove = F.pad_sequence(ove)  # (B, LB, E+1)
-    padded_ive = padded_ove[uidxs]  # (I, LI, E+1)
+    padded_ove = F.pad_sequence(ove)  # (B, LB, E)
+    padded_ive = padded_ove[uidxs]  # (I, LI, E)
     ouvar = ouvar[uidxs]  # (I, LI)
-    # (I, LB, LB) x (B, LB, E+1) -> (I, LB, E+1)
+    # (I, LB, LB) x (B, LB, E) -> (I, LB, E)
     uve = F.einsum('ilf,ife->ile', uniatt, padded_ove)
     # ---
-    uve = ouvar[..., None] * uve + (1-ouvar[..., None]) * padded_ive  # (I, LB, E+1)
+    uve = ouvar[..., None] * uve + (1-ouvar[..., None]) * padded_ive  # (I, LB, E)
     # Variableness of a rule does not get unified
-    uve = F.concat([uve[..., :-1], padded_ive[..., -1:]], -1)  # (I, LB, E+1)
-    uve = F.separate(uve, 0)  # I x [(LB, E+1), ...]
+    # uve = F.concat([uve[..., :-1], padded_ive[..., -1:]], -1)  # (I, LB, E+1)
+    uve = F.separate(uve, 0)  # I x [(LB, E), ...]
     ulens = np.array([len(t) for t in texts])[uidxs]  # (I,)
-    uve = [seq[:l] for seq, l in zip(uve, ulens)]  # I x [(L1, E+1), (L2, E+1), ..]
+    uve = [seq[:l] for seq, l in zip(uve, ulens)]  # I x [(L1, E), (L2, E), ..]
     # ---------------------------
     # Compute unification predictions
     _, upred = self.predict(uve)  # (I, 1)
@@ -268,11 +265,12 @@ class Classifier(C.Chain):
       report[k + 'acc'] = F.binary_accuracy(r[k + 'pred'], t)
     # ---------------------------
     # Aux lossess
-    vloss = F.sum(r['vmap']) # ()
+    vloss = F.mean(r['vmap']) # ()
     report['vloss'] = vloss
     # ---------------------------
     C.report(report, self)
-    return self.uniparam*(report['uloss'] + 0.001*report['vloss']) + (1-self.uniparam)*report['oloss']
+    # return self.uniparam*(report['uloss'] + 0.001*report['vloss']) + (1-self.uniparam)*report['oloss']
+    return (report['uloss'] + 0*report['vloss']) + report['oloss']
 
 # ---------------------------
 
@@ -288,13 +286,9 @@ def converter(batch, _):
 # Training on single fold
 def train(train_data, test_data, foldid: int = 0):
   """Train new UMLP on given data."""
-  # Setup invariant repositories
-  # we'll take I many examples at random
-  idxs = np.random.choice(len(train_data), size=ARGS.invariants, replace=False)
-  invariants = train_data[idxs]
   # ---------------------------
   # Setup model
-  model = URNN(invariants)
+  model = URNN()
   cmodel = Classifier(model)
   optimiser = C.optimizers.Adam().setup(cmodel)
   train_iter = C.iterators.SerialIterator(train_data, ARGS.batch_size)
@@ -352,4 +346,8 @@ def train(train_data, test_data, foldid: int = 0):
 
 # Training loop
 for foldidx, (trainfold, testfold) in enumerate(nfolds):
+  ARGS.nouni = False
   train(trainfold, testfold, foldidx)
+  ARGS.nouni = True
+  train(trainfold, testfold, foldidx)
+  break
