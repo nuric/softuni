@@ -24,7 +24,7 @@ parser.add_argument("-i", "--invariants", default=1, type=int, help="Number of i
 parser.add_argument("-e", "--embed", default=16, type=int, help="Embedding size.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
 parser.add_argument("-nu", "--nouni", action="store_true", help="Disable unification.")
-parser.add_argument("--train_size", default=0, type=int, help="Training size per label, 0 to use everything.")
+parser.add_argument("-t", "--train_size", default=0, type=int, help="Training size per label, 0 to use everything.")
 parser.add_argument("--test_size", default=0, type=int, help="Test size per label, 0 to use everything.")
 parser.add_argument("-bs", "--batch_size", default=64, type=int, help="Training batch size.")
 parser.add_argument("-o", "--outf", default="{name}_l{length}_i{invariants}_e{embed}_t{train_size}_f{foldid}")
@@ -152,17 +152,13 @@ class URNN(C.Chain):
       self.embed = L.Linear(300, EMBED)
       self.uni_embed = L.Linear(EMBED, EMBED)
       self.var_linear = L.Linear(EMBED, 1)
-      self.bigru_state = C.Parameter(0.0, (1, 1, EMBED), name='bigru_state')
-      self.bigru = L.NStepGRU(1, EMBED, EMBED, 0)
-      # self.uni_bigru = L.NStepBiGRU(1, 32, 32, 0)
-      # self.uni_linear = L.Linear(32*2, 32)
+      self.lstm = L.NStepLSTM(1, EMBED, EMBED, 0)
       self.fc1 = L.Linear(EMBED*1, 1)
 
   def predict(self, embed_seqs):
     """Predict class on embeeded seqs."""
     # embed_seqs B x [(L1, E), (L2, E), ...]
-    init_state = F.tile(self.bigru_state, (1, len(embed_seqs), 1))  # (2, B, E)
-    hy, ys = self.bigru(init_state, embed_seqs)  # (2, B, E), B x [(L1, E), ...]
+    hy, _, ys = self.lstm(None, None, embed_seqs)  # (2, B, E), B x [(L1, E), ...]
     hy = F.transpose(hy, [1, 0, 2])  # (B, 2, E)
     hy = F.reshape(hy, [hy.shape[0], -1])  # (B, 2*E)
     hy = F.dropout(hy, 0.5)  # (B, 2*E)
