@@ -2,11 +2,14 @@
 Soft unification is an attention mechanism to align inputs to extract common patterns, referred to as invariants, in the data. By learning which symbols are variables the remaining part of a ground example is lifted into an invariant to answer the question: *if and how can a machine learn and use the idea that a symbol can take on different values?* For example, learning that Mary could be *someone* else and that person could go *somewhere* else.
 
 ## Data
-The experiments are held on 4 datasets:
+The experiments are held on 5 datasets:
 
- - 2 toy datasets for sequence of symbols designed to test MLPs and grid of symbols for CNNs.
+ - 2 toy datasets for sequence of symbols designed to test MLPs and grid of symbols for CNNs. These are generated on the fly when the `umlp.py` and `ucnn.py` training scripts are run.
  - The [bAbI dataset](https://research.fb.com/downloads/babi/) which can be obtained from this [direct link](http://www.thespermwhale.com/jaseweston/babi/tasks_1-20_v1-2.tar.gz).
- - And a slightly modified version of [DeepLogic](https://github.com/nuric/deeplogic) dataset which can be generated using the `gen_dl.sh` script provided in the repository.
+ - A slightly modified version of [DeepLogic](https://github.com/nuric/deeplogic) dataset which can be generated using the `gen_dl.sh` script provided in the repository.
+ - And the [Sentiment Treebank dataset](https://nlp.stanford.edu/sentiment/index.html), [direct link](http://nlp.stanford.edu/~socherr/stanfordSentimentTreebank.zip), for which we use the [ConceptNet NumberBatch](https://github.com/commonsense/conceptnet-numberbatch) word embeddings, specifically we use [version 19.08](https://conceptnet.s3.amazonaws.com/downloads/2019/numberbatch/numberbatch-en-19.08.txt.gz).
+
+Except for the 2 toy datasets, the scripts expect the data to be in `data/` folder. For the downloaded datasets, you can extract the zip file into the `data/` folder.
 
 To generate the logical reasoning tasks individually with different parameters:
 
@@ -58,14 +61,14 @@ The training for unification feed-forward networks and unification convolutional
 ```bash
 PYTHON=python3
 
-for type in mlp cnn; do
+for type in mlp cnn urnn; do
   echo "Running $type baseline"
-  $PYTHON u$type.py base$type -i 1 -nu
+  $PYTHON u$type.py base$type -i 1 -nu -t 1000
   $PYTHON u$type.py base$type -i 1 -nu -t 50
 
   echo "Running unification $type"
   for inv in {1..4}; do
-    $PYTHON u$type.py u$type -i $inv
+    $PYTHON u$type.py u$type -i $inv -t 1000
     $PYTHON u$type.py u$type -i $inv -t 50
   done
 done
