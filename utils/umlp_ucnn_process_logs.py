@@ -12,6 +12,8 @@ if 'ucnn' in ARGS.fpath[0]:
   pkeys = ['name', 'symbols', 'invariants', 'embed', 'tsize', 'fold']
 elif 'umlp' in ARGS.fpath[0]:
   pkeys = ['name', 'length', 'symbols', 'invariants', 'embed', 'tsize', 'fold']
+elif 'urnn' in ARGS.fpath[0]:
+  pkeys = ['name', 'length', 'invariants', 'embed', 'tsize', 'fold']
 else:
   raise ValueError("Unknown log file type.")
 
