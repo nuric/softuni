@@ -1,6 +1,11 @@
 # Custom ignores
 *.swp
 *.db
+*.pdf
+*.png
+*.csv
+*.zip
+*_result
 data
 
 # Byte-compiled / optimized / DLL files
