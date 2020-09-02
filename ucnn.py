@@ -24,6 +24,7 @@ parser.add_argument("-nu", "--nouni", action="store_true", help="Disable unifica
 parser.add_argument("-t", "--tsize", default=0, type=int, help="Training size per task, 0 to use everything.")
 parser.add_argument("-g", "--gsize", default=1000, type=int, help="Random data tries per task.")
 parser.add_argument("-bs", "--batch_size", default=64, type=int, help="Training batch size.")
+parser.add_argument("-lr", "--learning_rate", default=0.001, type=float, help="Learning rate.")
 parser.add_argument("-o", "--outf", default="{name}_s{symbols}_i{invariants}_e{embed}_t{tsize}_f{foldid}")
 ARGS = parser.parse_args()
 
@@ -358,10 +359,10 @@ def train(train_data, test_data, foldid: int = 0):
   # Setup model
   model = UCNN(invariants)
   cmodel = Classifier(model)
-  optimiser = C.optimizers.Adam().setup(cmodel)
+  optimiser = C.optimizers.Adam(alpha=ARGS.learning_rate).setup(cmodel)
   train_iter = C.iterators.SerialIterator(train_data, ARGS.batch_size)
   updater = T.StandardUpdater(train_iter, optimiser, device=-1)
-  trainer = T.Trainer(updater, (2000, 'iteration'), out='ucnn_result')
+  trainer = T.Trainer(updater, (2000, 'iteration'), out='results/ucnn_result')
   # ---------------------------
   fname = ARGS.outf.format(**vars(ARGS), foldid=foldid)
   # Setup trainer extensions

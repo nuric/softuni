@@ -27,6 +27,7 @@ parser.add_argument("-nu", "--nouni", action="store_true", help="Disable unifica
 parser.add_argument("-t", "--train_size", default=0, type=int, help="Training size per label, 0 to use everything.")
 parser.add_argument("--test_size", default=0, type=int, help="Test size per label, 0 to use everything.")
 parser.add_argument("-bs", "--batch_size", default=64, type=int, help="Training batch size.")
+parser.add_argument("-lr", "--learning_rate", default=0.001, type=float, help="Learning rate.")
 parser.add_argument("-o", "--outf", default="{name}_l{length}_i{invariants}_e{embed}_t{train_size}_f{foldid}")
 ARGS = parser.parse_args()
 
@@ -290,11 +291,11 @@ def train(train_data, test_data, foldid: int = 0):
   # Setup model
   model = URNN(invariants)
   cmodel = Classifier(model)
-  optimiser = C.optimizers.Adam().setup(cmodel)
+  optimiser = C.optimizers.Adam(alpha=ARGS.learning_rate).setup(cmodel)
   train_iter = C.iterators.SerialIterator(train_data, ARGS.batch_size)
   test_iter = C.iterators.SerialIterator(test_data, ARGS.batch_size, repeat=False, shuffle=False)
   updater = T.StandardUpdater(train_iter, optimiser, converter=converter, device=-1)
-  trainer = T.Trainer(updater, (2000, 'iteration'), out='urnn_result')
+  trainer = T.Trainer(updater, (2000, 'iteration'), out='results/urnn_result')
   # ---------------------------
   # Setup debug output
   test_iter.reset()
