@@ -1,5 +1,7 @@
 """Unification CNN."""
 import argparse
+import uuid
+import json
 import sys
 import numpy as np
 import chainer as C
@@ -14,18 +16,17 @@ np.set_printoptions(threshold=10000, suppress=True, precision=5, linewidth=180)
 # Arguments
 parser = argparse.ArgumentParser(description="Run UCNN on randomly generated tasks.")
 # parser.add_argument("task", help="Task name to solve.")
-parser.add_argument("name", help="Name prefix for saving files etc.")
+parser.add_argument("--name", help="Name prefix for saving files etc.")
 parser.add_argument("-gr", "--grid", nargs='+', default=[3, 3], type=int, help="Size of input grid.")
 parser.add_argument("-s", "--symbols", default=8, type=int, help="Number of symbols.")
 parser.add_argument("-i", "--invariants", default=1, type=int, help="Number of invariants per task.")
 parser.add_argument("-e", "--embed", default=32, type=int, help="Embedding size.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
 parser.add_argument("-nu", "--nouni", action="store_true", help="Disable unification.")
-parser.add_argument("-t", "--tsize", default=0, type=int, help="Training size per task, 0 to use everything.")
+parser.add_argument("-t", "--train_size", default=0, type=int, help="Training size per task, 0 to use everything.")
 parser.add_argument("-g", "--gsize", default=1000, type=int, help="Random data tries per task.")
 parser.add_argument("-bs", "--batch_size", default=64, type=int, help="Training batch size.")
 parser.add_argument("-lr", "--learning_rate", default=0.001, type=float, help="Learning rate.")
-parser.add_argument("-o", "--outf", default="{name}_s{symbols}_i{invariants}_e{embed}_t{tsize}_f{foldid}")
 ARGS = parser.parse_args()
 
 GRID = np.array(ARGS.grid, dtype=np.int8)
@@ -189,7 +190,7 @@ class UCNN(C.Chain):
     in_x = F.swapaxes(in_x, -1, -3) # (N, E+T, H, W)
     out = F.relu(self.conv1(in_x)) # (N, E, H, W)
     out = F.relu(self.conv2(out)) # (N, E, W', H')
-    out = F.max_pooling_2d(out, GRID[0], GRID[1]) # (N, E, W', H')
+    out = F.max_pooling_2d(out, tuple(GRID)) # (N, E, W', H')
     out = self.fc1(out) # (N, V)
     out = F.squeeze(out) @ self.embed.W.T # (N, V)
     out = F.reshape(out, combined_x.shape[:-3] + (VOCAB,)) # (..., V)
@@ -364,7 +365,7 @@ def train(train_data, test_data, foldid: int = 0):
   updater = T.StandardUpdater(train_iter, optimiser, device=-1)
   trainer = T.Trainer(updater, (2000, 'iteration'), out='results/ucnn_result')
   # ---------------------------
-  fname = ARGS.outf.format(**vars(ARGS), foldid=foldid)
+  fname = (ARGS.name.format(foldid=foldid) if ARGS.name else '') or ('debug' if ARGS.debug else '') or str(uuid.uuid4())
   # Setup trainer extensions
   if ARGS.debug:
     trainer.extend(print_vmap, trigger=(1000, 'iteration'))
@@ -383,6 +384,13 @@ def train(train_data, test_data, foldid: int = 0):
   except KeyboardInterrupt:
     if not ARGS.debug:
       return
+  # Save run parameters
+  params = ['symbols', 'invariants', 'embed', 'train_size', 'learning_rate', 'nouni', 'batch_size']
+  params = {k: vars(ARGS)[k] for k in params}
+  params['name'] = fname
+  params['foldid'] = foldid
+  with open(trainer.out + '/' + fname + '_params.json', 'w') as f:
+    json.dump(params, f)
   # Save learned invariants
   with open(trainer.out + '/' + fname + '.out', 'w') as f:
     f.write("---- META ----\n")
@@ -435,9 +443,9 @@ for foldidx, (traind, testd) in enumerate(nfolds):
   # We'll ensure the model sees every symbol at least once in training
   # at test time symbols might appear in different unseen sequences
   vtraind = np.stack(traind)
-  if ARGS.tsize > 0:
+  if ARGS.train_size > 0:
     # For each task select at most tsize many examples
-    vtraind = np.concatenate([vtraind[vtraind[:, 0] == tid][:ARGS.tsize] for tid in range(1, TASKS+1)]) # (<=tsize, 1+W*H+1)
+    vtraind = np.concatenate([vtraind[vtraind[:, 0] == tid][:ARGS.train_size] for tid in range(1, TASKS+1)]) # (<=tsize, 1+W*H+1)
   train_syms = vtraind[:, 1:-1]
   assert len(np.unique(train_syms)) == VOCAB, "Some symbols are missing from training."
   train(vtraind, testd, foldidx)

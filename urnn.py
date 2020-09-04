@@ -1,6 +1,7 @@
 """Unification RNN."""
 import argparse
 import json
+import uuid
 import re
 import string
 import sys
@@ -18,7 +19,7 @@ np.set_printoptions(suppress=True, precision=5, linewidth=180, threshold=1000000
 
 # Arguments
 parser = argparse.ArgumentParser(description="Run URNN on reviews.")
-parser.add_argument("name", help="Name prefix for saving files etc.")
+parser.add_argument("--name", help="Name prefix for saving files etc.")
 parser.add_argument("-l", "--length", default=20, type=int, help="Max length of reviews.")
 parser.add_argument("-i", "--invariants", default=1, type=int, help="Number of invariants per task.")
 parser.add_argument("-e", "--embed", default=16, type=int, help="Embedding size.")
@@ -28,7 +29,6 @@ parser.add_argument("-t", "--train_size", default=0, type=int, help="Training si
 parser.add_argument("--test_size", default=0, type=int, help="Test size per label, 0 to use everything.")
 parser.add_argument("-bs", "--batch_size", default=64, type=int, help="Training batch size.")
 parser.add_argument("-lr", "--learning_rate", default=0.001, type=float, help="Learning rate.")
-parser.add_argument("-o", "--outf", default="{name}_l{length}_i{invariants}_e{embed}_t{train_size}_f{foldid}")
 ARGS = parser.parse_args()
 
 LABEL_T = 0.1 # Lower bound below which is set to 0 
@@ -109,7 +109,7 @@ idx2word = {v:k for k, v in word2idx.items()}
 print("Loading word embeddings.")
 wordembeds = np.zeros((len(word2idx)+1, 300), dtype=np.float32)
 word_count = 0
-with open('data/numberbatch-en-19.08.txt') as f:
+with open('data/numberbatch-en-19.08.txt', encoding='utf8') as f:
   for i, l in enumerate(f):
     if i == 0:
       continue  # skip first line
@@ -292,6 +292,7 @@ def train(train_data, test_data, foldid: int = 0):
   model = URNN(invariants)
   cmodel = Classifier(model)
   optimiser = C.optimizers.Adam(alpha=ARGS.learning_rate).setup(cmodel)
+  optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
   train_iter = C.iterators.SerialIterator(train_data, ARGS.batch_size)
   test_iter = C.iterators.SerialIterator(test_data, ARGS.batch_size, repeat=False, shuffle=False)
   updater = T.StandardUpdater(train_iter, optimiser, converter=converter, device=-1)
@@ -308,7 +309,7 @@ def train(train_data, test_data, foldid: int = 0):
     print_tasks(model.inv_examples)
     print(model(debug_texts))
   # ---------------------------
-  fname = ARGS.outf.format(**vars(ARGS), foldid=foldid)
+  fname = (ARGS.name.format(foldid=foldid) if ARGS.name else '') or ('debug' if ARGS.debug else '') or str(uuid.uuid4())
   # Setup trainer extensions
   if ARGS.debug:
     trainer.extend(print_vmap, trigger=(200, 'iteration'))
@@ -327,6 +328,13 @@ def train(train_data, test_data, foldid: int = 0):
     if not ARGS.debug:
       return
   # ---------------------------
+  # Save run parameters
+  params = ['length', 'invariants', 'embed', 'train_size', 'learning_rate', 'nouni', 'batch_size']
+  params = {k: vars(ARGS)[k] for k in params}
+  params['name'] = fname
+  params['foldid'] = foldid
+  with open(trainer.out + '/' + fname + '_params.json', 'w') as f:
+    json.dump(params, f)
   # Save learned invariants
   out = {k: v if isinstance(v, np.ndarray) else v.array for k, v in model(debug_texts).items()}
   with open(trainer.out + '/' + fname + '.out', 'w') as f:

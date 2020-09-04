@@ -1,5 +1,7 @@
 """Unification MLP."""
 import argparse
+import uuid
+import json
 import numpy as np
 import chainer as C
 import chainer.links as L
@@ -12,19 +14,17 @@ np.set_printoptions(suppress=True, precision=5, linewidth=180)
 
 # Arguments
 parser = argparse.ArgumentParser(description="Run UMLP on randomly generated tasks.")
-# parser.add_argument("task", help="Task name to solve.")
-parser.add_argument("name", help="Name prefix for saving files etc.")
+parser.add_argument("--name", help="Name prefix for saving files etc.")
 parser.add_argument("-l", "--length", default=4, type=int, help="Fixed length of symbol sequences.")
 parser.add_argument("-s", "--symbols", default=8, type=int, help="Number of symbols.")
 parser.add_argument("-i", "--invariants", default=1, type=int, help="Number of invariants per task.")
 parser.add_argument("-e", "--embed", default=16, type=int, help="Embedding size.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
 parser.add_argument("-nu", "--nouni", action="store_true", help="Disable unification.")
-parser.add_argument("-t", "--tsize", default=0, type=int, help="Training size per task, 0 to use everything.")
+parser.add_argument("-t", "--train_size", default=0, type=int, help="Training size per task, 0 to use everything.")
 parser.add_argument("-g", "--gsize", default=1000, type=int, help="Random data tries per task.")
 parser.add_argument("-bs", "--batch_size", default=64, type=int, help="Training batch size.")
 parser.add_argument("-lr", "--learning_rate", default=0.001, type=float, help="Learning rate.")
-parser.add_argument("-o", "--outf", default="{name}_l{length}_s{symbols}_i{invariants}_e{embed}_t{tsize}_f{foldid}")
 ARGS = parser.parse_args()
 
 LENGTH = ARGS.length
@@ -181,18 +181,21 @@ class UMLP(C.Chain):
 
     # Embed ground examples
     eg = self.embed(ground_inputs) # (B, L, E)
-    ei = self.embed(invs_inputs) # (B, I, L, E)
+    ei = self.embed(invariant_inputs) # (T, I, L, E)
 
     # Embed tasks for RNN init states
     embed_tasks = self.task_embed(task_ids-1) # (B, E)
     embed_tasks = F.repeat(embed_tasks[None, ...], 2, axis=0) # (2, B, E)
+    iembed_tasks = self.task_embed(self.inv_examples[..., 0]-1) # (T, I, E)
+    iembed_tasks = F.repeat(iembed_tasks[None, ...], 2, axis=0) # (2, T, I, E)
+    iembed_tasks = F.reshape(iembed_tasks, [2, -1, EMBED]) # (2, T*I, E)
 
     # Extract unification features
     ground_rnn = seq_rnn_embed(eg, self.uni_birnn, init_state=embed_tasks, return_sequences=True) # (B, L, 2*E)
-    embed_tasks = F.repeat(embed_tasks, invs_inputs.shape[1], axis=1) # (2, B*I, E)
-    invs_rnn = seq_rnn_embed(ei, self.uni_birnn, init_state=embed_tasks, return_sequences=True) # (B, I, L, 2*E)
+    invs_rnn = seq_rnn_embed(ei, self.uni_birnn, init_state=iembed_tasks, return_sequences=True) # (T, I, L, 2*E)
     ground_rnn = self.uni_linear(ground_rnn, n_batch_axes=2) # (B, L, E)
-    invs_rnn = self.uni_linear(invs_rnn, n_batch_axes=3) # (B, I, L, E)
+    invs_rnn = self.uni_linear(invs_rnn, n_batch_axes=3) # (T, I, L, E)
+    invs_rnn = invs_rnn[task_ids-1] # (B, I, L, E)
     # (B, I, L, E) x (B, L, E) -> (B, I, L, L)
     uni_att = F.einsum("ijke,ile->ijkl", invs_rnn, ground_rnn) # (B, I, L, L)
     uni_att = F.softmax(uni_att, axis=-1) # (B, I, L, L)
@@ -202,7 +205,7 @@ class UMLP(C.Chain):
     eu = F.einsum("ijkl,ile->ijke", uni_att, eg) # (B, I, L, E)
 
     # uni_embed = vmap[..., None]*eg[:, None] + (1-vmap)[..., None]*ei # (B, I, L, E)
-    uni_embed = vmap[..., None]*eu + (1-vmap)[..., None]*ei # (B, I, L, E)
+    uni_embed = vmap[..., None]*eu + (1-vmap)[..., None]*ei[task_ids-1] # (B, I, L, E)
     uni_embed = F.reshape(uni_embed, uni_embed.shape[:-2] + (-1,)) # (B, I, L*E)
 
     # Make the prediction on the unification
@@ -280,7 +283,7 @@ def train(train_data, test_data, foldid: int = 0):
   updater = T.StandardUpdater(train_iter, optimiser, device=-1)
   trainer = T.Trainer(updater, (2000, 'iteration'), out='results/umlp_result')
   # ---------------------------
-  fname = ARGS.outf.format(**vars(ARGS), foldid=foldid)
+  fname = (ARGS.name.format(foldid=foldid) if ARGS.name else '') or ('debug' if ARGS.debug else '') or str(uuid.uuid4())
   # Setup trainer extensions
   if ARGS.debug:
     trainer.extend(print_vmap, trigger=(200, 'iteration'))
@@ -299,6 +302,13 @@ def train(train_data, test_data, foldid: int = 0):
   except KeyboardInterrupt:
     if not ARGS.debug:
       return
+  # Save run parameters
+  params = ['length', 'symbols', 'invariants', 'embed', 'train_size', 'learning_rate', 'nouni', 'batch_size']
+  params = {k: vars(ARGS)[k] for k in params}
+  params['name'] = fname
+  params['foldid'] = foldid
+  with open(trainer.out + '/' + fname + '_params.json', 'w') as f:
+    json.dump(params, f)
   # Save learned invariants
   with open(trainer.out + '/' + fname + '.out', 'w') as f:
     f.write("---- META ----\n")
@@ -337,9 +347,9 @@ for foldidx, (traind, testd) in enumerate(nfolds):
   # We'll ensure the model sees every symbol at least once in training
   # at test time symbols might appear in different unseen sequences
   vtraind = np.stack(traind)
-  if ARGS.tsize > 0:
+  if ARGS.train_size > 0:
     # For each task select at most tsize many examples
-    vtraind = np.concatenate([vtraind[vtraind[:, 0] == tid][:ARGS.tsize] for tid in range(1, TASKS+1)]) # (<=tsize, 1+L+1)
+    vtraind = np.concatenate([vtraind[vtraind[:, 0] == tid][:ARGS.train_size] for tid in range(1, TASKS+1)]) # (<=tsize, 1+L+1)
   train_syms = vtraind[:, 1:-1]
   assert len(np.unique(train_syms)) == VOCAB-1, "Some symbols are missing from training."
   train(vtraind, testd, foldidx)
