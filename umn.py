@@ -2,6 +2,7 @@
 import argparse
 import os
 import json
+import uuid
 import signal
 from collections import OrderedDict
 import numpy as np
@@ -19,7 +20,7 @@ np.set_printoptions(suppress=True, precision=3, linewidth=180)
 # Arguments
 parser = argparse.ArgumentParser(description="Run UMN on given tasks.")
 parser.add_argument("task", help="File that contains task train.")
-parser.add_argument("name", help="Name prefix for saving files etc.")
+parser.add_argument("--name", help="Name prefix for saving files etc.")
 parser.add_argument("-r", "--rules", default=3, type=int, help="Number of rules in repository.")
 parser.add_argument("-e", "--embed", default=32, type=int, help="Embedding size.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
@@ -653,7 +654,8 @@ def converter(batch_stories, _):
   return (vctx, vq, vas, supps), vas[:, 0] # (B,)
 updater = T.StandardUpdater(train_iter, optimiser, converter=converter, device=-1)
 # trainer = T.Trainer(updater, T.triggers.EarlyStoppingTrigger())
-trainer = T.Trainer(updater, (300, 'epoch'))
+trainer = T.Trainer(updater, (300, 'epoch'), out='results/umn_result')
+fname = ARGS.name or ('debug' if ARGS.debug else '') or str(uuid.uuid4())
 
 # Trainer extensions
 def enable_unification(trainer):
@@ -665,7 +667,7 @@ def log_vmap(trainer):
   """Log inner properties to file."""
   pmodel = trainer.updater.get_optimizer('main').target.predictor
   vmaplog = pmodel.log['vmap'][0] # (V,)
-  logpath = os.path.join(trainer.out, ARGS.name + '_vmap.jsonl')
+  logpath = os.path.join(trainer.out, fname + '_vmap.jsonl')
   with open(logpath, 'a') as f:
     if trainer.updater.epoch == 1:
       # Log the rule as well
@@ -680,19 +682,19 @@ val_iter = C.iterators.SerialIterator(val_enc_stories, 128, repeat=False, shuffl
 trainer.extend(T.extensions.Evaluator(val_iter, cmodel, converter=converter, device=-1), name='val')
 test_iter = C.iterators.SerialIterator(test_enc_stories, 128, repeat=False, shuffle=False)
 trainer.extend(T.extensions.Evaluator(test_iter, cmodel, converter=converter, device=-1), name='test')
-# trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_best.npz'), trigger=T.triggers.MinValueTrigger('validation/main/loss'))
-trainer.extend(T.extensions.snapshot(filename=ARGS.name+'_latest.npz'), trigger=(1, 'epoch'))
-trainer.extend(T.extensions.LogReport(log_name=ARGS.name+'_log.json'))
-# trainer.extend(T.extensions.LogReport(trigger=(1, 'iteration'), log_name=ARGS.name+'_log.json'))
+# trainer.extend(T.extensions.snapshot(filename=fname+'_best.npz'), trigger=T.triggers.MinValueTrigger('validation/main/loss'))
+trainer.extend(T.extensions.snapshot(filename=fname+'_latest.npz'), trigger=(1, 'epoch'))
+trainer.extend(T.extensions.LogReport(log_name=fname+'_log.json'))
+# trainer.extend(T.extensions.LogReport(trigger=(1, 'iteration'), log_name=fname+'_log.json'))
 trainer.extend(T.extensions.FailOnNonNumber())
 report_keys = ['loss', 'vmap', 'uatt', 'oatt', 'batt', 'rpred', 'opred', 'uni', 'oacc', 'acc']
 trainer.extend(T.extensions.PrintReport(['epoch'] + ['main/'+s for s in report_keys] + [p+'/main/'+s for p in ('val', 'test') for s in ('loss', 'acc')] + ['elapsed_time']))
 # trainer.extend(T.extensions.ProgressBar(update_interval=10))
-# trainer.extend(T.extensions.PlotReport(['main/loss', 'validation/main/loss'], 'iteration', marker=None, file_name=ARGS.name+'_loss.pdf'))
-# trainer.extend(T.extensions.PlotReport(['main/accuracy', 'validation/main/accuracy'],'iteration', marker=None, file_name=ARGS.name+'_acc.pdf'))
+# trainer.extend(T.extensions.PlotReport(['main/loss', 'validation/main/loss'], 'iteration', marker=None, file_name=fname+'_loss.pdf'))
+# trainer.extend(T.extensions.PlotReport(['main/accuracy', 'validation/main/accuracy'],'iteration', marker=None, file_name=fname+'_acc.pdf'))
 
 # Setup training pausing
-trainer_statef = trainer.out + '/' + ARGS.name + '_latest.npz'
+trainer_statef = trainer.out + '/' + fname + '_latest.npz'
 def interrupt(signum, frame):
   """Save and interrupt training."""
   C.serializers.save_npz(trainer_statef, trainer)
