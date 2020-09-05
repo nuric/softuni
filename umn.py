@@ -275,25 +275,6 @@ def pos_encode(vxs, exs):
   enc = coeff * exs # (..., S, E)
   return F.sum(enc, axis=-2) # (..., E)
 
-def contextual_convolve(backend, convolution, vxs, exs):
-  """Given vectorised and encoded sentences convolve over last dimension."""
-  # (B, ..., S), (B, ..., S, E)
-  mask = (vxs != 0.0) # (B, ..., S)
-  toconvolve = exs # Assuming we have (B, S), (B, S, E)
-  if len(vxs.shape) > 2:
-    # We need to pad between sentences
-    padding = backend.zeros(exs.shape[:-2]+(1,exs.shape[-1]), dtype=exs.dtype) # (B, ..., 1, E)
-    padded = F.concat([exs, padding], -2) # (B, ..., S+1, E)
-    toconvolve = F.reshape(padded, (exs.shape[0], -1, exs.shape[-1])) # (B, *S+1, E)
-  permuted = F.transpose(toconvolve, (0, 2, 1)) # (B, E, S)
-  contextual = convolution(permuted) # (B, E, S)
-  contextual = F.transpose(contextual, (0, 2, 1)) # (B, S, E)
-  if len(vxs.shape) > 2:
-    contextual = F.reshape(contextual, padded.shape) # (B, ..., S+1, E)
-    contextual = contextual[..., :-1, :] # (B, ..., S, E)
-  contextual *= mask[..., None] # (B, ..., S, E)
-  return contextual
-
 def seq_rnn_embed(vxs, exs, birnn, return_seqs=False):
   """Embed given sequences using rnn."""
   # vxs.shape == (..., S)
@@ -393,11 +374,6 @@ class MemAttention(C.Chain):
 
 # ---------------------------
 
-class Embed:
-  """One-hot embedding layer."""
-  def __call__(self, x):
-    return F.embed_id(x, wordeye, ignore_label=0)
-
 # Inference network
 class Infer(C.Chain):
   """Takes a story, a set of rules and predicts answers."""
@@ -407,7 +383,6 @@ class Infer(C.Chain):
     # Create model parameters
     with self.init_scope():
       self.embed = L.EmbedID(len(word2idx), EMBED, ignore_label=0)
-      # self.embed = Embed()
       # self.rulegen = RuleGen()
       self.vmap_params = C.Parameter(0.0, (len(self.rule_stories), len(word2idx)), name='vmap_params')
       self.mematt = MemAttention()
@@ -454,16 +429,11 @@ class Infer(C.Chain):
     sim_mask = mask_candidates.astype(np.float32) * MINUS_INF # (B, Cs, C)
     # ---------------------------
     # Calculate a match for every word in s1 to every word in s2
-    # Compute contextual representations
-    # contextual_toprove = contextual_convolve(self.xp, self.convolve_words, toprove, groundtoprove) # (R, Ps, P, E)
-    # contextual_candidates = contextual_convolve(self.xp, self.convolve_words, candidates, embedded_candidates) # (B, Cs, C, E)
-    # contextual_toprove = embedded_toprove # (R, Ps, P, E)
+    # Compute contextual unification representations
     contextual_toprove = seq_rnn_embed(toprove, embedded_toprove, self.uni_birnn, True) # (R, Ps, P, E)
     contextual_toprove = self.uni_linear(contextual_toprove, n_batch_axes=3) # (R, Ps, P, E)
     contextual_candidates = seq_rnn_embed(candidates, embedded_candidates, self.uni_birnn, True) # (B, Cs, C, E)
     contextual_candidates = self.uni_linear(contextual_candidates, n_batch_axes=3) # (B, Cs, C, E)
-    # contextual_toprove = F.normalize(contextual_toprove, axis=-1) # (B, R, Ps, P, E)
-    # contextual_candidates = F.normalize(contextual_candidates, axis=-1) # (B, Cs, C, E)
     # Compute similarity between every provable symbol and candidate symbol
     # (R, Ps, P, E) x (B, Cs, C, E)
     raw_sims = F.einsum("jklm,inom->ijklno", contextual_toprove, contextual_candidates) # (B, R, Ps, P, Cs, C)
