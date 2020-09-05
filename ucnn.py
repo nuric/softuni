@@ -2,6 +2,7 @@
 import argparse
 import uuid
 import json
+import pickle
 import sys
 import numpy as np
 import chainer as C
@@ -27,6 +28,7 @@ parser.add_argument("-t", "--train_size", default=0, type=int, help="Training si
 parser.add_argument("-g", "--gsize", default=1000, type=int, help="Random data tries per task.")
 parser.add_argument("-bs", "--batch_size", default=64, type=int, help="Training batch size.")
 parser.add_argument("-lr", "--learning_rate", default=0.001, type=float, help="Learning rate.")
+parser.add_argument("--data", choices=['save', 'load'], help="Save or load generated data.")
 ARGS = parser.parse_args()
 
 GRID = np.array(ARGS.grid, dtype=np.int8)
@@ -154,6 +156,19 @@ def print_tasks(batch_tasks: np.ndarray, file=sys.stdout):
 
 data = gen_all() # (S, 1+W*H+1)
 nfolds = C.datasets.get_cross_validation_datasets_random(data, FOLDS) # 5 folds, list of 5 tuples train/test
+
+# ---
+# Save or load data
+if ARGS.data == "save":
+  with open('data/grid_data.pickle', 'wb') as f:
+    pickle.dump((data, nfolds), f)
+  print("Saved generated data.")
+  sys.exit()
+if ARGS.data == "load":
+  with open('data/grid_data.pickle', 'rb') as f:
+    data, nfolds = pickle.load(f)
+  print("Loaded pre-generated data.")
+# ---
 
 metadata = {'data': data.shape, 'tasks': np.unique(data[:, 0], return_counts=True),
             'folds': len(nfolds), 'train': len(nfolds[0][0]), 'test': len(nfolds[0][1])}

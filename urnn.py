@@ -2,6 +2,7 @@
 import argparse
 import json
 import uuid
+import pickle
 import re
 import string
 import sys
@@ -29,6 +30,7 @@ parser.add_argument("-t", "--train_size", default=0, type=int, help="Training si
 parser.add_argument("--test_size", default=0, type=int, help="Test size per label, 0 to use everything.")
 parser.add_argument("-bs", "--batch_size", default=64, type=int, help="Training batch size.")
 parser.add_argument("-lr", "--learning_rate", default=0.001, type=float, help="Learning rate.")
+parser.add_argument("--data", choices=['save', 'load'], help="Save or load generated data.")
 ARGS = parser.parse_args()
 
 LABEL_T = 0.1 # Lower bound below which is set to 0 
@@ -131,6 +133,19 @@ def print_tasks(in_data, file=sys.stdout):
 nfolds = C.datasets.get_cross_validation_datasets_random(data, FOLDS) # 5 folds, list of 5 tuples train/test
 # Filter per label
 nfolds = [(filter_per_label(td, ARGS.train_size), filter_per_label(vd, ARGS.test_size)) for td, vd in nfolds]
+
+# ---
+# Save or load data
+if ARGS.data == "save":
+  with open(f'data/sentiment_data_train{ARGS.train_size}_test{ARGS.test_size}.pickle', 'wb') as f:
+    pickle.dump((data, nfolds), f)
+  print("Saved generated data.")
+  sys.exit()
+if ARGS.data == "load":
+  with open(f'data/sentiment_data_train{ARGS.train_size}_test{ARGS.test_size}.pickle', 'rb') as f:
+    data, nfolds = pickle.load(f)
+  print("Loaded pre-processed data.")
+# ---
 
 metadata = {'data': data_stats(data), 'folds': len(nfolds)}
 for foldidx, (trainfold, testfold) in enumerate(nfolds):
@@ -337,7 +352,7 @@ def train(train_data, test_data, foldid: int = 0):
     json.dump(params, f)
   # Save learned invariants
   out = {k: v if isinstance(v, np.ndarray) else v.array for k, v in model(debug_texts).items()}
-  with open(trainer.out + '/' + fname + '.out', 'w') as f:
+  with open(trainer.out + '/' + fname + '.out', 'w', encoding='utf8') as f:
     f.write("---- META ----\n")
     metadata['foldid'] = foldid
     f.write(str(metadata))
