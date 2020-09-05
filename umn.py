@@ -207,6 +207,11 @@ def vectorise_stories(encoded_stories, noise=False):
           supps[i,j] = np.argmax(perm==supp)
   return vctx, vq, vas, supps
 
+def decode_vector_stories(vstory):
+  """Decode a given vector of stories."""
+  return [np.array([idx2word[i] for i in v.flatten()]).reshape(v.shape)
+          for v in vstory[:-1]]
+
 # ---------------------------
 
 # Utility functions for visualisation
@@ -380,24 +385,27 @@ class Infer(C.Chain):
   """Takes a story, a set of rules and predicts answers."""
   def __init__(self, rule_stories):
     super().__init__()
-    self.add_persistent('rule_stories', rule_stories)
+    # Setup rule repo
+    rvctx, rvq, rva, rsupps = vectorise_stories(rule_stories) # (R, Ls, L), (R, Q), (R, A), (R, I)
+    self.add_persistent('rvctx', rvctx)
+    self.add_persistent('rvq', rvq)
+    self.add_persistent('rva', rva)
+    self.add_persistent('rsupps', rsupps)
     # Create model parameters
     with self.init_scope():
       self.embed = L.EmbedID(len(word2idx), EMBED, ignore_label=0)
       # self.rulegen = RuleGen()
-      self.vmap_params = C.Parameter(0.0, (len(self.rule_stories), len(word2idx)), name='vmap_params')
+      self.vmap_params = C.Parameter(0.0, (rvq.shape[0], len(word2idx)), name='vmap_params') # (R, V)
       self.mematt = MemAttention()
       self.uni_birnn = L.NStepBiGRU(1, EMBED, EMBED, DROPOUT)
       self.uni_linear = L.Linear(EMBED, EMBED, nobias=True)
       self.rule_linear = L.Linear(EMBED, EMBED, nobias=True)
       self.answer_linear = L.Linear(EMBED, len(word2idx))
-    # Setup empty rule repo
-    self.vrules = None
     self.log = None
 
-  def init_rules(self):
-    """Initialise rule repo."""
-    self.vrules = vectorise_stories(self.rule_stories) # (R, Ls, L), (R, Q), (R, A), (R, I)
+  @property
+  def vrules(self):
+    return self.rvctx, self.rvq, self.rva, self.rsupps
 
   def tolog(self, key, value):
     """Append to log dictionary given key value pair."""
@@ -462,9 +470,9 @@ class Infer(C.Chain):
     erctx, erq, era = [self.embed(v) for v in self.vrules[:-1]] # (R, Ls, L, E), (R, Q, E), (R, A, E)
     # ---------------------------
     # Compute variable map
-    vmap = self.compute_vmap()
+    vmap = self.compute_vmap() # (R, V)
     # Setup variable maps and states
-    nrules_range = np.arange(len(self.rule_stories)) # (R,)
+    nrules_range = np.arange(rvq.shape[0]) # (R,)
     ctxvgates = vmap[nrules_range[:, None, None], rvctx] # (R, Ls, L)
     qvgates = vmap[nrules_range[:, None], rvq] # (R, Q)
     # ---------------------------
@@ -639,7 +647,6 @@ print("RULE REPO:", rule_repo)
 
 # Setup model
 model = Infer(rule_repo)
-model.init_rules()
 cmodel = Classifier(model)
 
 optimiser = C.optimizers.Adam().setup(cmodel)
@@ -704,14 +711,12 @@ signal.signal(signal.SIGTERM, interrupt)
 
 # Check previously saved trainer
 if os.path.isfile(trainer_statef):
+  model.rvctx, model.rvq, model.rva, model.rvs = None, None, None, None
   C.serializers.load_npz(trainer_statef, trainer)
-  trainer.updater.get_optimizer('main').target.predictor.init_rules()
   print("Loaded trainer state from:", trainer_statef)
   print("UNI:", trainer.updater.get_optimizer('main').target.uniparam)
   print("RULES:", trainer.updater.get_optimizer('main').target.predictor.vrules)
 
-# answer = model(converter([val_enc_stories[0]], None)[0])[0].array
-# print("INIT ANSWER:", answer)
 # Hit the train button
 try:
   trainer.run()
@@ -721,8 +726,8 @@ except KeyboardInterrupt:
 # Print final rules
 answer = model(converter([test_enc_stories[0]], None)[0])[0].array
 print("POST ANSWER:", answer)
-print("RULE STORY:", [decode_story(rs) for rs in model.rule_stories])
 print("ENC RULE STORY:", model.vrules)
+print("RULE STORY:", decode_vector_stories(model.vrules))
 print("RULE PARAMS:", model.log)
 # Extra inspection if we are debugging
 if ARGS.debug:
