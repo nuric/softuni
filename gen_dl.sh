@@ -8,18 +8,13 @@ SIZE=$1
 #TSIZE=$((SIZE / 10))
 TSIZE=1000
 shift
-ARITY=$1
-ARGS="-pl 1 -cl 1 -ns 2 -ar $ARITY"
-shift
+ARGS="-pl 1 -cl 1 -ns 2"
 
 all() {
   echo "Generating all tasks..."
   for i in {1..12}; do
-    if [ $ARITY != 2 ] && [ $i == 8 ]; then
-      continue
-    fi
-    F=$DDIR'train_ar'$ARITY'_'${SIZE::-3}'k_task'$i.txt
-    TF=$DDIR'test_ar'$ARITY'_'${SIZE::-3}'k_task'$i.txt
+    F=$DDIR'train_'${SIZE::-3}'k_task'$i.txt
+    TF=$DDIR'test_'${SIZE::-3}'k_task'$i.txt
     echo Writing to $F - $TF
     rm -f $F $TF
     $DCMD $ARGS -t $i -s $SIZE >> $F
@@ -28,4 +23,5 @@ all() {
 }
 
 # Run given function
+mkdir -p $DDIR
 $FUNC "$@"
