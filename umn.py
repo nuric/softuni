@@ -2,6 +2,7 @@
 import argparse
 import os
 import json
+import pickle
 import uuid
 import signal
 from collections import OrderedDict
@@ -24,8 +25,9 @@ parser.add_argument("--name", help="Name prefix for saving files etc.")
 parser.add_argument("-r", "--rules", default=3, type=int, help="Number of rules in repository.")
 parser.add_argument("-e", "--embed", default=32, type=int, help="Embedding size.")
 parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output.")
-parser.add_argument("-t", "--tsize", default=0, type=int, help="Training size, 0 means use everything.")
-parser.add_argument("-s", "--strong", default=1.0, type=float, help="Strong supervision ratio.")
+parser.add_argument("-t", "--train_size", default=0, type=int, help="Training size, 0 means use everything.")
+parser.add_argument("-w", "--weak", action="store_true", help="Weak supervision setting.")
+parser.add_argument("--runc", default=0, type=int, help="Run count of the experiment, for multiple runs.")
 ARGS = parser.parse_args()
 print("TASK:", ARGS.task)
 
@@ -38,7 +40,6 @@ if ARGS.debug:
   from sklearn.decomposition import PCA
   import matplotlib.pyplot as plt
   import seaborn as sns; sns.set()
-  import pickle
 
 EMBED = ARGS.embed
 MAX_HIST = 250
@@ -47,6 +48,7 @@ DROPOUT = 0.1
 BABI = 'qa' in ARGS.task
 DEEPLOGIC = not BABI
 MINUS_INF = -100
+STRONG = 0.0 if ARGS.weak else 1.0
 
 # ---------------------------
 
@@ -107,7 +109,7 @@ stories = loadf(ARGS.task)
 test_stories = loadf(ARGS.task.replace('train', 'test'))
 # Print general information
 print("EMBED:", EMBED)
-print("STRONG:", ARGS.strong)
+print("STRONG:", STRONG)
 print("REPO:", REPO_SIZE)
 print("TRAIN:", len(stories), "stories")
 print("TEST:", len(test_stories), "stories")
@@ -150,9 +152,9 @@ idx2word = {v:k for k, v in word2idx.items()}
 wordeye = np.eye(len(word2idx), dtype=np.float32)
 
 # Prepare training validation sets
-if ARGS.tsize != 0:
-  assert ARGS.tsize < len(enc_stories), "Not enough examples for training size."
-  tratio = (len(enc_stories)-ARGS.tsize) / len(enc_stories)
+if ARGS.train_size != 0:
+  assert ARGS.train_size < len(enc_stories), "Not enough examples for training size."
+  tratio = (len(enc_stories)-ARGS.train_size) / len(enc_stories)
   train_enc_stories, val_enc_stories = train_test_split(enc_stories, test_size=tratio)
   while len(train_enc_stories) < 900:
     train_enc_stories.append(np.random.choice(train_enc_stories))
@@ -693,7 +695,7 @@ class Classifier(C.Chain):
     uniloss = F.mean(uniloss) # ()
     # ---
     C.report({'loss': mainloss, 'vmap': vmaploss, 'uatt': uattloss, 'oatt': oattloss, 'batt': battloss, 'rpred': rpredloss, 'opred': opredloss, 'uni': uniloss, 'oacc': oacc, 'acc': acc}, self)
-    return self.uniparam*(mainloss + 0.1*vmaploss + ARGS.strong*(uattloss+battloss) + rpredloss + uniloss) + ARGS.strong*oattloss + opredloss # ()
+    return self.uniparam*(mainloss + 0.1*vmaploss + STRONG*(uattloss+battloss) + rpredloss + uniloss) + STRONG*oattloss + opredloss # ()
 
 # ---------------------------
 
@@ -743,6 +745,22 @@ updater = T.StandardUpdater(train_iter, optimiser, converter=converter, device=-
 # trainer = T.Trainer(updater, T.triggers.EarlyStoppingTrigger())
 trainer = T.Trainer(updater, (1000, 'iteration'), out='results/umn_result')
 fname = ARGS.name or ('debug' if ARGS.debug else '') or str(uuid.uuid4())
+
+# Save run parameters
+params = {
+  'task': ARGS.task,
+  'name': fname,
+  'rules': REPO_SIZE,
+  'is_babi': BABI,
+  'weak': ARGS.weak,
+  'embed': EMBED,
+  'train_size': ARGS.train_size,
+  'runc': ARGS.runc
+}
+
+with open(trainer.out + '/' + fname + '_params.json', 'w') as f:
+  json.dump(params, f)
+  print("Saved run parameters.")
 
 # Trainer extensions
 def enable_unification(trainer):
