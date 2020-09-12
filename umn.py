@@ -738,7 +738,7 @@ def converter(batch_stories, _):
   return (vctx, vq, vas, supps), vas[:, 0] # (B,)
 updater = T.StandardUpdater(train_iter, optimiser, converter=converter, device=-1)
 # trainer = T.Trainer(updater, T.triggers.EarlyStoppingTrigger())
-trainer = T.Trainer(updater, (1000, 'iteration'), out='results/umn_result')
+trainer = T.Trainer(updater, (4000, 'iteration'), out='results/umn_result')
 fname = ARGS.name or ('debug' if ARGS.debug else '') or str(uuid.uuid4())
 
 # Save run parameters
@@ -746,7 +746,6 @@ params = {
   'task': ARGS.task,
   'name': fname,
   'rules': REPO_SIZE,
-  'is_babi': BABI,
   'weak': ARGS.weak,
   'embed': EMBED,
   'train_size': ARGS.train_size,
