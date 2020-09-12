@@ -156,8 +156,6 @@ if ARGS.train_size != 0:
   assert ARGS.train_size < len(enc_stories), "Not enough examples for training size."
   tratio = (len(enc_stories)-ARGS.train_size) / len(enc_stories)
   train_enc_stories, val_enc_stories = train_test_split(enc_stories, test_size=tratio)
-  while len(train_enc_stories) < 900:
-    train_enc_stories.append(np.random.choice(train_enc_stories))
 else:
   train_enc_stories, val_enc_stories = train_test_split(enc_stories, test_size=0.1)
 assert len(train_enc_stories) > REPO_SIZE, "Not enough training stories to generate rules from."
@@ -674,17 +672,14 @@ class Classifier(C.Chain):
     uattloss = F.stack(self.predictor.log['raw_uni_cands_att'], 2) # (B, R, I, Cs)
     # (B, R) x (B, R, I, Cs) -> (B, I, Cs)
     uattloss = F.einsum("br,bric->bic", ratt, uattloss) # (B, I, Cs)
-    uattloss = F.hstack([F.softmax_cross_entropy(uattloss[:,i,:], supps[:,i]) for i in range(supps.shape[-1])]) # (I,)
-    uattloss = F.mean(uattloss) # ()
+    uattloss = F.softmax_cross_entropy(F.reshape(uattloss, (-1, vctx.shape[1])), supps.flatten()) # ()
     # ---
     oattloss = F.stack(self.predictor.log['raw_orig_cands_att'], 1) # (B, I, Cs)
-    oattloss = F.hstack([F.softmax_cross_entropy(oattloss[:,i,:], supps[:,i]) for i in range(supps.shape[-1])]) # (I,)
-    oattloss = F.mean(oattloss) # ()
+    oattloss = F.softmax_cross_entropy(F.reshape(oattloss, (-1, vctx.shape[1])), supps.flatten()) # ()
     # ---
     battloss = F.stack(self.predictor.log['raw_body_att'], 1) # (R, I, Ls)
     riters = min(rsupps.shape[-1], supps.shape[-1])
-    battloss = F.hstack([F.softmax_cross_entropy(battloss[:,i,:], rsupps[:,i]) for i in range(riters)]) # (I,)
-    battloss = F.mean(battloss) # ()
+    battloss = F.softmax_cross_entropy(F.reshape(battloss[:, :riters], (-1, rvctx.shape[1])), rsupps[:, :riters].flatten()) # ()
     # ---
     rpredloss = F.softmax_cross_entropy(self.predictor.log['rpred'][0], rva[:, 0]) # ()
     opred = self.predictor.log['opred'][0] # (B, V)
