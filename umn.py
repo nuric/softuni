@@ -802,7 +802,7 @@ signal.signal(signal.SIGTERM, interrupt)
 
 # Check previously saved trainer
 if os.path.isfile(trainer_statef):
-  model.rvctx, model.rvq, model.rva, model.rvs = None, None, None, None
+  model.rvctx, model.rvq, model.rva, model.rsupps = None, None, None, None
   C.serializers.load_npz(trainer_statef, trainer)
   print("Loaded trainer state from:", trainer_statef)
   print("UNI:", trainer.updater.get_optimizer('main').target.uniparam)
