@@ -7,6 +7,8 @@
 *.zip
 *_result
 data
+outs
+condor*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
