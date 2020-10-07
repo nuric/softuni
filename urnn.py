@@ -307,7 +307,6 @@ def train(train_data, test_data, foldid: int = 0):
   model = URNN(invariants)
   cmodel = Classifier(model)
   optimiser = C.optimizers.Adam(alpha=ARGS.learning_rate).setup(cmodel)
-  optimiser.add_hook(C.optimizer_hooks.WeightDecay(0.001))
   train_iter = C.iterators.SerialIterator(train_data, ARGS.batch_size)
   test_iter = C.iterators.SerialIterator(test_data, ARGS.batch_size, repeat=False, shuffle=False)
   updater = T.StandardUpdater(train_iter, optimiser, converter=converter, device=-1)
